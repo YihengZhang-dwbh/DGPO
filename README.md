@@ -125,6 +125,9 @@ CUDA_VISIBLE_DEVICES=0 python scripts/train_ppo.py --env_name FingerSpin --seed 
 
 # FPO
 CUDA_VISIBLE_DEVICES=0 python scripts/train_fpo.py --env_name FingerSpin --seed 1
+
+# DPPO
+CUDA_VISIBLE_DEVICES=0 python scripts/train_fpo.py --env_name FingerSpin --seed 1 --config.loss_mode denoising_mdp
 ```
 
 Run with `--help` to see all available options.
