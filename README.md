@@ -1,5 +1,17 @@
 # GoRL: An Algorithm-Agnostic Framework for Online RL with Generative Policies
 
+
+*Chubin Zhang\*<sup>1</sup>,
+Zhenglin Wan\*<sup>2</sup>,
+Feng Chen<sup>2</sup>,
+Xingrui Yu<sup>3</sup>,
+Ivor Tsang<sup>3</sup>,
+Bo An<sup>2</sup>*
+
+<sup>1</sup>BUPT, China
+<sup>2</sup>NTU, Singapore  <sup>3</sup>Centre for Frontier AI Research, A*STAR, Singapore 
+
+(\*: Equal contribution)
 <p align="center">
   <a href="https://arxiv.org/abs/2512.02581">
     <img src="https://img.shields.io/badge/arXiv-Paper-red?style=flat-square&logo=arxiv" alt="arXiv Paper"></a>
