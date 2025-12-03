@@ -1,7 +1,7 @@
 # GoRL: An Algorithm-Agnostic Framework for Online RL with Generative Policies
 
 <p align="center">
-  <a href="#">
+  <a href="https://arxiv.org/abs/2512.02581">
     <img src="https://img.shields.io/badge/arXiv-Paper-red?style=flat-square&logo=arxiv" alt="arXiv Paper"></a>
   &nbsp;
   <a href="https://github.com/bennidict23/GoRL">
@@ -136,10 +136,14 @@ Our PPO and FPO implementations are based on the official [FPO repository](https
 If you find this code useful, please cite our paper:
 
 ```bibtex
-@article{gorl2025,
-  title={GoRL: An Algorithm-Agnostic Framework for Online Reinforcement Learning with Generative Policies},
-  author={Anonymous},
-  year={2025}
+@misc{zhang2025gorlalgorithmagnosticframeworkonline,
+      title={GoRL: An Algorithm-Agnostic Framework for Online Reinforcement Learning with Generative Policies}, 
+      author={Chubin Zhang and Zhenglin Wan and Feng Chen and Xingrui Yu and Ivor Tsang and Bo An},
+      year={2025},
+      eprint={2512.02581},
+      archivePrefix={arXiv},
+      primaryClass={cs.LG},
+      url={https://arxiv.org/abs/2512.02581}, 
 }
 ```
 
