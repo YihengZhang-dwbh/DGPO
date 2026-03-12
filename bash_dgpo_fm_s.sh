@@ -33,7 +33,7 @@ for env in "${envs[@]}"; do
         log_fm="logs/dgpo_fm_${env}_seed${seed}_${time}.txt"
         
         echo "  ⏳ [正在运行] DGPO (FM) | Seed: $seed | 日志: $log_fm"
-        XLA_PYTHON_CLIENT_PREALLOCATE=false CUDA_VISIBLE_DEVICES=$gpu_id python run_dgpo_fm.py \
+        XLA_PYTHON_CLIENT_PREALLOCATE=false CUDA_VISIBLE_DEVICES=$gpu_id python train_dgpo_fm.py \
             --env-name $env \
             --seed $seed \
             --config.num_timesteps $timesteps \
