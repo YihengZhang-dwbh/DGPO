@@ -137,8 +137,29 @@ class DGPOFMState:
 
         network_params = DGPOFMParams(actor_net, critic_net)
 
-        # We'll manage learning rate ourselves!
-        opt = optax.scale_by_adam()
+        # # We'll manage learning rate ourselves!
+        # opt = optax.scale_by_adam()
+
+        # --- 核心改进：非对称学习率 (Asymmetric LR) ---
+        # 为 Policy 和 Value 定义不同的优化器
+        # 建议 Critic LR 是 Policy 的 2-3 倍
+        policy_lr = config.learning_rate
+        critic_lr = config.learning_rate * 2.5  # 针对 FingerSpin 调高
+
+        lr_map = {
+            "policy": optax.adam(policy_lr),
+            "value": optax.adam(critic_lr)
+        }
+
+        # 使用 multi_transform 进行分配
+        # 这里假设 DGPOFMParams 的字段名就是 "policy" 和 "value"
+        opt = optax.multi_transform(
+            lr_map,
+            DGPOFMParams(policy="policy", value="value")
+        )
+        # ------------------------------------------
+
+
         return DGPOFMState(
             env=env,
             config=config,
@@ -289,12 +310,15 @@ class DGPOFMState:
         assert isinstance(loss, Array)
         assert isinstance(metrics, dict)
 
-        param_update, new_opt_state = self.opt.update(grads, self.opt_state)  # type: ignore
-        param_update = jax.tree.map(
-            lambda x: -self.config.learning_rate * x, param_update
-        )
+        # param_update, new_opt_state = self.opt.update(grads, self.opt_state)  # type: ignore
+        # param_update = jax.tree.map(
+        #     lambda x: -self.config.learning_rate * x, param_update
+        # )
+        param_update, new_opt_state = self.opt.update(grads, self.opt_state, self.params)
         with jdc.copy_and_mutate(self) as state:
-            state.params = jax.tree.map(jnp.add, self.params, param_update)
+            # state.params = jax.tree.map(jnp.add, self.params, param_update)
+            # 直接 apply_updates
+            state.params = optax.apply_updates(self.params, param_update)
             state.opt_state = new_opt_state
             state.steps = state.steps + 1
         return state, metrics
