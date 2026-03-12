@@ -19,6 +19,11 @@ from . import math_utils, networks, rollouts
 class DGPOFMConfig:
     # Closed
     resampling_alpha: float = 0.1  # 新增：控制重采样的“温度”
+
+    resampling_mode: jdc.Static[Literal["knn", "radius"]] = "knn"
+    fixed_radius: float = 0.5  # 仅在 "radius" 模式下生效
+    use_subsampling: False
+
     # Flow parameters.
     flow_steps: jdc.Static[int] = 10
     output_mode: jdc.Static[Literal["u", "u_but_supervise_as_eps"]] = (
@@ -357,52 +362,70 @@ class DGPOFMState:
         flat_adv = gae_advantages.reshape((N,))
 
         # ==========================================
-        # 6. 高效子采样重采样 (Subsampled Resampling)
+        # 6. 重采样逻辑 (修复监控指标与命名冲突)
         # ==========================================
-        M = 512  # 候选池大小，根据显存调整 (512-1024 比较稳妥)
-        # 随机抽取 M 个索引作为全 Batch 的共同候选候选人
-        prng_pool, prng_resample = jax.random.split(prng_resample)
-        candidate_indices = jax.random.choice(prng_pool, N, shape=(M,), replace=False)
+        if self.config.use_subsampling:
+            M = self.config.subsampling_m
+            prng_pool, prng_resample = jax.random.split(prng_resample)
+            # 确保 M 不超过 N
+            actual_m = jnp.minimum(M, N)
+            candidate_indices = jax.random.choice(prng_pool, N, shape=(actual_m,), replace=False)
 
-        # 计算 N 个状态对 M 个候选动作的距离矩阵 (N x M)
-        # 这里的 dist_matrix_sub 解决了你的 NameError
-        dist_input_all = jax.lax.stop_gradient(flat_obs)  # N x D
-        dist_input_cand = jax.lax.stop_gradient(flat_obs[candidate_indices])  # M x D
+            dist_input_all = jax.lax.stop_gradient(flat_obs)
+            dist_input_cand = jax.lax.stop_gradient(flat_obs[candidate_indices])
 
-        sq_norms_all = jnp.sum(dist_input_all ** 2, axis=-1)
-        sq_norms_cand = jnp.sum(dist_input_cand ** 2, axis=-1)
-        dist_sq_sub = jnp.maximum(0.0, sq_norms_all[:, None] + sq_norms_cand[None, :] - 2 * jnp.matmul(dist_input_all,
+            sq_norms_all = jnp.sum(dist_input_all ** 2, axis=-1)
+            sq_norms_cand = jnp.sum(dist_input_cand ** 2, axis=-1)
+            dist_sq = jnp.maximum(0.0, sq_norms_all[:, None] + sq_norms_cand[None, :] - 2 * jnp.matmul(dist_input_all,
                                                                                                        dist_input_cand.T))
-        dist_matrix_sub = jnp.sqrt(dist_sq_sub + 1e-8)  # 维度: (N, M)
 
-        # 为每个状态单独计算属于它的物理邻域阈值 delta (针对候选池的 q 分位数)
-        # individual_deltas 维度: (N,)
-        individual_deltas = jnp.quantile(dist_matrix_sub, q=0.05, axis=-1)
-        mask = dist_matrix_sub < individual_deltas[:, None]
+            cand_adv = flat_adv[candidate_indices]
+            gumbel_shape = (N, actual_m)
+            pool_indices_ref = candidate_indices
+            scaling_factor = N / actual_m
+        else:
+            dist_input = jax.lax.stop_gradient(flat_obs)
+            sq_norms = jnp.sum(dist_input ** 2, axis=-1)
+            dist_sq = jnp.maximum(0.0, sq_norms[:, None] + sq_norms[None, :] - 2 * jnp.matmul(dist_input, dist_input.T))
 
-        # --- 修复你刚才提供的监控指标部分 ---
-        # 全部统一使用 dist_matrix_sub
-        neighbor_counts = jnp.sum(dist_matrix_sub <= individual_deltas[:, None], axis=-1)
-        metrics["avg_neighbor_count"] = jnp.mean(neighbor_counts)
-        metrics["isolated_ratio"] = jnp.mean(neighbor_counts <= 1.0)
-        metrics["crowded_ratio"] = jnp.mean(neighbor_counts > (M * 0.1))
-        # 估计全量 Batch 下的类聚簇数：N / (在 M 规模下的平均邻居数 * 放大倍率)
-        metrics["est_clusters"] = N / (jnp.mean(neighbor_counts) * (N / M) + 1e-8)
-        # ----------------------------------
+            cand_adv = flat_adv
+            gumbel_shape = (N, N)
+            pool_indices_ref = jnp.arange(N)
+            scaling_factor = 1.0
 
-        # 计算优势 Logits (只看候选池里的邻居)
-        cand_adv = flat_adv[candidate_indices]  # M
+
+
+
+        # --- 共同逻辑：划分邻域 ---
+        dist_matrix = jnp.sqrt(dist_sq + 1e-8)
+
+        if self.config.resampling_mode == "knn":
+            # 自适应 KNN：确保每个状态都有前 5% 的候选人作为邻居
+            individual_deltas = jnp.quantile(dist_matrix, q=0.05, axis=-1)
+            mask = dist_matrix < individual_deltas[:, None]
+        else:
+            # 固定半径：只有物理距离小于阈值的才算邻居 (更严格的局部性)
+            mask = dist_matrix < self.config.fixed_radius
+
+        # --- 监控指标计算 (修复 KeyError) ---
+        neighbor_counts = jnp.sum(mask, axis=-1)
+        avg_neighbors = jnp.mean(neighbor_counts)
+
+        metrics["dgpo/avg_neighbor_count"] = avg_neighbors
+        metrics["dgpo/isolated_ratio"] = jnp.mean(neighbor_counts <= 1.0)
+        metrics["dgpo/crowded_ratio"] = jnp.mean(neighbor_counts > (gumbel_shape[1] * 0.1))
+        metrics["dgpo/est_clusters"] = N / (avg_neighbors * scaling_factor + 1e-8)
+
+        # --- 核心重采样计算 ---
         masked_adv = jnp.where(mask, cand_adv[None, :], -jnp.inf)
         max_adv = jnp.max(masked_adv, axis=-1, keepdims=True)
         logits = jnp.where(mask, (cand_adv[None, :] - max_adv) / self.config.resampling_alpha, -jnp.inf)
 
-        # Gumbel-Max 采样选中 M 个候选人里的某一个
-        gumbel_noise = jax.random.gumbel(prng_resample, shape=(N, M))
-        sampled_sub_indices = jnp.argmax(logits + gumbel_noise, axis=-1)
+        gumbel_noise = jax.random.gumbel(prng_resample, shape=gumbel_shape)
+        sampled_rel_indices = jnp.argmax(logits + gumbel_noise, axis=-1)
 
-        # 映射回原始全量 Batch 的索引，提取 a_hat
-        final_indices = candidate_indices[sampled_sub_indices]
-        a_hat = flat_actions[final_indices]
+        # 提取最终动作
+        a_hat = flat_actions[pool_indices_ref[sampled_rel_indices]]
 
         # 7. 纯净流匹配 ODE 更新
         eps = jax.random.normal(prng_eps, (N, self.env.action_size))
@@ -433,11 +456,11 @@ class DGPOFMState:
         metrics["v_loss"] = v_loss
         metrics["advantages_mean"] = jnp.mean(gae_advantages)
 
-        # 在 return 之前放开这些监控项
-        metrics["dgpo/avg_neighbor_count"] = metrics["avg_neighbor_count"]
-        metrics["dgpo/isolated_ratio"] = metrics["isolated_ratio"]
-        metrics["dgpo/crowded_ratio"] = metrics["crowded_ratio"]
-        metrics["dgpo/est_clusters"] = metrics["est_clusters"]
+        # # 在 return 之前放开这些监控项
+        # metrics["dgpo/avg_neighbor_count"] = metrics["avg_neighbor_count"]
+        # metrics["dgpo/isolated_ratio"] = metrics["isolated_ratio"]
+        # metrics["dgpo/crowded_ratio"] = metrics["crowded_ratio"]
+        # metrics["dgpo/est_clusters"] = metrics["est_clusters"]
 
 
         return total_loss, metrics
