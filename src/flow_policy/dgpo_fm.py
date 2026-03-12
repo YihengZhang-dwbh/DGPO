@@ -422,29 +422,37 @@ class DGPOFMState:
         # --- 邻域划分算法选择 ---
         dist_matrix = jnp.sqrt(dist_sq + 1e-8)
 
-        # --- 2. 模式切换：决定基础搜索范围 ---
-        if self.config.resampling_mode == "knn":
-            # 纯 KNN：每个状态找前 5%
-            individual_deltas = jnp.quantile(dist_matrix, q=0.05, axis=-1)
-            mask = dist_matrix < individual_deltas[:, None]
-        elif self.config.resampling_mode == "radius":
-            # 纯 Radius：固定物理半径
-            mask = dist_matrix < self.config.fixed_radius
-        elif self.config.resampling_mode == "both":
-            # 你的创新模式：在 Radius 之内取 Top-K
-            # 1. 先定物理边界
-            mask_radius = dist_matrix < self.config.fixed_radius
-            # 2. 再定数量边界 (精英筛选)
-            # 在 loss 函数中使用
-            K_max = self.config.resampling_topk
-            _, topk_indices = jax.lax.top_k(-dist_matrix, k=jnp.minimum(K_max, dist_matrix.shape[-1]))
-            mask_topk = jnp.zeros_like(mask_radius, dtype=jnp.bool_).at[jnp.arange(N)[:, None], topk_indices].set(True)
-            # 3. 逻辑交集：既要近，又要强
+        # --- 2. 预计算所有可能的掩码 (JAX 风格，无分支) ---
+        # KNN 掩码
+        individual_deltas = jnp.quantile(dist_matrix, q=0.05, axis=-1)
+        mask_knn = dist_matrix < individual_deltas[:, None]
+
+        # Radius 掩码
+        mask_radius = dist_matrix < self.config.fixed_radius
+
+        # Top-K 掩码 (使用固定 K)
+        K_max = 32
+        # 注意：JAX 的 top_k 要求 k 必须是编译期常数。
+        # 如果 M < 32，jax.lax.top_k 会报错。所以我们用静态 K 值。
+        # 假设你的 batch 或 subsampling_m 总是大于 32。
+        _, topk_indices = jax.lax.top_k(-dist_matrix, k=K_max)
+        mask_topk = jnp.zeros_like(mask_radius, dtype=jnp.bool_).at[
+            jnp.arange(N)[:, None], topk_indices
+        ].set(True)
+
+        # --- 3. 根据 mode 静态选择最终掩码 ---
+        # 这里使用 Python string 比较，但要确保 mode 在 config 里是 jdc.Static
+        mode = self.config.resampling_mode
+
+        if mode == "knn":
+            mask = mask_knn
+        elif mode == "radius":
+            mask = mask_radius
+        elif mode == "both":
             mask = mask_radius & mask_topk
         else:
-            # 默认回退到 KNN
-            individual_deltas = jnp.quantile(dist_matrix, q=0.05, axis=-1)
-            mask = dist_matrix < individual_deltas[:, None]
+            # Fallback
+            mask = mask_knn
 
 
         # 兜底逻辑：防止孤立状态找不到任何邻居（导致 Logits 为空）
