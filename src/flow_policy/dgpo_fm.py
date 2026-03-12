@@ -381,6 +381,11 @@ class DGPOFMState:
         k_neighbors = 8  # 因为候选池小了，k 也可以适当减小提升速度
         neg_dists, top_k_sub_indices = jax.lax.top_k(-dist_matrix_sub, k_neighbors)
 
+        # --- 修复位置：定义 individual_deltas ---
+        # 这里的每一行的最后一个值就是第 k 个最近邻的距离（取正值）
+        individual_deltas = -neg_dists[:, -1]
+        # --------------------------------------
+
         # 获取这些邻居在候选池中的 Advantage
         # neighbor_advs 形状为 (N, k_neighbors)
         neighbor_advs = adv_candidates[top_k_sub_indices]
