@@ -357,50 +357,69 @@ class DGPOFMState:
         flat_adv = gae_advantages.reshape((N,))
         flat_obs = obs_norm.reshape((N, self.env.observation_size))
 
-        # 3. 计算隐空间距离矩阵
-        sq_norms = jnp.sum(flat_h_s ** 2, axis=-1)
-        dist_sq = jnp.maximum(0.0, sq_norms[:, None] + sq_norms[None, :] - 2 * jnp.matmul(flat_h_s, flat_h_s.T))
-        dist_matrix = jnp.sqrt(dist_sq + 1e-8)
+        # ========================== 极速子采样逻辑开始 ==========================
+        # 3. 随机选择一个固定的候选池 M (例如 1024)，显著降低计算量
+        M = 1024
+        key_sample, prng_resample = jax.random.split(prng_resample)
+        # 随机选出 M 个“参考邻居”
+        candidate_indices = jax.random.choice(key_sample, N, shape=(M,), replace=False)
 
-        # 4.
-        # --- 核心改进：从全局 Quantile 切换为局部 K-NN ---
-        # 强制每个状态只看最近的 16 个邻居，防止退化为行为克隆
-        k_neighbors = 16
+        h_s_candidates = flat_h_s[candidate_indices]  # (M, D)
+        actions_candidates = flat_actions[candidate_indices]  # (M, A)
+        adv_candidates = flat_adv[candidate_indices]  # (M,)
 
-        # 计算负距离的 top_k，因为 dist_matrix 越小代表越近
-        # top_k 返回值中，distances 为 (N, k), indices 为 (N, k)
-        top_k_neg_dists, _ = jax.lax.top_k(-dist_matrix, k_neighbors)
+        # 4. 只计算 N x M 的距离矩阵 (不再是 N x N)
+        # 矩阵大小从 9亿 缩小到 3千万，显存压力瞬间消失
+        def compute_dist_row(single_h):
+            # 计算单个状态对 M 个候选者的距离
+            return jnp.sum((single_h - h_s_candidates) ** 2, axis=-1)
 
-        # 提取第 k 个邻居的距离作为每个样本独立的局部半径 (N,)
-        individual_deltas = -top_k_neg_dists[:, -1]
+        # 使用 vmap 批量计算 N 个状态对应的 M 个距离
+        dist_matrix_sub = jax.vmap(compute_dist_row)(flat_h_s)  # (N, M)
 
-        # 构建局部掩码：每个样本只看自己半径内的邻居
-        mask = dist_matrix <= individual_deltas[:, None]
-        # -----------------------------------------------
+        # 5. 在 M 个候选者中找最近的 k 个
+        k_neighbors = 8  # 因为候选池小了，k 也可以适当减小提升速度
+        neg_dists, top_k_sub_indices = jax.lax.top_k(-dist_matrix_sub, k_neighbors)
 
-        # 5. 计算优势加权 Logits (体现 exp(A/alpha) 思想)
-        masked_adv = jnp.where(mask, flat_adv[None, :], -jnp.inf)
-        max_adv = jnp.max(masked_adv, axis=-1, keepdims=True)
+        # 获取这些邻居在候选池中的 Advantage
+        # neighbor_advs 形状为 (N, k_neighbors)
+        neighbor_advs = adv_candidates[top_k_sub_indices]
 
-        # 使用 self.config.resampling_alpha
-        logits = jnp.where(mask, (flat_adv[None, :] - max_adv) / self.config.resampling_alpha, -jnp.inf)
+        # 6. Gumbel-Max 重采样 (在 k 个最近邻中选优势最大的)
+        max_adv = jnp.max(neighbor_advs, axis=-1, keepdims=True)
+        logits = (neighbor_advs - max_adv) / self.config.resampling_alpha
 
-        # --- 更新后的聚类监控 ---
-        neighbor_counts = jnp.sum(mask, axis=-1)
-        # 在 K-NN 模式下，avg_neighbors 应该严格稳定在 16 左右
+        gumbel_noise = jax.random.gumbel(prng_resample, shape=(N, k_neighbors))
+        resample_choice = jnp.argmax(logits + gumbel_noise, axis=-1)  # (N,)
+
+        # 映射回动作空间
+        # 从 top_k_sub_indices 中选出被选中的那个参考点的索引
+        final_indices_in_candidates = jnp.take_along_axis(
+            top_k_sub_indices, resample_choice[:, None], axis=1
+        ).squeeze()
+
+        # 最终的目标动作 a_hat
+        a_hat = actions_candidates[final_indices_in_candidates]
+        # ========================== 极速子采样逻辑结束 ==========================
+
+        # --- 恢复全量监控指标 ---
+        # 在子采样模式下，我们通过距离分布来模拟原本的指标
+        neighbor_counts = jnp.sum(dist_matrix_sub <= individual_deltas[:, None], axis=-1)
+
+        # 1. 平均邻居数 (在 K-NN 下这通常等于 k_neighbors)
         avg_neighbor_count = jnp.mean(neighbor_counts)
-        # est_clusters 应该显著提升到 N/16 (约 1920)
-        est_clusters = N / (avg_neighbor_count + 1e-8)
 
-        isolated_ratio = jnp.mean(neighbor_counts <= 1.5)
-        # 在 K-NN 下，crowded_ratio 理论上应该降为 0
-        crowded_ratio = jnp.mean(neighbor_counts > (N * 0.01))
+        # 2. 推估类数量 (考虑采样率 M/N)
+        # 这里的逻辑是：如果 M 个样本里能找到 k 个邻居，那么全量 N 样本里理论上有 k*(N/M) 个
+        est_clusters = N / (avg_neighbor_count * (N / M) + 1e-8)
+
+        # 3. 孤立样本比：在 M 个候选人里连 1 个够近的邻居都很难找
+        # 我们定义距离大于某个阈值或邻居数极少为孤立
+        isolated_ratio = jnp.mean(neighbor_counts <= 1.0)
+
+        # 4. 拥挤样本比：在子采样池里，邻居占比超过了 10% (说明局部性失效)
+        crowded_ratio = jnp.mean(neighbor_counts > (M * 0.1))
         # ----------------------
-
-        # 6. Gumbel-Max 重采样提取绝对纯净的目标动作 a_hat
-        gumbel_noise = jax.random.gumbel(prng_resample, shape=(N, N))
-        sampled_indices = jnp.argmax(logits + gumbel_noise, axis=-1)
-        a_hat = flat_actions[sampled_indices]
 
         # 7. 纯净流匹配 ODE 更新
         eps = jax.random.normal(prng_eps, (N, self.env.action_size))
