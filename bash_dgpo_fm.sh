@@ -3,7 +3,7 @@
 source activate DGPO
 
 id=0
-env_name="HalfCheetah-v4"
+env_name="CheetahRun"
 seed=1
 time=$(date '+%Y-%m-%d-%H%M%S')
 
