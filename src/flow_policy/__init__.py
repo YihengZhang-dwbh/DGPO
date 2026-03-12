@@ -21,6 +21,8 @@ from . import math_utils
 # Baseline algorithms
 from . import ppo
 from . import fpo
+from . import dgpo_fm
+from . import dgpo_diffusion
 
 __all__ = [
     # GoRL core
@@ -35,4 +37,6 @@ __all__ = [
     # Baselines
     'ppo',
     'fpo',
+    'dgpo_fm',
+    'dgpo_diffusion',
 ]

@@ -1,0 +1,431 @@
+from __future__ import annotations
+
+from functools import partial
+from typing import NamedTuple, Literal, assert_never
+
+import jax
+import jax_dataclasses as jdc
+import mujoco_playground as mjp
+import optax
+from jax import Array
+from jax import numpy as jnp
+
+from flow_policy.networks import MlpWeights
+
+from . import math_utils, networks, rollouts
+
+class DiffusionSchedule(NamedTuple):
+    t_current: Array
+    t_next: Array
+    alpha_t: Array
+    alpha_next: Array
+
+@jdc.pytree_dataclass
+class DGPODiffusionConfig:
+    # --- 替换这部分 ---
+    diffusion_steps: jdc.Static[int] = 10  # 对应原来的 flow_steps
+    beta_schedule: jdc.Static[str] = "cosine"
+    beta_start: float = 0.0001
+    beta_end: float = 0.02
+    # -----------------
+
+    timestep_embed_dim: jdc.Static[int] = 8
+    """"Must be divisible by 2."""
+    n_samples_per_action: jdc.Static[int] = 8
+    average_losses_before_exp: jdc.Static[bool] = False
+
+    discretize_t_for_training: jdc.Static[bool] = True
+    feather_std: float = 0.0
+    policy_mlp_output_scale: float = 0.25
+
+    loss_mode: jdc.Static[Literal["dgpo", "denoising_mdp"]] = "dgpo"
+    final_steps_only: jdc.Static[bool] = False
+
+    # Fixed noise level for sampling via denoising MDP. This is used for
+    # DDPO-style policy updates.
+    sde_sigma: float = 0.0
+
+    clipping_epsilon: float = 0.05
+
+    # Based on Brax PPO config:
+    batch_size: jdc.Static[int] = 1024
+    discounting: float = 0.995
+    episode_length: int = 1000
+    learning_rate: float = 3e-4
+    normalize_observations: jdc.Static[bool] = True
+    num_envs: jdc.Static[int] = 2048
+    num_evals: jdc.Static[int] = 30
+    num_minibatches: jdc.Static[int] = 32
+    num_timesteps: jdc.Static[int] = 60_000_000
+    num_updates_per_batch: jdc.Static[int] = 16
+    reward_scaling: float = 10.0
+    unroll_length: jdc.Static[int] = 30
+
+    gae_lambda: float = 0.95
+    normalize_advantage: jdc.Static[bool] = True
+    value_loss_coeff: float = 0.25
+
+    def __post_init__(self) -> None:
+        assert self.timestep_embed_dim % 2 == 0
+
+    @property
+    def iterations_per_env(self) -> int:
+        """Number of iterations (=policy forward passes) per environment at the
+        start of each training step."""
+        return (
+            self.num_minibatches * self.batch_size * self.unroll_length
+        ) // self.num_envs
+
+
+@jdc.pytree_dataclass
+class DGPOParams:
+    policy: MlpWeights
+    value: MlpWeights
+
+
+@jdc.pytree_dataclass
+class DGPOActionInfo:
+    pass  # 零负担，不需要存任何多余的 Loss 和噪声
+
+
+DGPOTransition = rollouts.TransitionStruct[DGPOActionInfo]
+
+
+@jdc.pytree_dataclass
+class DGPODiffusionState:
+    """PPO agent state."""
+
+    env: jdc.Static[mjp.MjxEnv]
+    config: DGPODiffusionConfig
+    params: DGPOParams
+    obs_stats: math_utils.RunningStats
+
+    opt: jdc.Static[optax.GradientTransformation]
+    opt_state: optax.OptState
+
+    prng: Array
+    steps: Array
+
+    @staticmethod
+    @jdc.jit
+    def init(prng: Array, env: jdc.Static[mjp.MjxEnv], config: DGPODiffusionConfig) -> DGPODiffusionState:
+        obs_size = env.observation_size
+        action_size = env.action_size
+        assert isinstance(obs_size, int)
+
+        prng0, prng1, prng2 = jax.random.split(prng, num=3)
+        actor_net = networks.mlp_init(
+            # Policy takes both observation and action as input. We'll just concatenate them!
+            prng0,
+            (
+                obs_size + action_size + config.timestep_embed_dim,
+                32,
+                32,
+                32,
+                32,
+                action_size,
+            ),
+        )
+        critic_net = networks.mlp_init(prng1, (obs_size, 256, 256, 256, 256, 256, 1))
+
+        network_params = DGPOParams(actor_net, critic_net)
+
+        # We'll manage learning rate ourselves!
+        opt = optax.scale_by_adam()
+        return DGPODiffusionState(
+            env=env,
+            config=config,
+            params=network_params,
+            obs_stats=math_utils.RunningStats.init((obs_size,)),
+            opt=opt,
+            opt_state=opt.init(network_params),  # type: ignore
+            prng=prng2,
+            steps=jnp.zeros((), dtype=jnp.int32),
+        )
+
+    def get_beta_schedule(self) -> tuple[Array, Array, Array]:
+        steps = self.config.diffusion_steps
+        if self.config.beta_schedule == "linear":
+            betas = jnp.linspace(self.config.beta_start, self.config.beta_end, steps)
+            alphas = 1.0 - betas
+            alphas_cumprod = jnp.cumprod(alphas)
+        elif self.config.beta_schedule == "cosine":
+            s = 0.008
+            t = jnp.linspace(0, steps, steps + 1) / steps
+            alphas_cumprod_full = jnp.cos((t + s) / (1 + s) * jnp.pi / 2) ** 2
+            alphas_cumprod_full = alphas_cumprod_full / alphas_cumprod_full[0]
+            alphas_cumprod = alphas_cumprod_full[:-1]
+            alphas_cumprod_prev = jnp.concatenate([jnp.array([1.0]), alphas_cumprod[:-1]])
+            alphas = alphas_cumprod / alphas_cumprod_prev
+            betas = 1.0 - alphas
+            betas = jnp.clip(betas, 0.0001, 0.9999)
+        return betas, alphas, alphas_cumprod
+
+    def get_schedule(self):
+        # 对应 DDIM 采样的 schedule
+        _, _, alphas_cumprod = self.get_beta_schedule()
+        timesteps = jnp.arange(self.config.diffusion_steps - 1, -1, -1)
+        t_current = timesteps[:-1]
+        t_next = timesteps[1:]
+        alpha_t = alphas_cumprod[t_current]
+        alpha_next_from_schedule = alphas_cumprod[t_next]
+        alpha_next = jnp.where(t_next == 0, 1.0, alpha_next_from_schedule)
+
+        return DiffusionSchedule(
+            t_current=t_current.astype(jnp.float32),
+            t_next=t_next.astype(jnp.float32),
+            alpha_t=alpha_t,
+            alpha_next=alpha_next
+        )
+
+
+    def denoise_forward(self, obs_norm: Array, x_t: Array, t_embed: Array) -> Array:
+        noise_pred = networks.flow_mlp_fwd(self.params.policy, obs_norm, x_t, t_embed)
+        return noise_pred * self.config.policy_mlp_output_scale
+
+    def embed_timestep(self, t: Array) -> Array:
+        """Embed (*, 1) timestep into (*, timestep_embed_dim)."""
+        assert t.shape[-1] == 1
+        freqs = 2 ** jnp.arange(self.config.timestep_embed_dim // 2)
+        scaled_t = t * freqs
+        out = jnp.concatenate([jnp.cos(scaled_t), jnp.sin(scaled_t)], axis=-1)
+        assert out.shape == (*t.shape[:-1], self.config.timestep_embed_dim)
+        return out
+
+    def sample_action(
+            self, obs: Array, prng: Array, deterministic: bool
+    ) -> tuple[Array, DGPOActionInfo]:
+        """Sample an action from the policy given an observation."""
+        if self.config.normalize_observations:
+            obs_norm = (obs - self.obs_stats.mean) / self.obs_stats.std
+        else:
+            obs_norm = obs
+
+        (*batch_dims, obs_dim) = obs_norm.shape
+
+        def ddim_step(carry: Array, inputs):
+            x_t = carry
+            schedule_t, noise = inputs
+            t_embed = jnp.broadcast_to(
+                self.embed_timestep(schedule_t.t_current[None, None]),
+                (*batch_dims, self.config.timestep_embed_dim),
+            )
+            noise_pred = self.denoise_forward(obs_norm, x_t, t_embed)
+
+            sqrt_alpha_t = jnp.sqrt(schedule_t.alpha_t)
+            sqrt_one_minus_alpha_t = jnp.sqrt(1 - schedule_t.alpha_t)
+            sqrt_alpha_next = jnp.sqrt(schedule_t.alpha_next)
+            sqrt_one_minus_alpha_next = jnp.sqrt(1 - schedule_t.alpha_next)
+
+            x_0_pred = (x_t - sqrt_one_minus_alpha_t * noise_pred) / sqrt_alpha_t
+            x_t_next = sqrt_alpha_next * x_0_pred + sqrt_one_minus_alpha_next * noise_pred
+            x_t_next = x_t_next + self.config.sde_sigma * noise
+            return x_t_next, x_t
+
+        prng_sample, prng_noise, prng_feather = jax.random.split(prng, num=3)
+        noise_path = jax.random.normal(prng_noise, (self.config.diffusion_steps - 1, *batch_dims, self.env.action_size))
+
+        # Diffusion 是从纯噪声 x_T 开始的
+        x_T = jax.random.normal(prng_sample, (*batch_dims, self.env.action_size))
+
+        x_0, _ = jax.lax.scan(ddim_step, init=x_T, xs=(self.get_schedule(), noise_path))
+
+        if not deterministic:
+            perturb = jax.random.normal(prng_feather, (*batch_dims, self.env.action_size)) * self.config.feather_std
+            x_0 = x_0 + perturb
+
+        return x_0, DGPOActionInfo()  # 依然轻装上阵！
+
+    @jdc.jit
+    def training_step(
+        self, transitions: DGPOTransition
+    ) -> tuple[DGPODiffusionState, dict[str, Array]]:
+        # We're use a (T, B) shape convention, corresponding to a "scan of the
+        # vmap" and not a "vmap of the scan".
+        config = self.config
+        assert transitions.reward.shape == (config.iterations_per_env, config.num_envs)
+
+        # Update observation statistics.
+        state = self
+        if config.normalize_observations:
+            with jdc.copy_and_mutate(state) as state:
+                state.obs_stats = state.obs_stats.update(transitions.obs)
+        del self
+
+        def step_batch(state: DGPODiffusionState, _):
+            step_prng = jax.random.fold_in(state.prng, state.steps)
+            state, metrics = jax.lax.scan(
+                partial(
+                    DGPODiffusionState._step_minibatch, prng=jax.random.fold_in(step_prng, 0)
+                ),
+                init=state,
+                xs=transitions.prepare_minibatches(
+                    step_prng, config.num_minibatches, config.batch_size
+                ),
+            )
+            return state, metrics
+
+        # Do N updates over the full batch of transitions.
+        state, metrics = jax.lax.scan(
+            step_batch,
+            init=state,
+            length=config.num_updates_per_batch,
+        )
+
+        return state, metrics
+
+    def _step_minibatch(
+        self, transitions: DGPOTransition, prng: Array
+    ) -> tuple[DGPODiffusionState, dict[str, Array]]:
+        """One training step over a minibatch of transitions."""
+
+        assert transitions.reward.shape == (
+            self.config.unroll_length,
+            self.config.batch_size,
+        )
+        (loss, metrics), grads = jax.value_and_grad(
+            lambda params: DGPODiffusionState._compute_dgpo_loss(
+                jdc.replace(self, params=params),
+                transitions,
+                prng,
+            ),
+            has_aux=True,
+        )(self.params)
+        assert isinstance(grads, DGPOParams)
+        assert isinstance(loss, Array)
+        assert isinstance(metrics, dict)
+
+        param_update, new_opt_state = self.opt.update(grads, self.opt_state)  # type: ignore
+        param_update = jax.tree.map(
+            lambda x: -self.config.learning_rate * x, param_update
+        )
+        with jdc.copy_and_mutate(self) as state:
+            state.params = jax.tree.map(jnp.add, self.params, param_update)
+            state.opt_state = new_opt_state
+            state.steps = state.steps + 1
+        return state, metrics
+
+    def _compute_dgpo_loss(
+        self, transitions: DGPOTransition, prng: Array
+    ) -> tuple[Array, dict[str, Array]]:
+
+        (timesteps, batch_dim) = transitions.reward.shape
+        assert transitions.obs.shape == (
+            timesteps,
+            batch_dim,
+            self.env.observation_size,
+        )
+        assert transitions.action.shape == (
+            timesteps,
+            batch_dim,
+            self.env.action_size,
+        )
+
+        metrics = dict[str, Array]()
+
+        if self.config.normalize_observations:
+            obs_norm = (transitions.obs - self.obs_stats.mean) / self.obs_stats.std
+        else:
+            obs_norm = transitions.obs
+
+        prng_resample, prng_eps, prng_t = jax.random.split(prng, 3)
+        (timesteps, batch_dim) = transitions.reward.shape
+        N = timesteps * batch_dim
+
+        # 1. 获取 h_s (替换掉原来的 value_pred = networks.value_mlp_fwd(...))
+        value_pred, h_s = networks.value_mlp_fwd_with_features(self.params.value, obs_norm)
+
+        assert value_pred.shape == (timesteps, batch_dim)
+
+        bootstrap_obs_norm = (
+            transitions.next_obs[-1:, :, :] - self.obs_stats.mean
+        ) / self.obs_stats.std
+        bootstrap_value = networks.value_mlp_fwd(self.params.value, bootstrap_obs_norm)
+        assert bootstrap_value.shape == (1, batch_dim)
+
+        gae_vs, gae_advantages = jax.lax.stop_gradient(
+            rollouts.compute_gae(
+                truncation=transitions.truncation,
+                discount=transitions.discount * self.config.discounting,
+                rewards=transitions.reward * self.config.reward_scaling,
+                values=value_pred,
+                bootstrap_value=bootstrap_value,
+                gae_lambda=self.config.gae_lambda,
+            )
+        )
+
+        # Log advantage statistics before normalization
+        metrics["advantages_mean"] = jnp.mean(gae_advantages)
+        metrics["advantages_std"] = jnp.std(gae_advantages)
+        metrics["advantages_min"] = jnp.min(gae_advantages)
+        metrics["advantages_max"] = jnp.max(gae_advantages)
+
+        if self.config.normalize_advantage:
+            gae_advantages = (gae_advantages - gae_advantages.mean()) / (
+                gae_advantages.std() + 1e-8
+            )
+
+        # 2. 展平张量
+        flat_h_s = h_s.reshape((N, -1))
+        flat_actions = transitions.action.reshape((N, self.env.action_size))
+        flat_adv = gae_advantages.reshape((N,))
+        flat_obs = obs_norm.reshape((N, self.env.observation_size))
+
+        # 3. 计算隐空间距离矩阵
+        sq_norms = jnp.sum(flat_h_s ** 2, axis=-1)
+        dist_sq = jnp.maximum(0.0, sq_norms[:, None] + sq_norms[None, :] - 2 * jnp.matmul(flat_h_s, flat_h_s.T))
+        dist_matrix = jnp.sqrt(dist_sq + 1e-8)
+
+        # 4. 动态阈值与邻域掩码 (取 5% 分位数作为演示)
+        delta = jnp.quantile(dist_matrix, q=0.05)
+        mask = dist_matrix < delta
+
+        # 5. 计算优势加权 Logits (体现 exp(A/alpha) 思想)
+        alpha = 0.1
+        masked_adv = jnp.where(mask, flat_adv[None, :], -jnp.inf)
+        max_adv = jnp.max(masked_adv, axis=-1, keepdims=True)
+        logits = jnp.where(mask, (flat_adv[None, :] - max_adv) / alpha, -jnp.inf)
+
+        # 6. Gumbel-Max 重采样提取绝对纯净的目标动作 a_hat
+        # a_hat 此时就是完美无瑕的 x_0 目标！
+        gumbel_noise = jax.random.gumbel(prng_resample, shape=(N, N))
+        sampled_indices = jnp.argmax(logits + gumbel_noise, axis=-1)
+        a_hat = flat_actions[sampled_indices]
+
+        # ==========================================
+        # 7. 纯净 Diffusion DDPM 更新
+        # ==========================================
+        eps = jax.random.normal(prng_eps, (N, self.env.action_size))
+
+        # 采样离散时间步 t in [0, diffusion_steps-1]
+        t_int = jax.random.randint(prng_t, (N,), 0, self.config.diffusion_steps)
+        t_float = t_int.astype(jnp.float32)[..., None]  # 变成 (N, 1) 用于网络 Embedding
+
+        # 获取对应的 alpha_t
+        _, _, alphas_cumprod = self.get_beta_schedule()
+        alpha_t = alphas_cumprod[t_int]  # (N,)
+
+        # 核心加噪公式：x_t = sqrt(alpha_t) * x_0 + sqrt(1 - alpha_t) * eps
+        sqrt_alpha_t = jnp.sqrt(alpha_t)[..., None]  # (N, 1)
+        sqrt_one_minus_alpha_t = jnp.sqrt(1 - alpha_t)[..., None]  # (N, 1)
+
+        x_t = sqrt_alpha_t * a_hat + sqrt_one_minus_alpha_t * eps
+
+        # 预测噪声
+        noise_pred = self.denoise_forward(flat_obs, x_t, self.embed_timestep(t_float))
+
+        # 绝对纯净的 MSE 损失！依然没有高方差 RL 乘子！
+        policy_loss = jnp.mean((noise_pred - eps) ** 2)
+
+        # 8. 整合 metrics
+        v_error = (gae_vs - value_pred) * (1 - transitions.truncation)
+        v_loss = jnp.mean(v_error ** 2) * self.config.value_loss_coeff
+        total_loss = policy_loss + v_loss
+
+
+        metrics["policy_loss"] = policy_loss
+        metrics["v_loss"] = v_loss
+        metrics["advantages_mean"] = jnp.mean(gae_advantages)
+
+
+        return total_loss, metrics

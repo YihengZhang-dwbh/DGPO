@@ -46,6 +46,22 @@ def value_mlp_fwd(weights: MlpWeights, x: Array) -> Array:
     return x
 
 
+def value_mlp_fwd_with_features(weights: MlpWeights, x: Array) -> tuple[Array, Array]:
+    """Apply hidden layers, then output projection, and also return the latent features."""
+    for i in range(len(weights) - 1):
+        linear, bias = weights[i]
+        x = jnp.einsum("...i,ij->...j", x, linear) + bias
+        x = nn.silu(x)
+
+    # 截获倒数第二层的特征 h_s
+    h_s = x
+
+    linear, bias = weights[-1]
+    x = jnp.einsum("...i,ij->...j", x, linear) + bias
+    v_pred = jnp.squeeze(x, axis=-1)
+
+    return v_pred, h_s
+
 def flow_mlp_fwd(weights: MlpWeights, *inputs_to_concat: Array) -> Array:
     """Apply hidden layers, then output projection."""
     x = jnp.concatenate(inputs_to_concat, axis=-1)

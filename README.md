@@ -66,11 +66,16 @@ The training proceeds in multiple stages:
 1. **Stage 0**: Initialize decoder as identity mapping, train encoder with PPO
 2. **Stage 1+**: Collect data → Update decoder → Update encoder → Repeat
 
+### Beyond Two-Stage: Direct Generative Policy Optimization (DGPO)
+While GoRL resolves instability via alternating stages, our repository also introduces **DGPO** as a single-stage evolution. DGPO completely bypasses the need for an intermediate Gaussian encoder. Instead, it employs **Advantage-Weighted Gumbel-Max Resampling** within a local $K$-NN latent manifold to extract deterministic, high-quality target actions $\hat{a}$. This forms a mathematical "variance firewall," transforming the unstable policy gradient problem into a pure, zero-variance supervised MSE regression for the generative ODE/SDE.
+
 ## 📂 Directory Structure
 
 ```
 .
 ├── scripts/
+│   ├── train_dgpo_fm.py         - 🚀 NEW: DGPO with Flow Matching (End-to-end)
+│   ├── train_dgpo_diffusion.py  - 🚀 NEW: DGPO with Diffusion (End-to-end)
 │   ├── run_gorl_fm.py           - Main script: GoRL with Flow Matching
 │   ├── run_gorl_diffusion.py    - Main script: GoRL with Diffusion
 │   ├── train_ppo.py             - Baseline: Gaussian PPO
@@ -78,6 +83,8 @@ The training proceeds in multiple stages:
 │   └── components/              - Internal pipeline scripts
 │
 └── src/flow_policy/
+    ├── dgpo_fm.py               - 🚀 Core: DGPO Flow Matching engine
+    ├── dgpo_diffusion.py        - 🚀 Core: DGPO Diffusion engine
     ├── encoder_ppo.py           - Encoder (PPO in latent space)
     ├── decoder_fm.py            - Decoder (Flow Matching)
     ├── decoder_diffusion.py     - Decoder (Diffusion)
@@ -94,18 +101,29 @@ Tested with Python 3.12 on CUDA GPUs.
 
 ```bash
 # Clone the repository
-git clone https://github.com/bennidict23/GoRL.git
-cd GoRL
+https://github.com/YihengZhang-dwbh/DGPO.git
+cd DGPO
 
 # Create conda environment
-conda create -n GoRL python=3.12
-conda activate GoRL
+conda create -n DGPO python=3.12
+conda activate DGPO
 
 # Install dependencies
 pip install -r requirements.txt
 ```
 
 ## 🚀 Usage
+
+### ⚡ DGPO (Direct End-to-End Training)
+Train our latest single-stage, zero-variance generative policies:
+
+```bash
+# DGPO with Flow Matching
+CUDA_VISIBLE_DEVICES=0 python scripts/train_dgpo_fm.py --env_name FingerSpin --seed 1
+
+# DGPO with Diffusion
+CUDA_VISIBLE_DEVICES=0 python scripts/train_dgpo_diffusion.py --env_name FingerSpin --seed 1
+```
 
 ### GoRL
 
