@@ -420,42 +420,33 @@ class DGPOFMState:
             scaling_factor = 1.0
 
         # --- 邻域划分算法选择 ---
+        # 1. 计算距离 (保持不变)
         dist_matrix = jnp.sqrt(dist_sq + 1e-8)
 
-        # --- 2. 预计算所有可能的掩码 (JAX 风格，无分支) ---
-        # KNN 掩码
-        individual_deltas = jnp.quantile(dist_matrix, q=0.05, axis=-1)
-        mask_knn = dist_matrix < individual_deltas[:, None]
-
-        # Radius 掩码
-        mask_radius = dist_matrix < self.config.fixed_radius
-
-        # Top-K 掩码 (使用固定 K)
-        K_max = 32
-        # 注意：JAX 的 top_k 要求 k 必须是编译期常数。
-        # 如果 M < 32，jax.lax.top_k 会报错。所以我们用静态 K 值。
-        # 假设你的 batch 或 subsampling_m 总是大于 32。
-        _, topk_indices = jax.lax.top_k(-dist_matrix, k=K_max)
-        mask_topk = jnp.zeros_like(mask_radius, dtype=jnp.bool_).at[
-            jnp.arange(N)[:, None], topk_indices
-        ].set(True)
-
-        # --- 3. 根据 mode 静态选择最终掩码 ---
-        # 这里使用 Python string 比较，但要确保 mode 在 config 里是 jdc.Static
+        # 2. 优化后的分支：避免在 both 模式下计算昂贵的 quantile
         mode = self.config.resampling_mode
-
         if mode == "knn":
-            mask = mask_knn
+            # 只有纯 KNN 才算分位数
+            deltas = jnp.quantile(dist_matrix, q=0.05, axis=-1)
+            mask = dist_matrix < deltas[:, None]
         elif mode == "radius":
-            mask = mask_radius
+            mask = dist_matrix < self.config.fixed_radius
         elif mode == "both":
+            # 精英模式优化：跳过 quantile，直接 Radius + Top-K
+            mask_radius = dist_matrix < self.config.fixed_radius
+
+            # 减小 K 值提升速度 (比如从 32 降到 16)
+            K_val = 16
+            _, topk_indices = jax.lax.top_k(-dist_matrix, k=K_val)
+            mask_topk = jnp.zeros_like(mask_radius, dtype=jnp.bool_).at[
+                jnp.arange(N)[:, None], topk_indices
+            ].set(True)
+
             mask = mask_radius & mask_topk
         else:
-            # Fallback
-            mask = mask_knn
+            mask = dist_matrix < self.config.fixed_radius  # Default
 
-
-        # 兜底逻辑：防止孤立状态找不到任何邻居（导致 Logits 为空）
+        # 3. 兜底 (保持不变)
         mask = mask | (dist_matrix == jnp.min(dist_matrix, axis=-1, keepdims=True))
 
         # --- 核心改进：计算每个状态邻域内的动态 Alpha ---
