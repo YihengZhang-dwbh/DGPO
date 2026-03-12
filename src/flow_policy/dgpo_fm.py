@@ -436,7 +436,7 @@ class DGPOFMState:
             mask_radius = dist_matrix < self.config.fixed_radius
 
             # 减小 K 值提升速度 (比如从 32 降到 16)
-            K_val = 16
+            K_val = self.config.resampling_topk
             _, topk_indices = jax.lax.top_k(-dist_matrix, k=K_val)
             mask_topk = jnp.zeros_like(mask_radius, dtype=jnp.bool_).at[
                 jnp.arange(N)[:, None], topk_indices
