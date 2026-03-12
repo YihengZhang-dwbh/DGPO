@@ -101,7 +101,7 @@ Tested with Python 3.12 on CUDA GPUs.
 
 ```bash
 # Clone the repository
-https://github.com/YihengZhang-dwbh/DGPO.git
+cd https://github.com/YihengZhang-dwbh/DGPO.git
 cd DGPO
 
 # Create conda environment
