@@ -411,6 +411,19 @@ class DGPOFMState:
         # 兜底逻辑：防止孤立状态找不到任何邻居（导致 Logits 为空）
         mask = mask | (dist_matrix == jnp.min(dist_matrix, axis=-1, keepdims=True))
 
+        # --- 核心改进：计算每个状态邻域内的动态 Alpha ---
+        # 提取邻域内的 Advantage：非邻域位置设为 0 以便计算绝对值最大值
+        # 注意：这里 cand_adv[None, :] 会广播到 (N, M)
+        local_adv_pool = jnp.where(mask, cand_adv[None, :], 0.0)
+
+        # 计算局部尺度：每个状态邻域内 Advantage 的最大绝对值 (N,)
+        # 使用 stop_gradient 防止温度调节产生二阶梯度干扰优化过程
+        local_scale = jax.lax.stop_gradient(jnp.max(jnp.abs(local_adv_pool), axis=-1))
+
+        # 动态 Alpha：基准温度 * (局部尺度 + 极小偏移防止除零)
+        # 这样当局部差异很小时，Alpha 会自动缩小以放大信号
+        dynamic_alpha = self.config.resampling_alpha * (local_scale + 1e-6)
+
         # --- 监控指标计算 (已修复前缀冲突) ---
         neighbor_counts = jnp.sum(mask, axis=-1)
         avg_neighbors = jnp.mean(neighbor_counts)
@@ -421,15 +434,21 @@ class DGPOFMState:
         # --- 核心重采样计算 ---
         masked_adv = jnp.where(mask, cand_adv[None, :], -jnp.inf)
         max_adv = jnp.max(masked_adv, axis=-1, keepdims=True)
-        logits = jnp.where(mask, (masked_adv - max_adv) / self.config.resampling_alpha, -jnp.inf)
+
+        # 应用动态 Alpha：注意 dynamic_alpha[:, None] 确保对每个状态应用它自己的温度
+        logits = jnp.where(mask, (masked_adv - max_adv) / dynamic_alpha[:, None], -jnp.inf)
 
         gumbel_noise = jax.random.gumbel(prng_resample, shape=gumbel_shape)
         sampled_rel_indices = jnp.argmax(logits + gumbel_noise, axis=-1)
 
         a_hat = flat_actions[pool_indices_ref[sampled_rel_indices]]
 
+        # --- 指标监控 ---
+        metrics["dgpo/dynamic_alpha_mean"] = jnp.mean(dynamic_alpha)
+        metrics["dgpo/local_scale_max"] = jnp.max(local_scale)
+
         # ... 后面接流匹配 MSE Loss ...
-        
+
         # 7. 纯净流匹配 ODE 更新
         eps = jax.random.normal(prng_eps, (N, self.env.action_size))
         if self.config.discretize_t_for_training:
