@@ -356,51 +356,53 @@ class DGPOFMState:
         flat_actions = transitions.action.reshape((N, self.env.action_size))
         flat_adv = gae_advantages.reshape((N,))
 
-        # --- 2. 计算物理空间距离矩阵 (使用 flat_obs) ---
-        # 注意：这里建议加上 stop_gradient，因为我们不需要通过距离计算来更新网络
-        dist_input = jax.lax.stop_gradient(flat_obs)
-        sq_norms = jnp.sum(dist_input ** 2, axis=-1)
-        dist_sq = jnp.maximum(0.0, sq_norms[:, None] + sq_norms[None, :] - 2 * jnp.matmul(dist_input, dist_input.T))
-        dist_matrix = jnp.sqrt(dist_sq + 1e-8)
+        # ==========================================
+        # 6. 高效子采样重采样 (Subsampled Resampling)
+        # ==========================================
+        M = 512  # 候选池大小，根据显存调整 (512-1024 比较稳妥)
+        # 随机抽取 M 个索引作为全 Batch 的共同候选候选人
+        prng_pool, prng_resample = jax.random.split(prng_resample)
+        candidate_indices = jax.random.choice(prng_pool, N, shape=(M,), replace=False)
 
-        # --- 3. 动态邻域掩码 (B_s 的灵魂) ---
-        # 这里的 q 值可以根据实验调整，建议从 0.05 或 0.1 开始
-        delta = jnp.quantile(dist_matrix, q=0.05)
-        mask = dist_matrix < delta
+        # 计算 N 个状态对 M 个候选动作的距离矩阵 (N x M)
+        # 这里的 dist_matrix_sub 解决了你的 NameError
+        dist_input_all = jax.lax.stop_gradient(flat_obs)  # N x D
+        dist_input_cand = jax.lax.stop_gradient(flat_obs[candidate_indices])  # M x D
 
-        # --- 4. 关键：将 mask 应用于 Logits ---
-        alpha = 0.1  # 温度参数
-        # 只有物理邻域内的状态，其动作才有资格参与竞争
-        # 使用 -jnp.inf 彻底封死远距离动作被采样的可能性
-        masked_adv = jnp.where(mask, flat_adv[None, :], -jnp.inf)
-        max_adv = jnp.max(masked_adv, axis=-1, keepdims=True)
-        logits = jnp.where(mask, (flat_adv[None, :] - max_adv) / alpha, -jnp.inf)
+        sq_norms_all = jnp.sum(dist_input_all ** 2, axis=-1)
+        sq_norms_cand = jnp.sum(dist_input_cand ** 2, axis=-1)
+        dist_sq_sub = jnp.maximum(0.0, sq_norms_all[:, None] + sq_norms_cand[None, :] - 2 * jnp.matmul(dist_input_all,
+                                                                                                       dist_input_cand.T))
+        dist_matrix_sub = jnp.sqrt(dist_sq_sub + 1e-8)  # 维度: (N, M)
 
-        # --- 5. Gumbel-Max 采样 ---
-        # 此时生成的 sampled_indices 选出的 a_hat 才是真正的“物理近邻优等生”
-        gumbel_noise = jax.random.gumbel(prng_resample, shape=(N, N))
-        sampled_indices = jnp.argmax(logits + gumbel_noise, axis=-1)
-        a_hat = flat_actions[sampled_indices]
+        # 为每个状态单独计算属于它的物理邻域阈值 delta (针对候选池的 q 分位数)
+        # individual_deltas 维度: (N,)
+        individual_deltas = jnp.quantile(dist_matrix_sub, q=0.05, axis=-1)
+        mask = dist_matrix_sub < individual_deltas[:, None]
 
-
-        # --- 恢复全量监控指标 ---
-        # 在子采样模式下，我们通过距离分布来模拟原本的指标
+        # --- 修复你刚才提供的监控指标部分 ---
+        # 全部统一使用 dist_matrix_sub
         neighbor_counts = jnp.sum(dist_matrix_sub <= individual_deltas[:, None], axis=-1)
+        metrics["avg_neighbor_count"] = jnp.mean(neighbor_counts)
+        metrics["isolated_ratio"] = jnp.mean(neighbor_counts <= 1.0)
+        metrics["crowded_ratio"] = jnp.mean(neighbor_counts > (M * 0.1))
+        # 估计全量 Batch 下的类聚簇数：N / (在 M 规模下的平均邻居数 * 放大倍率)
+        metrics["est_clusters"] = N / (jnp.mean(neighbor_counts) * (N / M) + 1e-8)
+        # ----------------------------------
 
-        # 1. 平均邻居数 (在 K-NN 下这通常等于 k_neighbors)
-        avg_neighbor_count = jnp.mean(neighbor_counts)
+        # 计算优势 Logits (只看候选池里的邻居)
+        cand_adv = flat_adv[candidate_indices]  # M
+        masked_adv = jnp.where(mask, cand_adv[None, :], -jnp.inf)
+        max_adv = jnp.max(masked_adv, axis=-1, keepdims=True)
+        logits = jnp.where(mask, (cand_adv[None, :] - max_adv) / self.config.resampling_alpha, -jnp.inf)
 
-        # 2. 推估类数量 (考虑采样率 M/N)
-        # 这里的逻辑是：如果 M 个样本里能找到 k 个邻居，那么全量 N 样本里理论上有 k*(N/M) 个
-        est_clusters = N / (avg_neighbor_count * (N / M) + 1e-8)
+        # Gumbel-Max 采样选中 M 个候选人里的某一个
+        gumbel_noise = jax.random.gumbel(prng_resample, shape=(N, M))
+        sampled_sub_indices = jnp.argmax(logits + gumbel_noise, axis=-1)
 
-        # 3. 孤立样本比：在 M 个候选人里连 1 个够近的邻居都很难找
-        # 我们定义距离大于某个阈值或邻居数极少为孤立
-        isolated_ratio = jnp.mean(neighbor_counts <= 1.0)
-
-        # 4. 拥挤样本比：在子采样池里，邻居占比超过了 10% (说明局部性失效)
-        crowded_ratio = jnp.mean(neighbor_counts > (M * 0.1))
-        # ----------------------
+        # 映射回原始全量 Batch 的索引，提取 a_hat
+        final_indices = candidate_indices[sampled_sub_indices]
+        a_hat = flat_actions[final_indices]
 
         # 7. 纯净流匹配 ODE 更新
         eps = jax.random.normal(prng_eps, (N, self.env.action_size))
@@ -431,11 +433,11 @@ class DGPOFMState:
         metrics["v_loss"] = v_loss
         metrics["advantages_mean"] = jnp.mean(gae_advantages)
 
-        # 重点：在这里添加新指标，它们会被打印到 txt 和控制台
-        metrics["dgpo/est_clusters"] = est_clusters
-        metrics["dgpo/isolated_ratio"] = isolated_ratio
-        metrics["dgpo/crowded_ratio"] = crowded_ratio
-        metrics["dgpo/avg_neighbors"] = avg_neighbor_count
+        # 在 return 之前放开这些监控项
+        metrics["dgpo/avg_neighbor_count"] = metrics["avg_neighbor_count"]
+        metrics["dgpo/isolated_ratio"] = metrics["isolated_ratio"]
+        metrics["dgpo/crowded_ratio"] = metrics["crowded_ratio"]
+        metrics["dgpo/est_clusters"] = metrics["est_clusters"]
 
 
         return total_loss, metrics
