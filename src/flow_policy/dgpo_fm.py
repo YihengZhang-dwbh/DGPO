@@ -21,6 +21,7 @@ class DGPOFMConfig:
     resampling_alpha: float = 0.1
     resampling_mode: jdc.Static[Literal["knn", "radius"]] = "knn"
     fixed_radius: float = 0.5
+    resampling_topk: jdc.Static[int] = 32
 
     # 关键修改：JAX 内部的分支逻辑通常要求 M 的大小或采样开关在编译期确定
     use_subsampling: jdc.Static[bool] = False
@@ -421,13 +422,30 @@ class DGPOFMState:
         # --- 邻域划分算法选择 ---
         dist_matrix = jnp.sqrt(dist_sq + 1e-8)
 
+        # --- 2. 模式切换：决定基础搜索范围 ---
         if self.config.resampling_mode == "knn":
-            # 自适应 KNN：为每个状态找前 5% 近的候选动作
+            # 纯 KNN：每个状态找前 5%
             individual_deltas = jnp.quantile(dist_matrix, q=0.05, axis=-1)
             mask = dist_matrix < individual_deltas[:, None]
-        else:
-            # 固定物理半径：距离小于 fixed_radius 的才算邻居
+        elif self.config.resampling_mode == "radius":
+            # 纯 Radius：固定物理半径
             mask = dist_matrix < self.config.fixed_radius
+        elif self.config.resampling_mode == "both":
+            # 你的创新模式：在 Radius 之内取 Top-K
+            # 1. 先定物理边界
+            mask_radius = dist_matrix < self.config.fixed_radius
+            # 2. 再定数量边界 (精英筛选)
+            # 在 loss 函数中使用
+            K_max = self.config.resampling_topk
+            _, topk_indices = jax.lax.top_k(-dist_matrix, k=jnp.minimum(K_max, dist_matrix.shape[-1]))
+            mask_topk = jnp.zeros_like(mask_radius, dtype=jnp.bool_).at[jnp.arange(N)[:, None], topk_indices].set(True)
+            # 3. 逻辑交集：既要近，又要强
+            mask = mask_radius & mask_topk
+        else:
+            # 默认回退到 KNN
+            individual_deltas = jnp.quantile(dist_matrix, q=0.05, axis=-1)
+            mask = dist_matrix < individual_deltas[:, None]
+
 
         # 兜底逻辑：防止孤立状态找不到任何邻居（导致 Logits 为空）
         mask = mask | (dist_matrix == jnp.min(dist_matrix, axis=-1, keepdims=True))
