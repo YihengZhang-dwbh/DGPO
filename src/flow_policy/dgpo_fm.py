@@ -306,9 +306,10 @@ class DGPOFMState:
         policy_lr = self.config.learning_rate
         value_lr = self.config.learning_rate * 2.5
 
-        # 将变换后的梯度乘以负的学习率 (因为是梯度下降)
-        # 我们对 policy 和 value 分别处理
-        new_updates = updates.replace(
+        # 使用 jdc.replace 重新组装更新项
+        # 我们对 policy 和 value 的 pytree 分别乘上负的学习率
+        new_updates = jdc.replace(
+            updates,
             policy=jax.tree.map(lambda x: -policy_lr * x, updates.policy),
             value=jax.tree.map(lambda x: -value_lr * x, updates.value)
         )
