@@ -110,6 +110,7 @@ conda activate DGPO
 
 # Install dependencies
 pip install -r requirements.txt
+pip install warp-lang
 ```
 
 ## 🚀 Usage
