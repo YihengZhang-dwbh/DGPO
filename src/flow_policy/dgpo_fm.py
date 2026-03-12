@@ -351,61 +351,37 @@ class DGPOFMState:
                 gae_advantages.std() + 1e-8
             )
 
-        # 2. 展平张量
-        flat_h_s = h_s.reshape((N, -1))
+        # --- 1. 展平张量 (直接使用归一化后的 obs) ---
+        flat_obs = obs_norm.reshape((N, self.env.observation_size))
         flat_actions = transitions.action.reshape((N, self.env.action_size))
         flat_adv = gae_advantages.reshape((N,))
-        flat_obs = obs_norm.reshape((N, self.env.observation_size))
 
-        # ========================== 极速子采样逻辑开始 ==========================
-        # 3. 随机选择一个固定的候选池 M (例如 1024)，显著降低计算量
-        M = 1024
-        key_sample, prng_resample = jax.random.split(prng_resample)
-        # 随机选出 M 个“参考邻居”
-        candidate_indices = jax.random.choice(key_sample, N, shape=(M,), replace=False)
+        # --- 2. 计算物理空间距离矩阵 (使用 flat_obs) ---
+        # 注意：这里建议加上 stop_gradient，因为我们不需要通过距离计算来更新网络
+        dist_input = jax.lax.stop_gradient(flat_obs)
+        sq_norms = jnp.sum(dist_input ** 2, axis=-1)
+        dist_sq = jnp.maximum(0.0, sq_norms[:, None] + sq_norms[None, :] - 2 * jnp.matmul(dist_input, dist_input.T))
+        dist_matrix = jnp.sqrt(dist_sq + 1e-8)
 
-        h_s_candidates = flat_h_s[candidate_indices]  # (M, D)
-        actions_candidates = flat_actions[candidate_indices]  # (M, A)
-        adv_candidates = flat_adv[candidate_indices]  # (M,)
+        # --- 3. 动态邻域掩码 (B_s 的灵魂) ---
+        # 这里的 q 值可以根据实验调整，建议从 0.05 或 0.1 开始
+        delta = jnp.quantile(dist_matrix, q=0.05)
+        mask = dist_matrix < delta
 
-        # 4. 只计算 N x M 的距离矩阵 (不再是 N x N)
-        # 矩阵大小从 9亿 缩小到 3千万，显存压力瞬间消失
-        def compute_dist_row(single_h):
-            # 计算单个状态对 M 个候选者的距离
-            return jnp.sum((single_h - h_s_candidates) ** 2, axis=-1)
+        # --- 4. 关键：将 mask 应用于 Logits ---
+        alpha = 0.1  # 温度参数
+        # 只有物理邻域内的状态，其动作才有资格参与竞争
+        # 使用 -jnp.inf 彻底封死远距离动作被采样的可能性
+        masked_adv = jnp.where(mask, flat_adv[None, :], -jnp.inf)
+        max_adv = jnp.max(masked_adv, axis=-1, keepdims=True)
+        logits = jnp.where(mask, (flat_adv[None, :] - max_adv) / alpha, -jnp.inf)
 
-        # 使用 vmap 批量计算 N 个状态对应的 M 个距离
-        dist_matrix_sub = jax.vmap(compute_dist_row)(flat_h_s)  # (N, M)
+        # --- 5. Gumbel-Max 采样 ---
+        # 此时生成的 sampled_indices 选出的 a_hat 才是真正的“物理近邻优等生”
+        gumbel_noise = jax.random.gumbel(prng_resample, shape=(N, N))
+        sampled_indices = jnp.argmax(logits + gumbel_noise, axis=-1)
+        a_hat = flat_actions[sampled_indices]
 
-        # 5. 在 M 个候选者中找最近的 k 个
-        k_neighbors = 8  # 因为候选池小了，k 也可以适当减小提升速度
-        neg_dists, top_k_sub_indices = jax.lax.top_k(-dist_matrix_sub, k_neighbors)
-
-        # --- 修复位置：定义 individual_deltas ---
-        # 这里的每一行的最后一个值就是第 k 个最近邻的距离（取正值）
-        individual_deltas = -neg_dists[:, -1]
-        # --------------------------------------
-
-        # 获取这些邻居在候选池中的 Advantage
-        # neighbor_advs 形状为 (N, k_neighbors)
-        neighbor_advs = adv_candidates[top_k_sub_indices]
-
-        # 6. Gumbel-Max 重采样 (在 k 个最近邻中选优势最大的)
-        max_adv = jnp.max(neighbor_advs, axis=-1, keepdims=True)
-        logits = (neighbor_advs - max_adv) / self.config.resampling_alpha
-
-        gumbel_noise = jax.random.gumbel(prng_resample, shape=(N, k_neighbors))
-        resample_choice = jnp.argmax(logits + gumbel_noise, axis=-1)  # (N,)
-
-        # 映射回动作空间
-        # 从 top_k_sub_indices 中选出被选中的那个参考点的索引
-        final_indices_in_candidates = jnp.take_along_axis(
-            top_k_sub_indices, resample_choice[:, None], axis=1
-        ).squeeze()
-
-        # 最终的目标动作 a_hat
-        a_hat = actions_candidates[final_indices_in_candidates]
-        # ========================== 极速子采样逻辑结束 ==========================
 
         # --- 恢复全量监控指标 ---
         # 在子采样模式下，我们通过距离分布来模拟原本的指标
