@@ -19,7 +19,7 @@ from . import math_utils, networks, rollouts
 class DGPOFMConfig:
     # --- 重采样控制核心 ---
     resampling_alpha: float = 0.1
-    resampling_mode: jdc.Static[Literal["knn", "radius"]] = "knn"
+    resampling_mode: jdc.Static[Literal["knn", "radius", "both"]] = "knn"
     fixed_radius: float = 0.5
     resampling_topk: jdc.Static[int] = 32
 
@@ -305,7 +305,7 @@ class DGPOFMState:
         # Policy 更新步长: lr
         # Value 更新步长: lr * 2.5
         policy_lr = self.config.learning_rate
-        value_lr = self.config.learning_rate * 2.5
+        value_lr = self.config.learning_rate #* 2.5
 
         # 使用 jdc.replace 重新组装更新项
         # 我们对 policy 和 value 的 pytree 分别乘上负的学习率
