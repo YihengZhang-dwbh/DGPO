@@ -140,23 +140,24 @@ class DGPOFMState:
         # # We'll manage learning rate ourselves!
         # opt = optax.scale_by_adam()
 
-        # --- 核心改进：非对称学习率 (Asymmetric LR) ---
-        # 为 Policy 和 Value 定义不同的优化器
-        # 建议 Critic LR 是 Policy 的 2-3 倍
-        policy_lr = config.learning_rate
-        critic_lr = config.learning_rate * 2.5  # 针对 FingerSpin 调高
+        # --- 修复后的非对称学习率定义 ---
+        # 核心：使用函数闭包来延迟获取学习率，避免 Tracer 泄露
+        def make_policy_opt():
+            return optax.adam(config.learning_rate)
+
+        def make_value_opt():
+            # 这里直接计算倍数，不再定义中间变量
+            return optax.adam(config.learning_rate * 2.5)
 
         lr_map = {
-            "policy": optax.adam(policy_lr),
-            "value": optax.adam(critic_lr)
+            "policy": make_policy_opt(),
+            "value": make_value_opt()
         }
 
-        # 使用 multi_transform 进行分配
-        # 这里假设 DGPOFMParams 的字段名就是 "policy" 和 "value"
-        opt = optax.multi_transform(
-            lr_map,
-            DGPOFMParams(policy="policy", value="value")
-        )
+        # labels 必须是静态的，这没问题
+        labels = DGPOFMParams(policy="policy", value="value")
+
+        opt = optax.multi_transform(lr_map, labels)
         # ------------------------------------------
 
 
