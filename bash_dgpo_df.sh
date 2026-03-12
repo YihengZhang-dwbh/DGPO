@@ -15,4 +15,4 @@ echo "Run DGPO (Diffusion)... > logs/train_dgpo_diffusion_${env_name}_${time}.tx
 CUDA_VISIBLE_DEVICES=$id python scripts/train_dgpo_diffusion.py \
     --env-name $env_name \
     --seed $seed \
-    > logs/train_dgpo_diffusion_${env_name}_${time}.txt 2>&1 &
+    > logs/train_dgpo_diffusion_${env_name}_${time}.txt 2>&1
