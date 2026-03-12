@@ -17,12 +17,15 @@ from . import math_utils, networks, rollouts
 
 @jdc.pytree_dataclass
 class DGPOFMConfig:
-    # Closed
-    resampling_alpha: float = 0.1  # 新增：控制重采样的“温度”
-
+    # --- 重采样控制核心 ---
+    resampling_alpha: float = 0.1
     resampling_mode: jdc.Static[Literal["knn", "radius"]] = "knn"
-    fixed_radius: float = 0.5  # 仅在 "radius" 模式下生效
-    use_subsampling: False
+    fixed_radius: float = 0.5
+
+    # 关键修改：JAX 内部的分支逻辑通常要求 M 的大小或采样开关在编译期确定
+    use_subsampling: jdc.Static[bool] = False
+    subsampling_m: jdc.Static[int] = 512
+    # --------------------
 
     # Flow parameters.
     flow_steps: jdc.Static[int] = 10
@@ -361,13 +364,14 @@ class DGPOFMState:
         flat_actions = transitions.action.reshape((N, self.env.action_size))
         flat_adv = gae_advantages.reshape((N,))
 
+        # ... 前面 GAE 和展平逻辑保持不变 ...
+
         # ==========================================
-        # 6. 重采样逻辑 (修复监控指标与命名冲突)
+        # 6. 重采样逻辑 (支持急速子采样 + KNN/Radius 双模)
         # ==========================================
         if self.config.use_subsampling:
             M = self.config.subsampling_m
             prng_pool, prng_resample = jax.random.split(prng_resample)
-            # 确保 M 不超过 N
             actual_m = jnp.minimum(M, N)
             candidate_indices = jax.random.choice(prng_pool, N, shape=(actual_m,), replace=False)
 
@@ -393,40 +397,39 @@ class DGPOFMState:
             pool_indices_ref = jnp.arange(N)
             scaling_factor = 1.0
 
-
-
-
-        # --- 共同逻辑：划分邻域 ---
+        # --- 邻域划分算法选择 ---
         dist_matrix = jnp.sqrt(dist_sq + 1e-8)
 
         if self.config.resampling_mode == "knn":
-            # 自适应 KNN：确保每个状态都有前 5% 的候选人作为邻居
+            # 自适应 KNN：为每个状态找前 5% 近的候选动作
             individual_deltas = jnp.quantile(dist_matrix, q=0.05, axis=-1)
             mask = dist_matrix < individual_deltas[:, None]
         else:
-            # 固定半径：只有物理距离小于阈值的才算邻居 (更严格的局部性)
+            # 固定物理半径：距离小于 fixed_radius 的才算邻居
             mask = dist_matrix < self.config.fixed_radius
 
-        # --- 监控指标计算 (修复 KeyError) ---
+        # 兜底逻辑：防止孤立状态找不到任何邻居（导致 Logits 为空）
+        mask = mask | (dist_matrix == jnp.min(dist_matrix, axis=-1, keepdims=True))
+
+        # --- 监控指标计算 (已修复前缀冲突) ---
         neighbor_counts = jnp.sum(mask, axis=-1)
         avg_neighbors = jnp.mean(neighbor_counts)
-
         metrics["dgpo/avg_neighbor_count"] = avg_neighbors
         metrics["dgpo/isolated_ratio"] = jnp.mean(neighbor_counts <= 1.0)
-        metrics["dgpo/crowded_ratio"] = jnp.mean(neighbor_counts > (gumbel_shape[1] * 0.1))
         metrics["dgpo/est_clusters"] = N / (avg_neighbors * scaling_factor + 1e-8)
 
         # --- 核心重采样计算 ---
         masked_adv = jnp.where(mask, cand_adv[None, :], -jnp.inf)
         max_adv = jnp.max(masked_adv, axis=-1, keepdims=True)
-        logits = jnp.where(mask, (cand_adv[None, :] - max_adv) / self.config.resampling_alpha, -jnp.inf)
+        logits = jnp.where(mask, (masked_adv - max_adv) / self.config.resampling_alpha, -jnp.inf)
 
         gumbel_noise = jax.random.gumbel(prng_resample, shape=gumbel_shape)
         sampled_rel_indices = jnp.argmax(logits + gumbel_noise, axis=-1)
 
-        # 提取最终动作
         a_hat = flat_actions[pool_indices_ref[sampled_rel_indices]]
 
+        # ... 后面接流匹配 MSE Loss ...
+        
         # 7. 纯净流匹配 ODE 更新
         eps = jax.random.normal(prng_eps, (N, self.env.action_size))
         if self.config.discretize_t_for_training:
