@@ -137,29 +137,8 @@ class DGPOFMState:
 
         network_params = DGPOFMParams(actor_net, critic_net)
 
-        # # We'll manage learning rate ourselves!
-        # opt = optax.scale_by_adam()
-
-        # --- 修复后的非对称学习率定义 ---
-        # 核心：使用函数闭包来延迟获取学习率，避免 Tracer 泄露
-        def make_policy_opt():
-            return optax.adam(config.learning_rate)
-
-        def make_value_opt():
-            # 这里直接计算倍数，不再定义中间变量
-            return optax.adam(config.learning_rate * 2.5)
-
-        lr_map = {
-            "policy": make_policy_opt(),
-            "value": make_value_opt()
-        }
-
-        # labels 必须是静态的，这没问题
-        labels = DGPOFMParams(policy="policy", value="value")
-
-        opt = optax.multi_transform(lr_map, labels)
-        # ------------------------------------------
-
+        # We'll manage learning rate ourselves!
+        opt = optax.scale_by_adam()
 
         return DGPOFMState(
             env=env,
@@ -167,7 +146,7 @@ class DGPOFMState:
             params=network_params,
             obs_stats=math_utils.RunningStats.init((obs_size,)),
             opt=opt,
-            opt_state=opt.init(network_params),  # type: ignore
+            opt_state=opt.init(network_params),
             prng=prng2,
             steps=jnp.zeros((), dtype=jnp.int32),
         )
@@ -290,6 +269,9 @@ class DGPOFMState:
 
         return state, metrics
 
+
+
+
     def _step_minibatch(
         self, transitions: DGPOFMTransition, prng: Array
     ) -> tuple[DGPOFMState, dict[str, Array]]:
@@ -315,11 +297,24 @@ class DGPOFMState:
         # param_update = jax.tree.map(
         #     lambda x: -self.config.learning_rate * x, param_update
         # )
-        param_update, new_opt_state = self.opt.update(grads, self.opt_state, self.params)
+        # 1. 正常的 Adam 梯度变换 (矩估计归一化)
+        updates, new_opt_state = self.opt.update(grads, self.opt_state, self.params)
+
+        # 2. 手动应用非对称学习率更新
+        # Policy 更新步长: lr
+        # Value 更新步长: lr * 2.5
+        policy_lr = self.config.learning_rate
+        value_lr = self.config.learning_rate * 2.5
+
+        # 将变换后的梯度乘以负的学习率 (因为是梯度下降)
+        # 我们对 policy 和 value 分别处理
+        new_updates = updates.replace(
+            policy=jax.tree.map(lambda x: -policy_lr * x, updates.policy),
+            value=jax.tree.map(lambda x: -value_lr * x, updates.value)
+        )
+
         with jdc.copy_and_mutate(self) as state:
-            # state.params = jax.tree.map(jnp.add, self.params, param_update)
-            # 直接 apply_updates
-            state.params = optax.apply_updates(self.params, param_update)
+            state.params = optax.apply_updates(self.params, new_updates)
             state.opt_state = new_opt_state
             state.steps = state.steps + 1
         return state, metrics
