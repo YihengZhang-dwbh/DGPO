@@ -17,6 +17,8 @@ from . import math_utils, networks, rollouts
 
 @jdc.pytree_dataclass
 class DGPOFMConfig:
+    # Closed
+    resampling_alpha: float = 0.1  # 新增：控制重采样的“温度”
     # Flow parameters.
     flow_steps: jdc.Static[int] = 10
     output_mode: jdc.Static[Literal["u", "u_but_supervise_as_eps"]] = (
@@ -365,10 +367,11 @@ class DGPOFMState:
         mask = dist_matrix < delta
 
         # 5. 计算优势加权 Logits (体现 exp(A/alpha) 思想)
-        alpha = 0.1
         masked_adv = jnp.where(mask, flat_adv[None, :], -jnp.inf)
         max_adv = jnp.max(masked_adv, axis=-1, keepdims=True)
-        logits = jnp.where(mask, (flat_adv[None, :] - max_adv) / alpha, -jnp.inf)
+
+        # 使用 self.config.resampling_alpha
+        logits = jnp.where(mask, (flat_adv[None, :] - max_adv) / self.config.resampling_alpha, -jnp.inf)
 
         # --- 聚类/退化情况监控 ---
         neighbor_counts = jnp.sum(mask, axis=-1)  # 每个样本的邻居数 (N,)

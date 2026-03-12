@@ -22,6 +22,8 @@ class DiffusionSchedule(NamedTuple):
 
 @jdc.pytree_dataclass
 class DGPODiffusionConfig:
+    # Closed
+    resampling_alpha: float = 0.1  # 新增：控制重采样的“温度”
     # --- 替换这部分 ---
     diffusion_steps: jdc.Static[int] = 10  # 对应原来的 flow_steps
     beta_schedule: jdc.Static[str] = "cosine"
@@ -381,10 +383,27 @@ class DGPODiffusionState:
         mask = dist_matrix < delta
 
         # 5. 计算优势加权 Logits (体现 exp(A/alpha) 思想)
-        alpha = 0.1
+        # alpha = 0.1  <-- 删掉这一行
         masked_adv = jnp.where(mask, flat_adv[None, :], -jnp.inf)
         max_adv = jnp.max(masked_adv, axis=-1, keepdims=True)
-        logits = jnp.where(mask, (flat_adv[None, :] - max_adv) / alpha, -jnp.inf)
+
+        # 使用 self.config.resampling_alpha
+        logits = jnp.where(mask, (flat_adv[None, :] - max_adv) / self.config.resampling_alpha, -jnp.inf)
+
+        # --- 聚类/退化情况监控 ---
+        neighbor_counts = jnp.sum(mask, axis=-1)  # 每个样本的邻居数 (N,)
+
+        # 1. 推估有效类的数量 (1 / 占有率)
+        # 如果所有样本都在一个类，est_clusters 为 1
+        avg_neighbor_count = jnp.mean(neighbor_counts)
+        est_clusters = N / (avg_neighbor_count + 1e-8)
+
+        # 2. 样本比例分布
+        # 孤立样本：基本只看自己
+        isolated_ratio = jnp.mean(neighbor_counts <= 1.5)
+        # 拥挤样本：邻居超过总数的 5%（说明局部性开始失效）
+        crowded_ratio = jnp.mean(neighbor_counts > (N * 0.05))
+        # -----------------------
 
         # 6. Gumbel-Max 重采样提取绝对纯净的目标动作 a_hat
         # a_hat 此时就是完美无瑕的 x_0 目标！
@@ -426,6 +445,13 @@ class DGPODiffusionState:
         metrics["policy_loss"] = policy_loss
         metrics["v_loss"] = v_loss
         metrics["advantages_mean"] = jnp.mean(gae_advantages)
+
+
+        # 重点：在这里添加新指标，它们会被打印到 txt 和控制台
+        metrics["dgpo/est_clusters"] = est_clusters
+        metrics["dgpo/isolated_ratio"] = isolated_ratio
+        metrics["dgpo/crowded_ratio"] = crowded_ratio
+        metrics["dgpo/avg_neighbors"] = avg_neighbor_count
 
 
         return total_loss, metrics
