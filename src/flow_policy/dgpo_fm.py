@@ -19,12 +19,15 @@ from . import math_utils, networks, rollouts
 class DGPOFMConfig:
     # --- 重采样控制核心 ---
     resampling_alpha: float = 0.1
-    resampling_mode: jdc.Static[Literal["knn", "radius", "both"]] = "knn"
+    # [新增]: 添加了 "cluster" 模式
+    resampling_mode: jdc.Static[Literal["knn", "radius", "both", "cluster"]] = "knn"
     fixed_radius: float = 0.5
     resampling_topk: jdc.Static[int] = 32
+    # [新增]: 聚类中心数量
+    num_clusters: jdc.Static[int] = 64
 
     # 控制损失权重
-    w_v_loss: float = 2.
+    w_v_loss: float = 1.
 
     # 关键修改：JAX 内部的分支逻辑通常要求 M 的大小或采样开关在编译期确定
     use_subsampling: jdc.Static[bool] = False
@@ -80,7 +83,7 @@ class DGPOFMConfig:
         """Number of iterations (=policy forward passes) per environment at the
         start of each training step."""
         return (
-            self.num_minibatches * self.batch_size * self.unroll_length
+                self.num_minibatches * self.batch_size * self.unroll_length
         ) // self.num_envs
 
 
@@ -100,7 +103,9 @@ class FlowSchedule:
     t_current: Array  # (*, flow_steps) - timesteps at the start of each step
     t_next: Array  # (*, flow_steps) - timesteps at the end of each step
 
+
 DGPOFMTransition = rollouts.TransitionStruct[DGPOFMActionInfo]
+
 
 @jdc.pytree_dataclass
 class DGPOFMState:
@@ -174,7 +179,7 @@ class DGPOFMState:
 
     def sample_action(
             self, obs: Array, prng: Array, deterministic: bool
-    ) -> tuple[Array, DGPOFMActionInfo]:  # <-- 修复了这里的类型提示
+    ) -> tuple[Array, DGPOFMActionInfo]:
         """Sample an action from the policy given an observation."""
         if self.config.normalize_observations:
             obs_norm = (obs - self.obs_stats.mean) / self.obs_stats.std
@@ -237,7 +242,7 @@ class DGPOFMState:
 
     @jdc.jit
     def training_step(
-        self, transitions: DGPOFMTransition
+            self, transitions: DGPOFMTransition
     ) -> tuple[DGPOFMState, dict[str, Array]]:
         # We're use a (T, B) shape convention, corresponding to a "scan of the
         # vmap" and not a "vmap of the scan".
@@ -273,11 +278,8 @@ class DGPOFMState:
 
         return state, metrics
 
-
-
-
     def _step_minibatch(
-        self, transitions: DGPOFMTransition, prng: Array
+            self, transitions: DGPOFMTransition, prng: Array
     ) -> tuple[DGPOFMState, dict[str, Array]]:
         """One training step over a minibatch of transitions."""
 
@@ -297,18 +299,12 @@ class DGPOFMState:
         assert isinstance(loss, Array)
         assert isinstance(metrics, dict)
 
-        # param_update, new_opt_state = self.opt.update(grads, self.opt_state)  # type: ignore
-        # param_update = jax.tree.map(
-        #     lambda x: -self.config.learning_rate * x, param_update
-        # )
         # 1. 正常的 Adam 梯度变换 (矩估计归一化)
         updates, new_opt_state = self.opt.update(grads, self.opt_state, self.params)
 
         # 2. 手动应用非对称学习率更新
-        # Policy 更新步长: lr
-        # Value 更新步长: lr * 2.5
         policy_lr = self.config.learning_rate
-        value_lr = self.config.learning_rate #* 2.5
+        value_lr = self.config.learning_rate  # * 2.5
 
         # 使用 jdc.replace 重新组装更新项
         # 我们对 policy 和 value 的 pytree 分别乘上负的学习率
@@ -325,7 +321,7 @@ class DGPOFMState:
         return state, metrics
 
     def _compute_dgpofm_loss(
-        self, transitions: DGPOFMTransition, prng: Array
+            self, transitions: DGPOFMTransition, prng: Array
     ) -> tuple[Array, dict[str, Array]]:
 
         (timesteps, batch_dim) = transitions.reward.shape
@@ -357,8 +353,8 @@ class DGPOFMState:
         assert value_pred.shape == (timesteps, batch_dim)
 
         bootstrap_obs_norm = (
-            transitions.next_obs[-1:, :, :] - self.obs_stats.mean
-        ) / self.obs_stats.std
+                                     transitions.next_obs[-1:, :, :] - self.obs_stats.mean
+                             ) / self.obs_stats.std
         bootstrap_value = networks.value_mlp_fwd(self.params.value, bootstrap_obs_norm)
         assert bootstrap_value.shape == (1, batch_dim)
 
@@ -381,7 +377,7 @@ class DGPOFMState:
 
         if self.config.normalize_advantage:
             gae_advantages = (gae_advantages - gae_advantages.mean()) / (
-                gae_advantages.std() + 1e-8
+                    gae_advantages.std() + 1e-8
             )
 
         # --- 1. 展平张量 (直接使用归一化后的 obs) ---
@@ -389,106 +385,148 @@ class DGPOFMState:
         flat_actions = transitions.action.reshape((N, self.env.action_size))
         flat_adv = gae_advantages.reshape((N,))
 
-        # ... 前面 GAE 和展平逻辑保持不变 ...
+        # =========================================================================
+        # [核心增量修改]：使用 if/else 完全隔离 Cluster 模式与原有模式
+        # =========================================================================
+        if self.config.resampling_mode == "cluster":
+            # --- 全新：基于状态空间的高效聚类重采样 (O(N*C) 复杂度) ---
+            C = self.config.num_clusters
+            prng_cluster, prng_resample = jax.random.split(prng_resample)
 
-        # ==========================================
-        # 6. 重采样逻辑 (支持急速子采样 + KNN/Radius 双模)
-        # ==========================================
-        if self.config.use_subsampling:
-            M = self.config.subsampling_m
-            prng_pool, prng_resample = jax.random.split(prng_resample)
-            actual_m = jnp.minimum(M, N)
-            candidate_indices = jax.random.choice(prng_pool, N, shape=(actual_m,), replace=False)
+            # 1. 初始化聚类中心 (随机从 flat_obs 中抽 C 个)
+            initial_indices = jax.random.choice(prng_cluster, N, shape=(C,), replace=False)
+            centers = jax.lax.stop_gradient(flat_obs[initial_indices])
 
-            dist_input_all = jax.lax.stop_gradient(flat_obs)
-            dist_input_cand = jax.lax.stop_gradient(flat_obs[candidate_indices])
+            # 2. 简化的 K-Means 迭代 (3步足以确定局部拓扑)
+            def kmeans_step(centers, _):
+                dist_to_centers = jnp.sum((flat_obs[:, None, :] - centers[None, :, :]) ** 2, axis=-1)  # (N, C)
+                labels = jnp.argmin(dist_to_centers, axis=-1)
+                one_hot = jax.nn.one_hot(labels, C)
+                # 更新重心，+1e-8 防止除以0
+                new_centers = jnp.matmul(one_hot.T, flat_obs) / (jnp.sum(one_hot, axis=0)[:, None] + 1e-8)
+                return jax.lax.stop_gradient(new_centers), labels
 
-            sq_norms_all = jnp.sum(dist_input_all ** 2, axis=-1)
-            sq_norms_cand = jnp.sum(dist_input_cand ** 2, axis=-1)
-            dist_sq = jnp.maximum(0.0, sq_norms_all[:, None] + sq_norms_cand[None, :] - 2 * jnp.matmul(dist_input_all,
-                                                                                                       dist_input_cand.T))
+            _, labels = jax.lax.scan(kmeans_step, centers, None, length=3)
+            one_hot_labels = jax.nn.one_hot(labels, C)  # (N, C)
 
-            cand_adv = flat_adv[candidate_indices]
-            gumbel_shape = (N, actual_m)
-            pool_indices_ref = candidate_indices
-            scaling_factor = N / actual_m
+            # 3. 簇内动态温度与 Gumbel-Max 采样
+            # 掩码优势矩阵：点i如果不属于簇c，则其优势为 -inf
+            masked_adv_cluster = jnp.where(one_hot_labels, flat_adv[:, None], -jnp.inf)
+
+            # 计算每个簇的局部动态 Alpha (C,)
+            local_adv_pool = jnp.where(one_hot_labels, flat_adv[:, None], 0.0)
+            local_scale_c = jax.lax.stop_gradient(jnp.max(jnp.abs(local_adv_pool), axis=0))
+            dynamic_alpha_c = self.config.resampling_alpha * (local_scale_c + 1e-6)
+
+            # 簇内 Logits 计算 (N, C)
+            max_adv_c = jnp.max(masked_adv_cluster, axis=0, keepdims=True)  # (1, C)
+            logits_c = jnp.where(one_hot_labels, (masked_adv_cluster - max_adv_c) / dynamic_alpha_c[None, :], -jnp.inf)
+
+            # 为每个簇独立进行 1 次 Gumbel-Max 采样，找出最佳候选索引
+            gumbel_noise_c = jax.random.gumbel(prng_resample, shape=(N, C))
+            sampled_idx_per_cluster = jnp.argmax(logits_c + gumbel_noise_c, axis=0)  # (C,)
+
+            # 提取每个簇的"行为原语"，并分配给该簇的所有状态成员
+            cluster_sampled_actions = flat_actions[sampled_idx_per_cluster]  # (C, action_dim)
+            a_hat = cluster_sampled_actions[labels]  # (N, action_dim)
+
+            # 4. 指标监控对齐 (适配 Cluster 模式)
+            cluster_sizes = jnp.sum(one_hot_labels, axis=0)
+            metrics["dgpo/avg_neighbor_count"] = jnp.mean(cluster_sizes)  # 这里等同于簇的平均大小
+            metrics["dgpo/isolated_ratio"] = jnp.mean(cluster_sizes <= 1.0)
+            metrics["dgpo/est_clusters"] = jnp.array(C, dtype=jnp.float32)
+            metrics["dgpo/dynamic_alpha_mean"] = jnp.mean(dynamic_alpha_c)
+            metrics["dgpo/local_scale_max"] = jnp.max(local_scale_c)
+
         else:
-            dist_input = jax.lax.stop_gradient(flat_obs)
-            sq_norms = jnp.sum(dist_input ** 2, axis=-1)
-            dist_sq = jnp.maximum(0.0, sq_norms[:, None] + sq_norms[None, :] - 2 * jnp.matmul(dist_input, dist_input.T))
+            # =========================================================================
+            # [原有逻辑区]：如果不是 cluster，则原封不动走 KNN / Radius / Both 的老路
+            # =========================================================================
+            if self.config.use_subsampling:
+                M = self.config.subsampling_m
+                prng_pool, prng_resample = jax.random.split(prng_resample)
+                actual_m = jnp.minimum(M, N)
+                candidate_indices = jax.random.choice(prng_pool, N, shape=(actual_m,), replace=False)
 
-            cand_adv = flat_adv
-            gumbel_shape = (N, N)
-            pool_indices_ref = jnp.arange(N)
-            scaling_factor = 1.0
+                dist_input_all = jax.lax.stop_gradient(flat_obs)
+                dist_input_cand = jax.lax.stop_gradient(flat_obs[candidate_indices])
 
-        # --- 邻域划分算法选择 ---
-        # 1. 计算距离 (保持不变)
-        dist_matrix = jnp.sqrt(dist_sq + 1e-8)
+                sq_norms_all = jnp.sum(dist_input_all ** 2, axis=-1)
+                sq_norms_cand = jnp.sum(dist_input_cand ** 2, axis=-1)
+                dist_sq = jnp.maximum(0.0,
+                                      sq_norms_all[:, None] + sq_norms_cand[None, :] - 2 * jnp.matmul(dist_input_all,
+                                                                                                      dist_input_cand.T))
 
-        # 2. 优化后的分支：避免在 both 模式下计算昂贵的 quantile
-        mode = self.config.resampling_mode
-        if mode == "knn":
-            # 只有纯 KNN 才算分位数
-            deltas = jnp.quantile(dist_matrix, q=0.05, axis=-1)
-            mask = dist_matrix < deltas[:, None]
-        elif mode == "radius":
-            mask = dist_matrix < self.config.fixed_radius
-        elif mode == "both":
-            # 精英模式优化：跳过 quantile，直接 Radius + Top-K
-            mask_radius = dist_matrix < self.config.fixed_radius
+                cand_adv = flat_adv[candidate_indices]
+                gumbel_shape = (N, actual_m)
+                pool_indices_ref = candidate_indices
+                scaling_factor = N / actual_m
+            else:
+                dist_input = jax.lax.stop_gradient(flat_obs)
+                sq_norms = jnp.sum(dist_input ** 2, axis=-1)
+                dist_sq = jnp.maximum(0.0,
+                                      sq_norms[:, None] + sq_norms[None, :] - 2 * jnp.matmul(dist_input, dist_input.T))
 
-            # 减小 K 值提升速度 (比如从 32 降到 16)
-            K_val = self.config.resampling_topk
-            _, topk_indices = jax.lax.top_k(-dist_matrix, k=K_val)
-            mask_topk = jnp.zeros_like(mask_radius, dtype=jnp.bool_).at[
-                jnp.arange(N)[:, None], topk_indices
-            ].set(True)
+                cand_adv = flat_adv
+                gumbel_shape = (N, N)
+                pool_indices_ref = jnp.arange(N)
+                scaling_factor = 1.0
 
-            mask = mask_radius & mask_topk
-        else:
-            mask = dist_matrix < self.config.fixed_radius  # Default
+            # --- 邻域划分算法选择 ---
+            # 1. 计算距离
+            dist_matrix = jnp.sqrt(dist_sq + 1e-8)
 
-        # 3. 兜底 (保持不变)
-        mask = mask | (dist_matrix == jnp.min(dist_matrix, axis=-1, keepdims=True))
+            # 2. 模式切换
+            mode = self.config.resampling_mode
+            if mode == "knn":
+                deltas = jnp.quantile(dist_matrix, q=0.05, axis=-1)
+                mask = dist_matrix < deltas[:, None]
+            elif mode == "radius":
+                mask = dist_matrix < self.config.fixed_radius
+            elif mode == "both":
+                mask_radius = dist_matrix < self.config.fixed_radius
+                K_val = self.config.resampling_topk
+                _, topk_indices = jax.lax.top_k(-dist_matrix, k=K_val)
+                mask_topk = jnp.zeros_like(mask_radius, dtype=jnp.bool_).at[
+                    jnp.arange(N)[:, None], topk_indices
+                ].set(True)
+                mask = mask_radius & mask_topk
+            else:
+                mask = dist_matrix < self.config.fixed_radius  # Default
 
-        # --- 核心改进：计算每个状态邻域内的动态 Alpha ---
-        # 提取邻域内的 Advantage：非邻域位置设为 0 以便计算绝对值最大值
-        # 注意：这里 cand_adv[None, :] 会广播到 (N, M)
-        local_adv_pool = jnp.where(mask, cand_adv[None, :], 0.0)
+            # 3. 兜底
+            mask = mask | (dist_matrix == jnp.min(dist_matrix, axis=-1, keepdims=True))
 
-        # 计算局部尺度：每个状态邻域内 Advantage 的最大绝对值 (N,)
-        # 使用 stop_gradient 防止温度调节产生二阶梯度干扰优化过程
-        local_scale = jax.lax.stop_gradient(jnp.max(jnp.abs(local_adv_pool), axis=-1))
+            # --- 计算每个状态邻域内的动态 Alpha ---
+            local_adv_pool = jnp.where(mask, cand_adv[None, :], 0.0)
+            local_scale = jax.lax.stop_gradient(jnp.max(jnp.abs(local_adv_pool), axis=-1))
+            dynamic_alpha = self.config.resampling_alpha * (local_scale + 1e-6)
 
-        # 动态 Alpha：基准温度 * (局部尺度 + 极小偏移防止除零)
-        # 这样当局部差异很小时，Alpha 会自动缩小以放大信号
-        dynamic_alpha = self.config.resampling_alpha * (local_scale + 1e-6)
+            # --- 监控指标计算 ---
+            neighbor_counts = jnp.sum(mask, axis=-1)
+            avg_neighbors = jnp.mean(neighbor_counts)
+            metrics["dgpo/avg_neighbor_count"] = avg_neighbors
+            metrics["dgpo/isolated_ratio"] = jnp.mean(neighbor_counts <= 1.0)
+            metrics["dgpo/est_clusters"] = N / (avg_neighbors * scaling_factor + 1e-8)
 
-        # --- 监控指标计算 (已修复前缀冲突) ---
-        neighbor_counts = jnp.sum(mask, axis=-1)
-        avg_neighbors = jnp.mean(neighbor_counts)
-        metrics["dgpo/avg_neighbor_count"] = avg_neighbors
-        metrics["dgpo/isolated_ratio"] = jnp.mean(neighbor_counts <= 1.0)
-        metrics["dgpo/est_clusters"] = N / (avg_neighbors * scaling_factor + 1e-8)
+            # --- 核心重采样计算 ---
+            masked_adv = jnp.where(mask, cand_adv[None, :], -jnp.inf)
+            max_adv = jnp.max(masked_adv, axis=-1, keepdims=True)
 
-        # --- 核心重采样计算 ---
-        masked_adv = jnp.where(mask, cand_adv[None, :], -jnp.inf)
-        max_adv = jnp.max(masked_adv, axis=-1, keepdims=True)
+            logits = jnp.where(mask, (masked_adv - max_adv) / dynamic_alpha[:, None], -jnp.inf)
 
-        # 应用动态 Alpha：注意 dynamic_alpha[:, None] 确保对每个状态应用它自己的温度
-        logits = jnp.where(mask, (masked_adv - max_adv) / dynamic_alpha[:, None], -jnp.inf)
+            gumbel_noise = jax.random.gumbel(prng_resample, shape=gumbel_shape)
+            sampled_rel_indices = jnp.argmax(logits + gumbel_noise, axis=-1)
 
-        gumbel_noise = jax.random.gumbel(prng_resample, shape=gumbel_shape)
-        sampled_rel_indices = jnp.argmax(logits + gumbel_noise, axis=-1)
+            a_hat = flat_actions[pool_indices_ref[sampled_rel_indices]]
 
-        a_hat = flat_actions[pool_indices_ref[sampled_rel_indices]]
+            # --- 指标监控 ---
+            metrics["dgpo/dynamic_alpha_mean"] = jnp.mean(dynamic_alpha)
+            metrics["dgpo/local_scale_max"] = jnp.max(local_scale)
 
-        # --- 指标监控 ---
-        metrics["dgpo/dynamic_alpha_mean"] = jnp.mean(dynamic_alpha)
-        metrics["dgpo/local_scale_max"] = jnp.max(local_scale)
-
-        # ... 后面接流匹配 MSE Loss ...
+        # =========================================================================
+        # 重采样块结束，继续后续的流匹配 (不受任何影响)
+        # =========================================================================
 
         # 7. 纯净流匹配 ODE 更新
         eps = jax.random.normal(prng_eps, (N, self.env.action_size))
@@ -510,20 +548,13 @@ class DGPOFMState:
         else:
             policy_loss = jnp.mean((velocity_pred - (eps - a_hat)) ** 2)
 
-        # 8. 整合 metrics 返回 (替换原本 FPO 的复杂 ratio metrics)
+        # 8. 整合 metrics 返回
         v_error = (gae_vs - value_pred) * (1 - transitions.truncation)
         v_loss = jnp.mean(v_error ** 2) * self.config.value_loss_coeff
-        total_loss = policy_loss + v_loss*self.config.w_v_loss
+        total_loss = policy_loss + v_loss * self.config.w_v_loss
 
         metrics["policy_loss"] = policy_loss
         metrics["v_loss"] = v_loss
         metrics["advantages_mean"] = jnp.mean(gae_advantages)
-
-        # # 在 return 之前放开这些监控项
-        # metrics["dgpo/avg_neighbor_count"] = metrics["avg_neighbor_count"]
-        # metrics["dgpo/isolated_ratio"] = metrics["isolated_ratio"]
-        # metrics["dgpo/crowded_ratio"] = metrics["crowded_ratio"]
-        # metrics["dgpo/est_clusters"] = metrics["est_clusters"]
-
 
         return total_loss, metrics
