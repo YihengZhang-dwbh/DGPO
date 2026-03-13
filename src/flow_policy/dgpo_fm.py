@@ -291,7 +291,7 @@ class DGPOFMState:
         flat_vs = gae_vs.reshape((N, 1))
         v_centers = jax.lax.stop_gradient(flat_vs[jax.random.choice(prng_v, N, shape=(K_v,), replace=False)])
 
-        for _ in range(3):
+        for _ in range(5):
             v_dist = jnp.sum((flat_vs[:, None, :] - v_centers[None, :, :]) ** 2, axis=-1)
             v_labels = jnp.argmin(v_dist, axis=-1)
             v_one_hot = jax.nn.one_hot(v_labels, K_v)
@@ -304,10 +304,12 @@ class DGPOFMState:
 
         # 空间扭曲压缩：最大物理距离压缩到 0.5 以内 (平方 < 0.25)
         max_norm = jax.lax.stop_gradient(jnp.max(jnp.linalg.norm(flat_obs, axis=-1, keepdims=True))) + 1e-8
-        s_T = (flat_obs / max_norm) * 0.25
+        # s_T = (flat_obs / max_norm) * 0.25
+        # # 你的神级向量：[压缩物理状态, 价值阶层]
+        # fused_vectors = jnp.concatenate([s_T, point_ranks], axis=-1)
 
         # 你的神级向量：[压缩物理状态, 价值阶层]
-        fused_vectors = jnp.concatenate([s_T, point_ranks], axis=-1)
+        fused_vectors = jnp.concatenate([flat_obs, point_ranks*4*max_norm], axis=-1)
 
         # === 极简融合逻辑 ===
         flat_hs = h_s.reshape((N, -1))
@@ -330,35 +332,6 @@ class DGPOFMState:
             C = self.config.num_clusters
 
             prng_v, prng_p, prng_resample = jax.random.split(prng_resample, 3)
-
-            # =========================================================
-            # 1. 1D 价值聚类，获取每个点的价值等级 (Rank)
-            # =========================================================
-            flat_vs = gae_vs.reshape((N, 1))
-            v_centers = jax.lax.stop_gradient(flat_vs[jax.random.choice(prng_v, N, shape=(K_v,), replace=False)])
-
-            for _ in range(3):
-                v_dist = jnp.sum((flat_vs[:, None, :] - v_centers[None, :, :]) ** 2, axis=-1)
-                v_labels = jnp.argmin(v_dist, axis=-1)
-                v_one_hot = jax.nn.one_hot(v_labels, K_v)
-                v_centers = jnp.matmul(v_one_hot.T, flat_vs) / (jnp.sum(v_one_hot, axis=0)[:, None] + 1e-8)
-
-            # 将 v_centers 排序，得出每个簇的 Rank (0 到 K_v - 1)
-            sorted_v_indices = jnp.argsort(v_centers.squeeze())
-            ranks = jnp.argsort(sorted_v_indices)  # 映射表：旧簇ID -> 排名Rank
-            point_ranks = ranks[v_labels].astype(jnp.float32)[:, None]  # (N, 1)，这就是你的 T_i，此时 delta 严格为 1.0
-
-            # =========================================================
-            # 2. 空间扭曲压缩：构造融合向量 [s_T, T_i]
-            # =========================================================
-            # 获取当前 batch 最大物理半径，并将其压缩到 0.25 (确保两点物理最大距离为 0.5 < delta=1.0)
-            max_norm = jax.lax.stop_gradient(jnp.max(jnp.linalg.norm(flat_obs, axis=-1, keepdims=True))) + 1e-8
-            # s_T = (flat_obs / max_norm) * 0.25
-            # # 拼出你的“神之向量”
-            # fused_vectors = jnp.concatenate([s_T, point_ranks], axis=-1)
-
-            # 拼出你的“神之向量”
-            fused_vectors = jnp.concatenate([flat_obs, point_ranks*max_norm*4], axis=-1)
 
             # =========================================================
             # 3. 全局自适应 K-Means (天然等效两次聚类)
@@ -480,8 +453,10 @@ class DGPOFMState:
             # =========================================================
             # 👑 利用数学构造，生成“绝对阶级隔离墙”
             # =========================================================
-            # 只要距离 < 1.0，在数学上绝对保证它们属于同一个 Value Rank！
-            same_class_mask = dist_matrix_fused < 1.0
+            # # 只要距离 < 1.0，在数学上绝对保证它们属于同一个 Value Rank！
+            # same_class_mask = dist_matrix_fused < 1.0
+            # 既然放大系数是 4 * max_norm，那么只要距离小于这个系数，就绝对是同一阶级
+            same_class_mask = dist_matrix_fused < (2 * max_norm)
 
             # =========================================================
             # 2. 模式切换 (所有模式都必须服从阶级隔离)
@@ -511,8 +486,18 @@ class DGPOFMState:
             else:
                 mask = (dist_matrix_phys < self.config.fixed_radius) & same_class_mask
 
-            # 3. 兜底 (自己永远是自己的邻居)
-            mask = mask | (dist_matrix_phys == jnp.min(dist_matrix_phys, axis=-1, keepdims=True))
+            # 1. 找出同阶级内，候选池里离你物理最近的那个人的距离
+            # (用 jnp.where 把不同阶级的人距离设为无穷大，这样 min 就只会挑同类)
+            min_phys_dist_in_class = jnp.min(
+                jnp.where(same_class_mask, dist_matrix_phys, jnp.inf),
+                axis=-1, keepdims=True
+            )
+
+            # 2. 只有当这个距离不是无穷大（即候选池里确实有同类）时，才把它作为保底
+            safe_in_class_mask = (dist_matrix_phys == min_phys_dist_in_class) & same_class_mask
+
+            # 3. 最终的 mask
+            mask = mask | safe_in_class_mask
 
             # --- 计算每个状态邻域内的动态 Alpha ---
             local_adv_pool = jnp.where(mask, cand_adv[None, :], 0.0)
