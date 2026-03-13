@@ -300,98 +300,102 @@ class DGPOFMState:
         if self.config.resampling_mode == "cluster":
             K_v = self.config.num_value_buckets
             C = self.config.num_clusters
-            assert C % K_v == 0, "聚类总数必须能被价值桶数整除"
-            C_p = C // K_v  # 每个价值桶内的物理簇数量
 
             prng_v, prng_p, prng_resample = jax.random.split(prng_resample, 3)
 
             # =========================================================
-            # 1. 动态价值聚类 (1D K-Means on gae_vs)
+            # 1. 1D 价值聚类，获取每个点的价值等级 (Rank)
             # =========================================================
             flat_vs = gae_vs.reshape((N, 1))
-            # 随机初始化价值中心
             v_centers = jax.lax.stop_gradient(flat_vs[jax.random.choice(prng_v, N, shape=(K_v,), replace=False)])
 
-            # 跑 3 轮 1D K-Means (按绝对价值距离聚类，打破数量平均)
             for _ in range(3):
-                v_dist = jnp.sum((flat_vs[:, None, :] - v_centers[None, :, :]) ** 2, axis=-1)  # (N, K_v)
-                v_labels = jnp.argmin(v_dist, axis=-1)  # (N,)
-                v_one_hot = jax.nn.one_hot(v_labels, K_v)  # (N, K_v)
+                v_dist = jnp.sum((flat_vs[:, None, :] - v_centers[None, :, :]) ** 2, axis=-1)
+                v_labels = jnp.argmin(v_dist, axis=-1)
+                v_one_hot = jax.nn.one_hot(v_labels, K_v)
                 v_centers = jnp.matmul(v_one_hot.T, flat_vs) / (jnp.sum(v_one_hot, axis=0)[:, None] + 1e-8)
-                v_centers = jax.lax.stop_gradient(v_centers)
 
-            # 此时 v_one_hot 就是我们的“价值隔离墙”：完全按照真实价值分布，而非数量分布！
+            # 将 v_centers 排序，得出每个簇的 Rank (0 到 K_v - 1)
+            sorted_v_indices = jnp.argsort(v_centers.squeeze())
+            ranks = jnp.argsort(sorted_v_indices)  # 映射表：旧簇ID -> 排名Rank
+            point_ranks = ranks[v_labels].astype(jnp.float32)[:, None]  # (N, 1)，这就是你的 T_i，此时 delta 严格为 1.0
 
             # =========================================================
-            # 2. 价值掩码下的物理聚类 (Masked Physical K-Means)
+            # 2. 空间扭曲压缩：构造融合向量 [s_T, T_i]
             # =========================================================
-            # 随机初始化 C 个物理中心
-            centers = jax.lax.stop_gradient(flat_obs[jax.random.choice(prng_p, N, shape=(C,), replace=False)])
-            sq_norms_obs = jnp.sum(flat_obs ** 2, axis=-1)
+            # 获取当前 batch 最大物理半径，并将其压缩到 0.25 (确保两点物理最大距离为 0.5 < delta=1.0)
+            max_norm = jax.lax.stop_gradient(jnp.max(jnp.linalg.norm(flat_obs, axis=-1, keepdims=True))) + 1e-8
+            s_T = (flat_obs / max_norm) * 0.25
+
+            # 拼出你的“神之向量”
+            fused_vectors = jnp.concatenate([s_T, point_ranks], axis=-1)
+
+            # =========================================================
+            # 3. 全局自适应 K-Means (天然等效两次聚类)
+            # =========================================================
+            centers = jax.lax.stop_gradient(fused_vectors[jax.random.choice(prng_p, N, shape=(C,), replace=False)])
+            sq_norms_fused = jnp.sum(fused_vectors ** 2, axis=-1)
 
             labels = jnp.zeros((N,), dtype=jnp.int32)
             for _ in range(3):
                 sq_norms_centers = jnp.sum(centers ** 2, axis=-1)
-                # 高速计算所有点到所有中心的物理距离 (N, C)
-                dist = jnp.maximum(0.0, sq_norms_obs[:, None] + sq_norms_centers[None, :] - 2 * jnp.matmul(flat_obs,
-                                                                                                           centers.T))
+                dist = jnp.maximum(0.0,
+                                   sq_norms_fused[:, None] + sq_norms_centers[None, :] - 2 * jnp.matmul(fused_vectors,
+                                                                                                        centers.T))
 
-                # 施加价值隔离墙：折叠为 (N, K_v, C_p) 并用 v_one_hot 掩码
-                # 如果一个点不属于这个价值桶，它到该桶内所有中心的距离都将是无穷大
-                dist_3d = dist.reshape((N, K_v, C_p))
-                masked_dist_3d = jnp.where(v_one_hot[:, :, None], dist_3d, jnp.inf)
-                masked_dist = masked_dist_3d.reshape((N, C))
-
-                labels = jnp.argmin(masked_dist, axis=-1)
+                labels = jnp.argmin(dist, axis=-1)
                 one_hot = jax.nn.one_hot(labels, C)
-
-                # 只有同一个价值桶内的点，才能拉扯对应的中心
-                centers = jnp.matmul(one_hot.T, flat_obs) / (jnp.sum(one_hot, axis=0)[:, None] + 1e-8)
+                centers = jnp.matmul(one_hot.T, fused_vectors) / (jnp.sum(one_hot, axis=0)[:, None] + 1e-8)
                 centers = jax.lax.stop_gradient(centers)
 
             # =========================================================
-            # 3. 离群点检测 (回归原汁原味的纯物理距离)
+            # 4. 离群点检测 (极其关键：必须换回原汁原味的未压缩物理空间！)
             # =========================================================
-            sq_norms_centers = jnp.sum(centers ** 2, axis=-1)
-            dist = jnp.maximum(0.0,
-                               sq_norms_obs[:, None] + sq_norms_centers[None, :] - 2 * jnp.matmul(flat_obs, centers.T))
-
-            # 再次施加隔离墙，确保只能看到自己价值桶内的距离
-            masked_dist = jnp.where(v_one_hot[:, :, None], dist.reshape((N, K_v, C_p)), jnp.inf).reshape((N, C))
-            min_dists_sq = jnp.min(masked_dist, axis=-1)  # (N,)
-
-            is_outlier = min_dists_sq > (self.config.fixed_radius ** 2)
+            # 我们只需要知道每个中心被分配到了哪些状态，用这些状态算出原始的物理中心
             one_hot_labels = jax.nn.one_hot(labels, C)
+            # 还原出纯物理的聚类中心
+            physical_centers = jnp.matmul(one_hot_labels.T, flat_obs) / (
+                        jnp.sum(one_hot_labels, axis=0)[:, None] + 1e-8)
+            physical_centers = jax.lax.stop_gradient(physical_centers)
+
+            # 在原尺寸下计算物理距离，判定离群点，完美保留你的 fixed_radius 物理意义！
+            sq_norms_obs = jnp.sum(flat_obs ** 2, axis=-1)
+            sq_norms_phys_centers = jnp.sum(physical_centers ** 2, axis=-1)
+            phys_dist = jnp.maximum(0.0,
+                                    sq_norms_obs[:, None] + sq_norms_phys_centers[None, :] - 2 * jnp.matmul(flat_obs,
+                                                                                                            physical_centers.T))
+
+            min_dists_sq = jnp.min(phys_dist, axis=-1)
+            is_outlier = min_dists_sq > (self.config.fixed_radius ** 2)
             valid_one_hot = one_hot_labels * (~is_outlier[:, None])
 
             # =========================================================
-            # 4. 簇内 Gumbel-Max 选优 (与之前完全相同)
+            # 5. 簇内 Gumbel-Max 选优 (保持原样)
             # =========================================================
-            masked_adv_cluster = jnp.where(valid_one_hot, flat_adv[:, None], -jnp.inf)
+            masked_adv = jnp.where(valid_one_hot, flat_adv[:, None], -jnp.inf)
             local_adv_pool = jnp.where(valid_one_hot, flat_adv[:, None], 0.0)
 
             local_scale_c = jax.lax.stop_gradient(jnp.max(jnp.abs(local_adv_pool), axis=0))
             dynamic_alpha_c = self.config.resampling_alpha * (local_scale_c + 1e-6)
 
-            max_adv_c = jnp.max(masked_adv_cluster, axis=0, keepdims=True)
-            logits_c = jnp.where(valid_one_hot, (masked_adv_cluster - max_adv_c) / dynamic_alpha_c[None, :], -jnp.inf)
+            max_adv_c = jnp.max(masked_adv, axis=0, keepdims=True)
+            logits_c = jnp.where(valid_one_hot, (masked_adv - max_adv_c) / dynamic_alpha_c[None, :], -jnp.inf)
 
             gumbel_noise_c = jax.random.gumbel(prng_resample, shape=(N, C))
-            sampled_idx_per_cluster = jnp.argmax(logits_c + gumbel_noise_c, axis=0)  # (C,)
+            sampled_idx_per_cluster = jnp.argmax(logits_c + gumbel_noise_c, axis=0)
 
             cluster_sampled_actions = flat_actions[sampled_idx_per_cluster]
             a_hat_normal = cluster_sampled_actions[labels]
 
-            # 离群点自我克隆
             a_hat = jnp.where(is_outlier[:, None], flat_actions, a_hat_normal)
 
-            # =========================================================
-            # 5. 监控指标
-            # =========================================================
+            # 监控指标
             cluster_sizes = jnp.sum(valid_one_hot, axis=0)
             metrics["dgpo/avg_neighbor_count"] = jnp.mean(cluster_sizes)
             metrics["dgpo/dynamic_alpha_mean"] = jnp.mean(dynamic_alpha_c)
             metrics["dgpo/outlier_ratio"] = jnp.mean(is_outlier)
+            metrics["dgpo/est_clusters"] = jnp.array(C, dtype=jnp.float32)
+            metrics["dgpo/local_scale_max"] = jnp.max(local_scale_c)
         else:
             # =========================================================================
             # [原有逻辑区]：如果不是 cluster，则原封不动走 KNN / Radius / Both 的老路
