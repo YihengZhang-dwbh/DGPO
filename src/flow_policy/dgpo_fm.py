@@ -316,9 +316,59 @@ class DGPOFMState:
             value=jax.tree.map(lambda x: -value_lr * x, updates.value)
         )
 
+        # 1. 获取第一轮联合更新后的参数 (Policy 在这里完成了本轮的唯一一次更新)
+        new_params = optax.apply_updates(self.params, new_updates)
+
+        # === 增量修改 2：实装 Critic 专属的局部 Adam 微调 ===
+        target_vs = metrics["_target_vs"]
+        del metrics["_target_vs"]  # 阅后即焚，不污染外层数据结构
+
+        # 核心：单独定义一个纯净的局部 Adam 优化器，不干扰全局动量
+        extra_v_opt = optax.adam(self.config.learning_rate_v)
+        extra_v_opt_state = extra_v_opt.init(new_params.value)
+
+        def extra_value_update(carry, _):
+            curr_v_params, curr_v_opt_state = carry
+
+            def v_loss_fn(v_params):
+                # 重构归一化特征
+                if self.config.normalize_observations:
+                    obs_norm = (transitions.obs - self.obs_stats.mean) / self.obs_stats.std
+                else:
+                    obs_norm = transitions.obs
+
+                v_pred, _ = networks.value_mlp_fwd_with_features(v_params, obs_norm)
+                v_error = (target_vs - v_pred) * (1 - transitions.truncation)
+                return jnp.mean(v_error ** 2)
+
+            # 获取 Value 梯度
+            v_loss_val, v_grads = jax.value_and_grad(v_loss_fn)(curr_v_params)
+
+            # 使用局部 Adam 步进
+            v_updates, next_v_opt_state = extra_v_opt.update(v_grads, curr_v_opt_state, curr_v_params)
+            # 这里不用乘负学习率了，因为 optax.adam 内部已经自带了下降逻辑
+            next_v_params = optax.apply_updates(curr_v_params, v_updates)
+
+            return (next_v_params, next_v_opt_state), v_loss_val
+
+        # 强制 Critic 额外用 Adam 猛练 4 次！
+        (final_v_params, _), extra_v_losses = jax.lax.scan(
+            extra_value_update,
+            (new_params.value, extra_v_opt_state),
+            None,
+            length=4
+        )
+
+        # 把小灶练出来的 Critic 拼回主参数里
+        final_params = jdc.replace(new_params, value=final_v_params)
+
+        # 记录小灶结束后的最终残差
+        metrics["v_loss_after_extra"] = extra_v_losses[-1] * self.config.value_loss_coeff
+        # =======================================================
+
         with jdc.copy_and_mutate(self) as state:
-            state.params = optax.apply_updates(self.params, new_updates)
-            state.opt_state = new_opt_state
+            state.params = final_params
+            state.opt_state = new_opt_state  # 全局优化器状态只接受了第一次的更新，完美保护
             state.steps = state.steps + 1
         return state, metrics
 
@@ -562,5 +612,6 @@ class DGPOFMState:
         metrics["policy_loss"] = policy_loss
         metrics["v_loss"] = v_loss
         metrics["advantages_mean"] = jnp.mean(gae_advantages)
-
+        # === 增量修改 1：将真实回报目标暴露出去 ===
+        metrics["_target_vs"] = jax.lax.stop_gradient(gae_vs)
         return total_loss, metrics
