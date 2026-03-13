@@ -301,104 +301,97 @@ class DGPOFMState:
             K_v = self.config.num_value_buckets
             C = self.config.num_clusters
             assert C % K_v == 0, "聚类总数必须能被价值桶数整除"
-            C_p = C // K_v  # 每个价值桶内的簇数量 (比如 64 // 8 = 8)
-            B = N // K_v  # 每个桶内的数据量
+            C_p = C // K_v  # 每个价值桶内的物理簇数量
 
-            prng_cluster, prng_resample = jax.random.split(prng_resample)
-
-            # =========================================================
-            # 1. 价值分层 (Value Stratification)
-            # =========================================================
-            # 按照 GAE Value (真实的价值预期) 对所有数据进行排序
-            sort_idx = jnp.argsort(gae_vs.reshape(-1))
-            inverse_sort_idx = jnp.argsort(sort_idx)  # 用于最后把顺序恢复原样
-
-            # 利用排好序的索引，把状态、动作、优势重新排列，并“折叠”出桶维度 K_v
-            bucketed_obs = flat_obs[sort_idx].reshape((K_v, B, self.env.observation_size))
-            bucketed_adv = flat_adv[sort_idx].reshape((K_v, B))
-            bucketed_actions = flat_actions[sort_idx].reshape((K_v, B, self.env.action_size))
+            prng_v, prng_p, prng_resample = jax.random.split(prng_resample, 3)
 
             # =========================================================
-            # 2. 桶内并行 K-Means (按物理距离)
+            # 1. 动态价值聚类 (1D K-Means on gae_vs)
             # =========================================================
-            # 随机初始化中心 (K_v, C_p, obs_dim)
-            rand_idx = jax.random.randint(prng_cluster, (K_v, C_p), 0, B)
-            # 扩展维度以适配 take_along_axis
-            rand_idx_exp = jnp.broadcast_to(rand_idx[..., None], (K_v, C_p, self.env.observation_size))
-            centers = jax.lax.stop_gradient(jnp.take_along_axis(bucketed_obs, rand_idx_exp, axis=1))
+            flat_vs = gae_vs.reshape((N, 1))
+            # 随机初始化价值中心
+            v_centers = jax.lax.stop_gradient(flat_vs[jax.random.choice(prng_v, N, shape=(K_v,), replace=False)])
 
-            sq_norms_obs = jnp.sum(bucketed_obs ** 2, axis=-1)  # (K_v, B)
-            labels = jnp.zeros((K_v, B), dtype=jnp.int32)
-
+            # 跑 3 轮 1D K-Means (按绝对价值距离聚类，打破数量平均)
             for _ in range(3):
-                sq_norms_centers = jnp.sum(centers ** 2, axis=-1)  # (K_v, C_p)
-                # 并行计算距离: (K_v, B) + (K_v, C_p) - matmul -> (K_v, B, C_p)
-                dist = jnp.maximum(
-                    0.0,
-                    sq_norms_obs[:, :, None] + sq_norms_centers[:, None, :] - 2 * jnp.matmul(bucketed_obs,
-                                                                                             jnp.swapaxes(centers, 1,
-                                                                                                          2))
-                )
-                labels = jnp.argmin(dist, axis=-1)
-                one_hot = jax.nn.one_hot(labels, C_p)  # (K_v, B, C_p)
+                v_dist = jnp.sum((flat_vs[:, None, :] - v_centers[None, :, :]) ** 2, axis=-1)  # (N, K_v)
+                v_labels = jnp.argmin(v_dist, axis=-1)  # (N,)
+                v_one_hot = jax.nn.one_hot(v_labels, K_v)  # (N, K_v)
+                v_centers = jnp.matmul(v_one_hot.T, flat_vs) / (jnp.sum(v_one_hot, axis=0)[:, None] + 1e-8)
+                v_centers = jax.lax.stop_gradient(v_centers)
 
-                # 并行更新中心
-                centers = jnp.matmul(jnp.swapaxes(one_hot, 1, 2), bucketed_obs) / (
-                            jnp.sum(one_hot, axis=1)[:, :, None] + 1e-8)
+            # 此时 v_one_hot 就是我们的“价值隔离墙”：完全按照真实价值分布，而非数量分布！
+
+            # =========================================================
+            # 2. 价值掩码下的物理聚类 (Masked Physical K-Means)
+            # =========================================================
+            # 随机初始化 C 个物理中心
+            centers = jax.lax.stop_gradient(flat_obs[jax.random.choice(prng_p, N, shape=(C,), replace=False)])
+            sq_norms_obs = jnp.sum(flat_obs ** 2, axis=-1)
+
+            labels = jnp.zeros((N,), dtype=jnp.int32)
+            for _ in range(3):
+                sq_norms_centers = jnp.sum(centers ** 2, axis=-1)
+                # 高速计算所有点到所有中心的物理距离 (N, C)
+                dist = jnp.maximum(0.0, sq_norms_obs[:, None] + sq_norms_centers[None, :] - 2 * jnp.matmul(flat_obs,
+                                                                                                           centers.T))
+
+                # 施加价值隔离墙：折叠为 (N, K_v, C_p) 并用 v_one_hot 掩码
+                # 如果一个点不属于这个价值桶，它到该桶内所有中心的距离都将是无穷大
+                dist_3d = dist.reshape((N, K_v, C_p))
+                masked_dist_3d = jnp.where(v_one_hot[:, :, None], dist_3d, jnp.inf)
+                masked_dist = masked_dist_3d.reshape((N, C))
+
+                labels = jnp.argmin(masked_dist, axis=-1)
+                one_hot = jax.nn.one_hot(labels, C)
+
+                # 只有同一个价值桶内的点，才能拉扯对应的中心
+                centers = jnp.matmul(one_hot.T, flat_obs) / (jnp.sum(one_hot, axis=0)[:, None] + 1e-8)
                 centers = jax.lax.stop_gradient(centers)
 
             # =========================================================
-            # 3. 离群点检测与自我克隆 (桶内局部判断)
+            # 3. 离群点检测 (回归原汁原味的纯物理距离)
             # =========================================================
             sq_norms_centers = jnp.sum(centers ** 2, axis=-1)
-            dist = jnp.maximum(
-                0.0,
-                sq_norms_obs[:, :, None] + sq_norms_centers[:, None, :] - 2 * jnp.matmul(bucketed_obs,
-                                                                                         jnp.swapaxes(centers, 1, 2))
-            )
-            min_dists_sq = jnp.min(dist, axis=-1)  # (K_v, B)
+            dist = jnp.maximum(0.0,
+                               sq_norms_obs[:, None] + sq_norms_centers[None, :] - 2 * jnp.matmul(flat_obs, centers.T))
 
-            # 使用原汁原味的物理距离阈值判断离群点
-            is_outlier_bucketed = min_dists_sq > (self.config.fixed_radius ** 2)
-            valid_one_hot = one_hot * (~is_outlier_bucketed[:, :, None])
+            # 再次施加隔离墙，确保只能看到自己价值桶内的距离
+            masked_dist = jnp.where(v_one_hot[:, :, None], dist.reshape((N, K_v, C_p)), jnp.inf).reshape((N, C))
+            min_dists_sq = jnp.min(masked_dist, axis=-1)  # (N,)
+
+            is_outlier = min_dists_sq > (self.config.fixed_radius ** 2)
+            one_hot_labels = jax.nn.one_hot(labels, C)
+            valid_one_hot = one_hot_labels * (~is_outlier[:, None])
 
             # =========================================================
-            # 4. 桶内 Gumbel-Max 选优
+            # 4. 簇内 Gumbel-Max 选优 (与之前完全相同)
             # =========================================================
-            masked_adv = jnp.where(valid_one_hot, bucketed_adv[:, :, None], -jnp.inf)
-            local_adv_pool = jnp.where(valid_one_hot, bucketed_adv[:, :, None], 0.0)
+            masked_adv_cluster = jnp.where(valid_one_hot, flat_adv[:, None], -jnp.inf)
+            local_adv_pool = jnp.where(valid_one_hot, flat_adv[:, None], 0.0)
 
-            # 局部缩放因子 (K_v, C_p)
-            local_scale_c = jax.lax.stop_gradient(jnp.max(jnp.abs(local_adv_pool), axis=1))
+            local_scale_c = jax.lax.stop_gradient(jnp.max(jnp.abs(local_adv_pool), axis=0))
             dynamic_alpha_c = self.config.resampling_alpha * (local_scale_c + 1e-6)
 
-            max_adv_c = jnp.max(masked_adv, axis=1, keepdims=True)  # (K_v, 1, C_p)
-            logits_c = jnp.where(valid_one_hot, (masked_adv - max_adv_c) / dynamic_alpha_c[:, None, :], -jnp.inf)
+            max_adv_c = jnp.max(masked_adv_cluster, axis=0, keepdims=True)
+            logits_c = jnp.where(valid_one_hot, (masked_adv_cluster - max_adv_c) / dynamic_alpha_c[None, :], -jnp.inf)
 
-            gumbel_noise_c = jax.random.gumbel(prng_resample, shape=(K_v, B, C_p))
-            sampled_idx_per_cluster = jnp.argmax(logits_c + gumbel_noise_c, axis=1)  # (K_v, C_p)
+            gumbel_noise_c = jax.random.gumbel(prng_resample, shape=(N, C))
+            sampled_idx_per_cluster = jnp.argmax(logits_c + gumbel_noise_c, axis=0)  # (C,)
 
-            # 提取优胜动作并分配 (利用广播获取真实动作维度)
-            idx_exp = jnp.broadcast_to(sampled_idx_per_cluster[:, :, None], (K_v, C_p, self.env.action_size))
-            cluster_sampled_actions = jnp.take_along_axis(bucketed_actions, idx_exp, axis=1)
+            cluster_sampled_actions = flat_actions[sampled_idx_per_cluster]
+            a_hat_normal = cluster_sampled_actions[labels]
 
-            labels_exp = jnp.broadcast_to(labels[:, :, None], (K_v, B, self.env.action_size))
-            a_hat_normal_bucketed = jnp.take_along_axis(cluster_sampled_actions, labels_exp, axis=1)
-
-            # 离群点回退到自我克隆
-            a_hat_bucketed = jnp.where(is_outlier_bucketed[:, :, None], bucketed_actions, a_hat_normal_bucketed)
+            # 离群点自我克隆
+            a_hat = jnp.where(is_outlier[:, None], flat_actions, a_hat_normal)
 
             # =========================================================
-            # 5. 还原初始顺序！(极其关键)
+            # 5. 监控指标
             # =========================================================
-            # 把分层聚类算出的 a_hat 拉平，并根据原始逆索引打乱，完美对齐外界的 transition
-            a_hat = a_hat_bucketed.reshape((N, self.env.action_size))[inverse_sort_idx]
-
-            # 监控指标
-            cluster_sizes = jnp.sum(valid_one_hot, axis=1)
+            cluster_sizes = jnp.sum(valid_one_hot, axis=0)
             metrics["dgpo/avg_neighbor_count"] = jnp.mean(cluster_sizes)
             metrics["dgpo/dynamic_alpha_mean"] = jnp.mean(dynamic_alpha_c)
-            metrics["dgpo/outlier_ratio"] = jnp.mean(is_outlier_bucketed)
+            metrics["dgpo/outlier_ratio"] = jnp.mean(is_outlier)
         else:
             # =========================================================================
             # [原有逻辑区]：如果不是 cluster，则原封不动走 KNN / Radius / Both 的老路
