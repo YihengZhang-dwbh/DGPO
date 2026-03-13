@@ -499,8 +499,6 @@ class DGPOFMState:
 
             # 3. 兜底 (自己永远是自己的邻居)
             mask = mask | (dist_matrix_phys == jnp.min(dist_matrix_phys, axis=-1, keepdims=True))
-            # 3. 兜底
-            mask = mask | (dist_matrix == jnp.min(dist_matrix, axis=-1, keepdims=True))
 
             # --- 计算每个状态邻域内的动态 Alpha ---
             local_adv_pool = jnp.where(mask, cand_adv[None, :], 0.0)
