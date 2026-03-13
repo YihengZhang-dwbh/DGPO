@@ -475,27 +475,39 @@ class DGPOFMState:
             dist_matrix_fused = jnp.sqrt(dist_sq_fused + 1e-8)
             dist_matrix_phys = jnp.sqrt(dist_sq_phys + 1e-8)
 
-            # --- 替换原有的模式切换代码 ---
-            # 2. 模式切换
+            # =========================================================
+            # 👑 利用数学构造，生成“绝对阶级隔离墙”
+            # =========================================================
+            # 只要距离 < 1.0，在数学上绝对保证它们属于同一个 Value Rank！
+            same_class_mask = dist_matrix_fused < 1.0
+
+            # =========================================================
+            # 2. 模式切换 (所有模式都必须服从阶级隔离)
+            # =========================================================
             mode = self.config.resampling_mode
             if mode == "knn":
-                # KNN 找的是最近的邻居，必须用融合距离，保证选出的一定是同阶级的点！
-                deltas = jnp.quantile(dist_matrix_fused, q=0.05, axis=-1)
-                mask = dist_matrix_fused < deltas[:, None]
+                # 在同阶级内，按真实的物理距离找 Top 5%
+                # 注意：如果同阶级的人数不够 5%，超出的部分会被 same_class_mask 无情斩断，绝不跨阶级拉人！
+                deltas = jnp.quantile(dist_matrix_phys, q=0.05, axis=-1)
+                mask_knn = dist_matrix_phys < deltas[:, None]
+                mask = mask_knn & same_class_mask
+
             elif mode == "radius":
-                # Radius 是物理意义的截断，必须用真实物理距离！
-                mask = dist_matrix_phys < self.config.fixed_radius
+                # 完美的双重认证：必须是同一个价值阶级 AND 真实物理距离达标
+                mask_radius = dist_matrix_phys < self.config.fixed_radius
+                mask = mask_radius & same_class_mask
+
             elif mode == "both":
-                # 结合两者的长处：同阶级优等生中，剔除物理姿态相差过大的
                 mask_radius = dist_matrix_phys < self.config.fixed_radius
                 K_val = self.config.resampling_topk
-                _, topk_indices = jax.lax.top_k(-dist_matrix_fused, k=K_val)
+                _, topk_indices = jax.lax.top_k(-dist_matrix_phys, k=K_val)
                 mask_topk = jnp.zeros_like(mask_radius, dtype=jnp.bool_).at[
                     jnp.arange(N)[:, None], topk_indices
                 ].set(True)
-                mask = mask_radius & mask_topk
+                mask = mask_radius & mask_topk & same_class_mask
+
             else:
-                mask = dist_matrix_phys < self.config.fixed_radius
+                mask = (dist_matrix_phys < self.config.fixed_radius) & same_class_mask
 
             # 3. 兜底 (自己永远是自己的邻居)
             mask = mask | (dist_matrix_phys == jnp.min(dist_matrix_phys, axis=-1, keepdims=True))
