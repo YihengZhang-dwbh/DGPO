@@ -23,6 +23,9 @@ class DGPOFMConfig:
     fixed_radius: float = 0.5
     resampling_topk: jdc.Static[int] = 32
 
+    # 控制损失权重
+    w_v_loss: float = 2.
+
     # 关键修改：JAX 内部的分支逻辑通常要求 M 的大小或采样开关在编译期确定
     use_subsampling: jdc.Static[bool] = False
     subsampling_m: jdc.Static[int] = 512
@@ -510,7 +513,7 @@ class DGPOFMState:
         # 8. 整合 metrics 返回 (替换原本 FPO 的复杂 ratio metrics)
         v_error = (gae_vs - value_pred) * (1 - transitions.truncation)
         v_loss = jnp.mean(v_error ** 2) * self.config.value_loss_coeff
-        total_loss = policy_loss + v_loss
+        total_loss = policy_loss + v_loss*self.config.w_v_loss
 
         metrics["policy_loss"] = policy_loss
         metrics["v_loss"] = v_loss
