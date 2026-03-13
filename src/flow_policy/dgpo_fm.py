@@ -130,7 +130,6 @@ class DGPOFMState:
     steps: Array
 
     @staticmethod
-    @jdc.jit
     def init(prng: Array, env: jdc.Static[mjp.MjxEnv], config: DGPOFMConfig) -> DGPOFMState:
         obs_size = env.observation_size
         action_size = env.action_size
@@ -241,9 +240,13 @@ class DGPOFMState:
         (timesteps, batch_dim) = transitions.reward.shape
         N = timesteps * batch_dim
 
-        # 计算 GAE
         value_pred, _ = networks.value_mlp_fwd_with_features(self.params.value, obs_norm)
-        bootstrap_obs_norm = (transitions.next_obs[-1:, :, :] - self.obs_stats.mean) / self.obs_stats.std
+
+        if self.config.normalize_observations:
+            bootstrap_obs_norm = (transitions.next_obs[-1:, :, :] - self.obs_stats.mean) / self.obs_stats.std
+        else:
+            bootstrap_obs_norm = transitions.next_obs[-1:, :, :]
+
         bootstrap_value = networks.value_mlp_fwd(self.params.value, bootstrap_obs_norm)
 
         gae_vs, gae_advantages = jax.lax.stop_gradient(
@@ -409,10 +412,6 @@ class DGPOFMState:
         velocity_pred = networks.flow_mlp_fwd(
             policy_params, flat_obs, x_t, self.embed_timestep(t)
         ) * self.config.policy_mlp_output_scale
-
-        policy_loss = jnp.mean((eps - (
-                    x_t - t * velocity_pred) - velocity_pred) ** 2) if self.config.output_mode != "u_but_supervise_as_eps" \
-            else jnp.mean((eps - (x_t - t * velocity_pred + velocity_pred)) ** 2)
 
         # 兼容你原来的 output_mode 逻辑
         if self.config.output_mode == "u_but_supervise_as_eps":
