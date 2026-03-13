@@ -425,7 +425,7 @@ class DGPOFMState:
             metrics["dgpo/est_clusters"] = jnp.array(C, dtype=jnp.float32)
             metrics["dgpo/local_scale_max"] = jnp.max(local_scale_c)
             # --- 替换原有 else: 分支下的距离计算部分 ---
-            else:
+        else:
             if self.config.use_subsampling:
                 M = self.config.subsampling_m
                 prng_pool, prng_resample = jax.random.split(prng_resample)
