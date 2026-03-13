@@ -337,7 +337,7 @@ class DGPOFMState:
             sq_norms_fused = jnp.sum(fused_vectors ** 2, axis=-1)
 
             labels = jnp.zeros((N,), dtype=jnp.int32)
-            for _ in range(3):
+            for _ in range(10):
                 sq_norms_centers = jnp.sum(centers ** 2, axis=-1)
                 dist = jnp.maximum(0.0,
                                    sq_norms_fused[:, None] + sq_norms_centers[None, :] - 2 * jnp.matmul(fused_vectors,
