@@ -25,6 +25,8 @@ class DGPOFMConfig:
     resampling_topk: jdc.Static[int] = 32
     # [新增]: 聚类中心数量
     num_clusters: jdc.Static[int] = 64
+    # [新增]: 语义特征融合权重 (0.0 表示纯物理状态聚类)
+    semantic_weight: float = 0.0
 
     # 控制损失权重
     w_v_loss: float = 1.
@@ -240,7 +242,9 @@ class DGPOFMState:
         (timesteps, batch_dim) = transitions.reward.shape
         N = timesteps * batch_dim
 
-        value_pred, _ = networks.value_mlp_fwd_with_features(self.params.value, obs_norm)
+        # === 提取并阻断梯度，防止聚类操作破坏 Critic 的主线学习 ===
+        value_pred, h_s = networks.value_mlp_fwd_with_features(self.params.value, obs_norm)
+        h_s = jax.lax.stop_gradient(h_s)
 
         if self.config.normalize_observations:
             bootstrap_obs_norm = (transitions.next_obs[-1:, :, :] - self.obs_stats.mean) / self.obs_stats.std
@@ -274,24 +278,34 @@ class DGPOFMState:
         flat_adv = gae_advantages.reshape((N,))
         prng_resample = prng
 
+        # === 极简融合逻辑 ===
+        flat_hs = h_s.reshape((N, -1))
+        flat_hs_norm = flat_hs / (jnp.linalg.norm(flat_hs, axis=-1, keepdims=True) + 1e-8)
+
+        # 直接乘上 config 里的权重！
+        combined_features = jnp.concatenate([
+            flat_obs,
+            flat_hs_norm * self.config.semantic_weight
+        ], axis=-1)
+
         if self.config.resampling_mode == "cluster":
             # [K-Means 聚类逻辑...]
             C = self.config.num_clusters
             prng_cluster, prng_resample = jax.random.split(prng_resample)
             initial_indices = jax.random.choice(prng_cluster, N, shape=(C,), replace=False)
-            centers = jax.lax.stop_gradient(flat_obs[initial_indices])
+            centers = jax.lax.stop_gradient(combined_features[initial_indices])
 
             labels = jnp.zeros((N,), dtype=jnp.int32)
             for _ in range(3):
-                dist_to_centers = jnp.sum((flat_obs[:, None, :] - centers[None, :, :]) ** 2, axis=-1)
+                dist_to_centers = jnp.sum((combined_features[:, None, :] - centers[None, :, :]) ** 2, axis=-1)
                 labels = jnp.argmin(dist_to_centers, axis=-1)
                 one_hot = jax.nn.one_hot(labels, C)
-                centers = jnp.matmul(one_hot.T, flat_obs) / (jnp.sum(one_hot, axis=0)[:, None] + 1e-8)
+                centers = jnp.matmul(one_hot.T, combined_features) / (jnp.sum(one_hot, axis=0)[:, None] + 1e-8)
                 centers = jax.lax.stop_gradient(centers)
 
             # --- 1. 离群点检测 ---
             # 重新计算一次所有点到最终中心的距离
-            dist_to_centers = jnp.sum((flat_obs[:, None, :] - centers[None, :, :]) ** 2, axis=-1)
+            dist_to_centers = jnp.sum((combined_features[:, None, :] - centers[None, :, :]) ** 2, axis=-1)
             min_dists_sq = jnp.min(dist_to_centers, axis=-1)
 
             # 判定阈值：大于 fixed_radius 的平方即为离群点
@@ -334,8 +348,8 @@ class DGPOFMState:
                 actual_m = jnp.minimum(M, N)
                 candidate_indices = jax.random.choice(prng_pool, N, shape=(actual_m,), replace=False)
 
-                dist_input_all = jax.lax.stop_gradient(flat_obs)
-                dist_input_cand = jax.lax.stop_gradient(flat_obs[candidate_indices])
+                dist_input_all = jax.lax.stop_gradient(combined_features)
+                dist_input_cand = jax.lax.stop_gradient(combined_features[candidate_indices])
 
                 sq_norms_all = jnp.sum(dist_input_all ** 2, axis=-1)
                 sq_norms_cand = jnp.sum(dist_input_cand ** 2, axis=-1)
@@ -348,7 +362,7 @@ class DGPOFMState:
                 pool_indices_ref = candidate_indices
                 scaling_factor = N / actual_m
             else:
-                dist_input = jax.lax.stop_gradient(flat_obs)
+                dist_input = jax.lax.stop_gradient(combined_features)
                 sq_norms = jnp.sum(dist_input ** 2, axis=-1)
                 dist_sq = jnp.maximum(0.0,
                                       sq_norms[:, None] + sq_norms[None, :] - 2 * jnp.matmul(dist_input, dist_input.T))
