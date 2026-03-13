@@ -218,7 +218,7 @@ class DGPOFMState:
             value_inner_step,
             (self.params.value, self.opt_state_value),
             None,
-            length=4  # 根据你的观察，4步通常能显著压低 v_loss
+            length=1  # 根据你的观察，4步通常能显著压低 v_loss
         )
         metrics["v_loss"] = extra_v_losses[-1]
 
