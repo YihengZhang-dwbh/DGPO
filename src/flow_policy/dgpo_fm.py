@@ -429,7 +429,9 @@ class DGPOFMState:
             if self.config.use_subsampling:
                 M = self.config.subsampling_m
                 prng_pool, prng_resample = jax.random.split(prng_resample)
-                actual_m = jnp.minimum(M, N)
+                # actual_m = jnp.minimum(M, N)
+                # ✅ 修改后：使用原生 Python 的 min 函数，保持 actual_m 为静态整数！
+                actual_m = min(M, N)
                 candidate_indices = jax.random.choice(prng_pool, N, shape=(actual_m,), replace=False)
 
                 # 1. 计算融合空间距离 (用于确定拓扑邻域)
