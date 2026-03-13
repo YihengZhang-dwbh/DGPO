@@ -37,7 +37,7 @@ class DGPOFMConfig:
     learning_rate_v: float = 3e-4
 
     # 关键修改：JAX 内部的分支逻辑通常要求 M 的大小或采样开关在编译期确定
-    use_subsampling: jdc.Static[bool] = False
+    use_subsampling: jdc.Static[bool] = True
     subsampling_m: jdc.Static[int] = 512
     # --------------------
 
@@ -276,10 +276,38 @@ class DGPOFMState:
             gae_advantages = (gae_advantages - gae_advantages.mean()) / (gae_advantages.std() + 1e-8)
 
         # --- 核心：重采样逻辑必须放在 if 外面 ---
+        # --- 原有代码 ---
         flat_obs = obs_norm.reshape((N, self.env.observation_size))
         flat_actions = transitions.action.reshape((N, self.env.action_size))
         flat_adv = gae_advantages.reshape((N,))
         prng_resample = prng
+
+        # =========================================================
+        # --- 新增插入：1. 提取价值 Rank 并构造扭曲空间向量 ---
+        # =========================================================
+        K_v = self.config.num_value_buckets
+        prng_v, prng_resample = jax.random.split(prng_resample)
+
+        flat_vs = gae_vs.reshape((N, 1))
+        v_centers = jax.lax.stop_gradient(flat_vs[jax.random.choice(prng_v, N, shape=(K_v,), replace=False)])
+
+        for _ in range(3):
+            v_dist = jnp.sum((flat_vs[:, None, :] - v_centers[None, :, :]) ** 2, axis=-1)
+            v_labels = jnp.argmin(v_dist, axis=-1)
+            v_one_hot = jax.nn.one_hot(v_labels, K_v)
+            v_centers = jnp.matmul(v_one_hot.T, flat_vs) / (jnp.sum(v_one_hot, axis=0)[:, None] + 1e-8)
+
+        # 获取严格的价值阶级 Rank (0 到 K_v - 1)
+        sorted_v_indices = jnp.argsort(v_centers.squeeze())
+        ranks = jnp.argsort(sorted_v_indices)
+        point_ranks = ranks[v_labels].astype(jnp.float32)[:, None]
+
+        # 空间扭曲压缩：最大物理距离压缩到 0.5 以内 (平方 < 0.25)
+        max_norm = jax.lax.stop_gradient(jnp.max(jnp.linalg.norm(flat_obs, axis=-1, keepdims=True))) + 1e-8
+        s_T = (flat_obs / max_norm) * 0.25
+
+        # 你的神级向量：[压缩物理状态, 价值阶层]
+        fused_vectors = jnp.concatenate([s_T, point_ranks], axis=-1)
 
         # === 极简融合逻辑 ===
         flat_hs = h_s.reshape((N, -1))
@@ -396,62 +424,79 @@ class DGPOFMState:
             metrics["dgpo/outlier_ratio"] = jnp.mean(is_outlier)
             metrics["dgpo/est_clusters"] = jnp.array(C, dtype=jnp.float32)
             metrics["dgpo/local_scale_max"] = jnp.max(local_scale_c)
-        else:
-            # =========================================================================
-            # [原有逻辑区]：如果不是 cluster，则原封不动走 KNN / Radius / Both 的老路
-            # =========================================================================
+            # --- 替换原有 else: 分支下的距离计算部分 ---
+            else:
             if self.config.use_subsampling:
                 M = self.config.subsampling_m
                 prng_pool, prng_resample = jax.random.split(prng_resample)
                 actual_m = jnp.minimum(M, N)
                 candidate_indices = jax.random.choice(prng_pool, N, shape=(actual_m,), replace=False)
 
-                dist_input_all = jax.lax.stop_gradient(combined_features)
-                dist_input_cand = jax.lax.stop_gradient(combined_features[candidate_indices])
+                # 1. 计算融合空间距离 (用于确定拓扑邻域)
+                dist_input_fused = jax.lax.stop_gradient(fused_vectors)
+                dist_cand_fused = jax.lax.stop_gradient(fused_vectors[candidate_indices])
+                sq_all_fused = jnp.sum(dist_input_fused ** 2, axis=-1)
+                sq_cand_fused = jnp.sum(dist_cand_fused ** 2, axis=-1)
+                dist_sq_fused = jnp.maximum(0.0, sq_all_fused[:, None] + sq_cand_fused[None, :] - 2 * jnp.matmul(
+                    dist_input_fused, dist_cand_fused.T))
 
-                sq_norms_all = jnp.sum(dist_input_all ** 2, axis=-1)
-                sq_norms_cand = jnp.sum(dist_input_cand ** 2, axis=-1)
-                dist_sq = jnp.maximum(0.0,
-                                      sq_norms_all[:, None] + sq_norms_cand[None, :] - 2 * jnp.matmul(dist_input_all,
-                                                                                                      dist_input_cand.T))
+                # 2. 计算纯物理距离 (用于判断离群点/Radius 阈值)
+                dist_input_phys = jax.lax.stop_gradient(flat_obs)
+                dist_cand_phys = jax.lax.stop_gradient(flat_obs[candidate_indices])
+                sq_all_phys = jnp.sum(dist_input_phys ** 2, axis=-1)
+                sq_cand_phys = jnp.sum(dist_cand_phys ** 2, axis=-1)
+                dist_sq_phys = jnp.maximum(0.0, sq_all_phys[:, None] + sq_cand_phys[None, :] - 2 * jnp.matmul(
+                    dist_input_phys, dist_cand_phys.T))
 
                 cand_adv = flat_adv[candidate_indices]
                 gumbel_shape = (N, actual_m)
                 pool_indices_ref = candidate_indices
                 scaling_factor = N / actual_m
             else:
-                dist_input = jax.lax.stop_gradient(combined_features)
-                sq_norms = jnp.sum(dist_input ** 2, axis=-1)
-                dist_sq = jnp.maximum(0.0,
-                                      sq_norms[:, None] + sq_norms[None, :] - 2 * jnp.matmul(dist_input, dist_input.T))
+                # 不用子采样的情况同理，算两遍
+                dist_input_fused = jax.lax.stop_gradient(fused_vectors)
+                dist_sq_fused = jnp.maximum(0.0, jnp.sum(dist_input_fused ** 2, axis=-1)[:, None] +
+                                            jnp.sum(dist_input_fused ** 2, axis=-1)[None, :] - 2 * jnp.matmul(
+                    dist_input_fused, dist_input_fused.T))
+
+                dist_input_phys = jax.lax.stop_gradient(flat_obs)
+                dist_sq_phys = jnp.maximum(0.0, jnp.sum(dist_input_phys ** 2, axis=-1)[:, None] +
+                                           jnp.sum(dist_input_phys ** 2, axis=-1)[None, :] - 2 * jnp.matmul(
+                    dist_input_phys, dist_input_phys.T))
 
                 cand_adv = flat_adv
                 gumbel_shape = (N, N)
                 pool_indices_ref = jnp.arange(N)
                 scaling_factor = 1.0
 
-            # --- 邻域划分算法选择 ---
-            # 1. 计算距离
-            dist_matrix = jnp.sqrt(dist_sq + 1e-8)
+            # 提取出两种距离矩阵
+            dist_matrix_fused = jnp.sqrt(dist_sq_fused + 1e-8)
+            dist_matrix_phys = jnp.sqrt(dist_sq_phys + 1e-8)
 
+            # --- 替换原有的模式切换代码 ---
             # 2. 模式切换
             mode = self.config.resampling_mode
             if mode == "knn":
-                deltas = jnp.quantile(dist_matrix, q=0.05, axis=-1)
-                mask = dist_matrix < deltas[:, None]
+                # KNN 找的是最近的邻居，必须用融合距离，保证选出的一定是同阶级的点！
+                deltas = jnp.quantile(dist_matrix_fused, q=0.05, axis=-1)
+                mask = dist_matrix_fused < deltas[:, None]
             elif mode == "radius":
-                mask = dist_matrix < self.config.fixed_radius
+                # Radius 是物理意义的截断，必须用真实物理距离！
+                mask = dist_matrix_phys < self.config.fixed_radius
             elif mode == "both":
-                mask_radius = dist_matrix < self.config.fixed_radius
+                # 结合两者的长处：同阶级优等生中，剔除物理姿态相差过大的
+                mask_radius = dist_matrix_phys < self.config.fixed_radius
                 K_val = self.config.resampling_topk
-                _, topk_indices = jax.lax.top_k(-dist_matrix, k=K_val)
+                _, topk_indices = jax.lax.top_k(-dist_matrix_fused, k=K_val)
                 mask_topk = jnp.zeros_like(mask_radius, dtype=jnp.bool_).at[
                     jnp.arange(N)[:, None], topk_indices
                 ].set(True)
                 mask = mask_radius & mask_topk
             else:
-                mask = dist_matrix < self.config.fixed_radius  # Default
+                mask = dist_matrix_phys < self.config.fixed_radius
 
+            # 3. 兜底 (自己永远是自己的邻居)
+            mask = mask | (dist_matrix_phys == jnp.min(dist_matrix_phys, axis=-1, keepdims=True))
             # 3. 兜底
             mask = mask | (dist_matrix == jnp.min(dist_matrix, axis=-1, keepdims=True))
 
