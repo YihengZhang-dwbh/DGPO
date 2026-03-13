@@ -283,33 +283,49 @@ class DGPOFMState:
         prng_resample = prng
 
         # =========================================================
-        # --- 新增插入：1. 提取价值 Rank 并构造扭曲空间向量 ---
+        # 1. 1D 价值聚类 (获取稳定的 v_centers)
         # =========================================================
         K_v = self.config.num_value_buckets
         prng_v, prng_resample = jax.random.split(prng_resample)
 
         flat_vs = gae_vs.reshape((N, 1))
+        # 初始中心
         v_centers = jax.lax.stop_gradient(flat_vs[jax.random.choice(prng_v, N, shape=(K_v,), replace=False)])
 
         for _ in range(5):
             v_dist = jnp.sum((flat_vs[:, None, :] - v_centers[None, :, :]) ** 2, axis=-1)
-            v_labels = jnp.argmin(v_dist, axis=-1)
-            v_one_hot = jax.nn.one_hot(v_labels, K_v)
-            v_centers = jnp.matmul(v_one_hot.T, flat_vs) / (jnp.sum(v_one_hot, axis=0)[:, None] + 1e-8)
+            v_labels_temp = jnp.argmin(v_dist, axis=-1)
+            v_one_hot_temp = jax.nn.one_hot(v_labels_temp, K_v)
+            v_centers = jnp.matmul(v_one_hot_temp.T, flat_vs) / (jnp.sum(v_one_hot_temp, axis=0)[:, None] + 1e-8)
 
-        # 获取严格的价值阶级 Rank (0 到 K_v - 1)
-        sorted_v_indices = jnp.argsort(v_centers.squeeze())
-        ranks = jnp.argsort(sorted_v_indices)
-        point_ranks = ranks[v_labels].astype(jnp.float32)[:, None]
+        # =========================================================
+        # 2. [关键]: 排序并重新指派 v_labels (确保 One-hot 顺序一致)
+        # =========================================================
+        # 拿到最终的 v_centers 顺序
+        v_centers_sq = v_centers.squeeze()
+        if v_centers_sq.ndim == 0: v_centers_sq = v_centers_sq[None]
 
-        # 空间扭曲压缩：最大物理距离压缩到 0.5 以内 (平方 < 0.25)
+        # 建立从 "随机标签" 到 "有序 Rank" 的映射
+        sorted_indices = jnp.argsort(v_centers_sq)
+        rank_mapping = jnp.argsort(sorted_indices)  # 这能把 0..Kv-1 映射到价值排名上
+
+        # 最终指派
+        final_dist = jnp.sum((flat_vs[:, None, :] - v_centers[None, :, :]) ** 2, axis=-1)
+        raw_labels = jnp.argmin(final_dist, axis=-1)
+        # 映射成有序标签，这样 One-hot 的第 0 位永远是价值最低的
+        v_labels = rank_mapping[raw_labels]
+
+        # =========================================================
+        # 3. 构造 One-hot 超维向量
+        # =========================================================
+        v_one_hot = jax.nn.one_hot(v_labels, K_v)
+
         max_norm = jax.lax.stop_gradient(jnp.max(jnp.linalg.norm(flat_obs, axis=-1, keepdims=True))) + 1e-8
-        # s_T = (flat_obs / max_norm) * 0.25
-        # # 你的神级向量：[压缩物理状态, 价值阶层]
-        # fused_vectors = jnp.concatenate([s_T, point_ranks], axis=-1)
+        gamma = 4.0 * max_norm
+        v_feat = v_one_hot * gamma
 
-        # 你的神级向量：[压缩物理状态, 价值阶层]
-        fused_vectors = jnp.concatenate([flat_obs, point_ranks*4*max_norm], axis=-1)
+        # 最终的融合向量
+        fused_vectors = jnp.concatenate([flat_obs, v_feat], axis=-1)
 
         # === 极简融合逻辑 ===
         flat_hs = h_s.reshape((N, -1))
