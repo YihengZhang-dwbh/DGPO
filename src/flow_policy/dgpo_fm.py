@@ -289,24 +289,41 @@ class DGPOFMState:
                 centers = jnp.matmul(one_hot.T, flat_obs) / (jnp.sum(one_hot, axis=0)[:, None] + 1e-8)
                 centers = jax.lax.stop_gradient(centers)
 
+            # --- 1. 离群点检测 ---
+            # 重新计算一次所有点到最终中心的距离
+            dist_to_centers = jnp.sum((flat_obs[:, None, :] - centers[None, :, :]) ** 2, axis=-1)
+            min_dists_sq = jnp.min(dist_to_centers, axis=-1)
+
+            # 判定阈值：大于 fixed_radius 的平方即为离群点
+            is_outlier = min_dists_sq > (self.config.fixed_radius ** 2)
+
             one_hot_labels = jax.nn.one_hot(labels, C)
-            masked_adv_cluster = jnp.where(one_hot_labels, flat_adv[:, None], -jnp.inf)
-            local_adv_pool = jnp.where(one_hot_labels, flat_adv[:, None], 0.0)
+            # 剥离离群点：在簇的有效掩码中，将离群点的位置抹零
+            valid_one_hot = one_hot_labels * (~is_outlier[:, None])
+
+            # --- 2. 簇内过滤与选优 (仅使用有效点) ---
+            masked_adv_cluster = jnp.where(valid_one_hot, flat_adv[:, None], -jnp.inf)
+            local_adv_pool = jnp.where(valid_one_hot, flat_adv[:, None], 0.0)
             local_scale_c = jax.lax.stop_gradient(jnp.max(jnp.abs(local_adv_pool), axis=0))
             dynamic_alpha_c = self.config.resampling_alpha * (local_scale_c + 1e-6)
             max_adv_c = jnp.max(masked_adv_cluster, axis=0, keepdims=True)
-            logits_c = jnp.where(one_hot_labels, (masked_adv_cluster - max_adv_c) / dynamic_alpha_c[None, :],
+            logits_c = jnp.where(valid_one_hot, (masked_adv_cluster - max_adv_c) / dynamic_alpha_c[None, :],
                                  -jnp.inf)
 
             gumbel_noise_c = jax.random.gumbel(prng_resample, shape=(N, C))
             sampled_idx_per_cluster = jnp.argmax(logits_c + gumbel_noise_c, axis=0)
+            # --- 3. 行为克隆分配 ---
             cluster_sampled_actions = flat_actions[sampled_idx_per_cluster]
-            a_hat = cluster_sampled_actions[labels]
+            a_hat_normal = cluster_sampled_actions[labels]
 
-            # 监控指标
-            cluster_sizes = jnp.sum(one_hot_labels, axis=0)
+            # 离群点不向簇中心学习，直接克隆自己本来的动作
+            a_hat = jnp.where(is_outlier[:, None], flat_actions, a_hat_normal)
+
+            # --- 4. 监控指标 ---
+            cluster_sizes = jnp.sum(valid_one_hot, axis=0)
             metrics["dgpo/avg_neighbor_count"] = jnp.mean(cluster_sizes)
             metrics["dgpo/dynamic_alpha_mean"] = jnp.mean(dynamic_alpha_c)
+            metrics["dgpo/outlier_ratio"] = jnp.mean(is_outlier)  # 监控当前有多少比例是离群点
         else:
             # =========================================================================
             # [原有逻辑区]：如果不是 cluster，则原封不动走 KNN / Radius / Both 的老路
