@@ -28,6 +28,8 @@ class DGPOFMConfig:
 
     # 控制损失权重
     w_v_loss: float = 1.
+    learning_rate_p: float = 3e-4
+    learning_rate_v: float = 3e-4
 
     # 关键修改：JAX 内部的分支逻辑通常要求 M 的大小或采样开关在编译期确定
     use_subsampling: jdc.Static[bool] = False
@@ -61,7 +63,7 @@ class DGPOFMConfig:
     batch_size: jdc.Static[int] = 1024
     discounting: float = 0.995
     episode_length: int = 1000
-    learning_rate: float = 3e-4
+    # learning_rate: float = 3e-4
     normalize_observations: jdc.Static[bool] = True
     num_envs: jdc.Static[int] = 2048
     num_evals: jdc.Static[int] = 30
@@ -303,8 +305,8 @@ class DGPOFMState:
         updates, new_opt_state = self.opt.update(grads, self.opt_state, self.params)
 
         # 2. 手动应用非对称学习率更新
-        policy_lr = self.config.learning_rate
-        value_lr = self.config.learning_rate  # * 2.5
+        policy_lr = self.config.learning_rate_p
+        value_lr = self.config.learning_rate_v  # * 2.5
 
         # 使用 jdc.replace 重新组装更新项
         # 我们对 policy 和 value 的 pytree 分别乘上负的学习率
