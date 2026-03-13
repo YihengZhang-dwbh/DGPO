@@ -397,19 +397,23 @@ class DGPOFMState:
             initial_indices = jax.random.choice(prng_cluster, N, shape=(C,), replace=False)
             centers = jax.lax.stop_gradient(flat_obs[initial_indices])
 
-            # 2. 简化的 K-Means 迭代 (3步足以确定局部拓扑)
-            def kmeans_step(centers, _):
-                dist_to_centers = jnp.sum((flat_obs[:, None, :] - centers[None, :, :]) ** 2, axis=-1)  # (N, C)
-                labels = jnp.argmin(dist_to_centers, axis=-1)
-                one_hot = jax.nn.one_hot(labels, C)
-                # 更新重心，+1e-8 防止除以0
-                new_centers = jnp.matmul(one_hot.T, flat_obs) / (jnp.sum(one_hot, axis=0)[:, None] + 1e-8)
-                return jax.lax.stop_gradient(new_centers), labels
+            # 2. 手动展开 3 次 K-Means 迭代 (避免 scan 导致的历史堆叠)
+            labels = jnp.zeros((N,), dtype=jnp.int32)
+            for _ in range(3):
+                # 计算所有点到中心的距离 (N, C)
+                dist_to_centers = jnp.sum((flat_obs[:, None, :] - centers[None, :, :]) ** 2, axis=-1)
+                labels = jnp.argmin(dist_to_centers, axis=-1)  # (N,)
 
-            _, labels = jax.lax.scan(kmeans_step, centers, None, length=3)
+                # 更新聚类中心
+                one_hot = jax.nn.one_hot(labels, C)  # (N, C)
+                centers = jnp.matmul(one_hot.T, flat_obs) / (jnp.sum(one_hot, axis=0)[:, None] + 1e-8)
+                centers = jax.lax.stop_gradient(centers)
+
+            # 此时 labels 的形状是完美的 (N,)
             one_hot_labels = jax.nn.one_hot(labels, C)  # (N, C)
 
             # 3. 簇内动态温度与 Gumbel-Max 采样
+            # ... (接下来的代码完全保持原样) ...
             # 掩码优势矩阵：点i如果不属于簇c，则其优势为 -inf
             masked_adv_cluster = jnp.where(one_hot_labels, flat_adv[:, None], -jnp.inf)
 
