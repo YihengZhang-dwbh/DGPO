@@ -368,8 +368,29 @@ class DGPOFMState:
                                     sq_norms_obs[:, None] + sq_norms_phys_centers[None, :] - 2 * jnp.matmul(flat_obs,
                                                                                                             physical_centers.T))
 
-            min_dists_sq = jnp.min(phys_dist, axis=-1)
-            is_outlier = min_dists_sq > (self.config.fixed_radius ** 2)
+            # --- 在 _compute_targets 内部 ---
+
+            # 1. 获取观测维度
+            obs_dim = flat_obs.shape[-1]
+
+            # 2. 计算动态物理半径：2.0 * sqrt(dim)
+            # 使用 jnp.sqrt 保证 JAX 追踪，* 2.0 是你的硬核约束
+            dynamic_radius = 2.0 * jnp.sqrt(obs_dim)
+
+            # 3. 执行离群点检测
+            # (假设你还在使用 cluster 模式)
+            sq_norms_obs = jnp.sum(flat_obs ** 2, axis=-1)
+            sq_norms_phys_centers = jnp.sum(physical_centers ** 2, axis=-1)
+            phys_dist_sq = jnp.maximum(0.0,
+                                       sq_norms_obs[:, None] + sq_norms_phys_centers[None, :] - 2 * jnp.matmul(flat_obs,
+                                                                                                               physical_centers.T))
+
+            min_dists_sq = jnp.min(phys_dist_sq, axis=-1)
+
+            # 判定：平方距离 > 半径的平方
+            is_outlier = min_dists_sq > (dynamic_radius ** 2)
+
+            # --- 后续逻辑保持不变 ---
             valid_one_hot = one_hot_labels * (~is_outlier[:, None])
 
             # =========================================================
