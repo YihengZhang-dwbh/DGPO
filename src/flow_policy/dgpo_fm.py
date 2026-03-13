@@ -353,10 +353,12 @@ class DGPOFMState:
             # =========================================================
             # 获取当前 batch 最大物理半径，并将其压缩到 0.25 (确保两点物理最大距离为 0.5 < delta=1.0)
             max_norm = jax.lax.stop_gradient(jnp.max(jnp.linalg.norm(flat_obs, axis=-1, keepdims=True))) + 1e-8
-            s_T = (flat_obs / max_norm) * 0.25
+            # s_T = (flat_obs / max_norm) * 0.25
+            # # 拼出你的“神之向量”
+            # fused_vectors = jnp.concatenate([s_T, point_ranks], axis=-1)
 
             # 拼出你的“神之向量”
-            fused_vectors = jnp.concatenate([s_T, point_ranks], axis=-1)
+            fused_vectors = jnp.concatenate([flat_obs, point_ranks*max_norm*4], axis=-1)
 
             # =========================================================
             # 3. 全局自适应 K-Means (天然等效两次聚类)
