@@ -204,8 +204,11 @@ class DGPOFMState:
         # 快速为 next_obs 生成一个动作
         def boot_step_fn(x, t_tuple):
             t_curr, t_next = t_tuple
-            t_embed = jnp.broadcast_to(self.embed_timestep(jnp.array([t_curr]))[None, :, :],
-                                       (1, B, self.config.timestep_embed_dim))
+            # 简化逻辑：先变成 (1, 1) 的输入，得到 (1, 8) 的输出
+            t_embed_raw = self.embed_timestep(jnp.array([t_curr])[..., None])  # (1, 8)
+            # 广播到 (1, B, embed_dim)
+            t_embed = jnp.broadcast_to(t_embed_raw[:, None, :], (1, B, self.config.timestep_embed_dim))
+
             vel = networks.flow_mlp_fwd(self.params.policy, bootstrap_obs, x,
                                         t_embed) * self.config.policy_mlp_output_scale
             return x + (t_next - t_curr) * vel, None
@@ -244,11 +247,14 @@ class DGPOFMState:
 
         def gen_step_fn(x, t_tuple):
             t_curr, t_next = t_tuple
-            t_embed = jnp.broadcast_to(self.embed_timestep(jnp.array([t_curr]))[None, None, :],
-                                       (N, K, self.config.timestep_embed_dim))
-            # 必须 stop_gradient，生成动作时不要影响 Policy 本身的梯度
-            vel = networks.flow_mlp_fwd(jax.lax.stop_gradient(self.params.policy), obs_b, x,
-                                        t_embed) * self.config.policy_mlp_output_scale
+            # 同样简化：得到 (1, 8) 的基础嵌入
+            t_embed_raw = self.embed_timestep(jnp.array([t_curr])[..., None])  # (1, 8)
+            # 广播到 (N, K, embed_dim)
+            t_embed = jnp.broadcast_to(t_embed_raw[:, None, :], (N, K, self.config.timestep_embed_dim))
+
+            # 必须 stop_gradient
+            p_params = jax.lax.stop_gradient(self.params.policy)
+            vel = networks.flow_mlp_fwd(p_params, obs_b, x, t_embed) * self.config.policy_mlp_output_scale
             return x + (t_next - t_curr) * vel, None
 
         generated_acts, _ = jax.lax.scan(gen_step_fn, x_t, (schedule.t_current, schedule.t_next))
