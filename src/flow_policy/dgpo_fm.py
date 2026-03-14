@@ -393,8 +393,8 @@ class DGPOFMState:
             assigned_dists_sq = jnp.sum((flat_obs - assigned_phys_centers) ** 2, axis=-1)
 
             # 判定离群点 (这里你可以用 fixed_radius 或者 dynamic_radius)
-            # is_outlier = assigned_dists_sq > (self.config.fixed_radius ** 2)
-            is_outlier = assigned_dists_sq > (dynamic_radius ** 2)
+            is_outlier = assigned_dists_sq > (self.config.fixed_radius ** 2)
+            # is_outlier = assigned_dists_sq > (dynamic_radius ** 2)
 
             valid_one_hot = one_hot_labels * (~is_outlier[:, None])
 
