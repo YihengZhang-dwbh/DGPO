@@ -383,7 +383,6 @@ class DGPOFMState:
         else:
             raise ValueError("Mode must be cluster")
 
-        return jax.lax.stop_gradient(a_hat), gae_vs, metrics
 
     # ==========================================
     # 3. 损失函数定义 (纯净计算)
@@ -416,6 +415,7 @@ class DGPOFMState:
         policy_loss = jnp.mean(weights * error_sq)
 
         return policy_loss, {"policy_loss": policy_loss}
+
 
     def _compute_value_loss(self, value_params, obs_norm, truncation, target_vs):
         v_pred, _ = networks.value_mlp_fwd_with_features(value_params, obs_norm)
