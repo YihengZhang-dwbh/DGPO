@@ -285,31 +285,36 @@ class DGPOFMState:
             gae_advantages = (gae_advantages - gae_advantages.mean()) / (gae_advantages.std() + 1e-8)
 
         # --- 核心：重采样逻辑必须放在 if 外面 ---
-        flat_obs = obs_norm.reshape((N, self.env.observation_size))
-        flat_actions = transitions.action.reshape((N, self.env.action_size))
         flat_adv = gae_advantages.reshape((N,))
         prng_resample = prng
 
-        # === 修复后的融合逻辑：保留幅度信息 ===
-        flat_hs = h_s.reshape((N, -1))
-        # 1. 先拼接出原始融合向量 (保留原始幅度)
-        raw_combined = jnp.concatenate([flat_obs, flat_hs], axis=-1)
-
-        # 2. 【核心】：执行跨样本的同维度归一化
-        # 计算当前 Batch 的均值和标准差
-        mean_feat = jnp.mean(raw_combined, axis=0, keepdims=True)
-        std_feat = jnp.std(raw_combined, axis=0, keepdims=True) + 1e-8
-
-        # 标准化：(x - mu) / sigma
-        # 现在每一个维度的期望值都是 0，方差都是 1
-        standardized_features = (raw_combined - mean_feat) / std_feat
-
-        # 3. 最后再应用 semantic_weight 进行“块级别”的权重分配
-        # 此时权重分配是极其精准的，因为两边的基准面（方差）已经完全平齐了
+        # === 1. 物理层：已经通过 obs_stats 实现了维度对齐 (mean=0, std=1) ===
+        flat_obs = obs_norm.reshape((N, self.env.observation_size))
         obs_dim = flat_obs.shape[-1]
+
+        # 将其期望模长缩放到 1.0 (保留了样本间的相对强度差异)
+        flat_obs_scaled = flat_obs / jnp.sqrt(obs_dim)
+
+        # === 2. 语义层：执行跨样本的同维度归一化 (核心改动) ===
+        flat_hs = h_s.reshape((N, -1))
+        hs_dim = flat_hs.shape[-1]
+
+        # 计算当前 Batch 内每个维度的均值和标准差
+        mean_hs = jnp.mean(flat_hs, axis=0, keepdims=True)
+        std_hs = jnp.std(flat_hs, axis=0, keepdims=True) + 1e-6
+
+        # 消除维度间的分辨率差异，使每个神经元方差都为 1
+        flat_hs_standardized = (flat_hs - mean_hs) / std_hs
+
+        # 同样将其期望模长缩放到 1.0
+        flat_hs_scaled = flat_hs_standardized / jnp.sqrt(hs_dim)
+
+        # === 3. 最终融合：权重受控 ===
+        # 此时 obs 分量和 hs 分量的统计特性完全一致：
+        # 每个维度的 mean≈0, std≈(1/sqrt(D))，期望总模长都等于 1.0
         combined_features = jnp.concatenate([
-            standardized_features[:, :obs_dim] * ((1.0 - self.config.semantic_weight) ** 0.5),
-            standardized_features[:, obs_dim:] * (self.config.semantic_weight ** 0.5)
+            flat_obs_scaled * ((1.0 - self.config.semantic_weight) ** 0.5),
+            flat_hs_scaled * (self.config.semantic_weight ** 0.5)
         ], axis=-1)
 
         if self.config.resampling_mode == "cluster":
