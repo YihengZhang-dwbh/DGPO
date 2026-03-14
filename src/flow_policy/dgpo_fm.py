@@ -330,15 +330,32 @@ class DGPOFMState:
     # ==========================================
     # 6. Q 网络训练 (拟合真实回报)
     # ==========================================
-    def _compute_value_loss(self, value_params, obs_norm, actions, truncation, target_qs):
+    # 修改 _compute_value_loss，我们需要传入生成的动作 pool_actions 来惩罚它们
+    def _compute_value_loss(self, value_params, obs_norm, actions, truncation, target_qs, pool_actions):
+        # 1. 计算真实动作的 Q 值，拟合 Target (保持不变)
         concat_inputs = jnp.concatenate([obs_norm, actions], axis=-1)
         q_pred, _ = networks.value_mlp_fwd_with_features(value_params, concat_inputs)
 
-        # 👑 终极修复：直接删掉下面这行！
-        # q_pred = q_pred[..., 0]  <--- 删掉！
-
         v_error = (target_qs - q_pred) * (1 - truncation)
-        return jnp.mean(v_error ** 2) * self.config.value_loss_coeff * self.config.w_v_loss
+        mse_loss = jnp.mean(v_error ** 2)
+
+        # 👑 2. 加入 CQL 保守惩罚项 (打破死亡螺旋的核心)
+        # 把生成的假动作丢进去算 Q 值
+        N, K_plus_1, act_dim = pool_actions.shape
+        obs_b = jnp.broadcast_to(obs_norm[:, None, :], (N, K_plus_1, obs_norm.shape[-1]))
+        concat_pool = jnp.concatenate([obs_b, pool_actions], axis=-1)
+
+        q_pool_fake, _ = networks.value_mlp_fwd_with_features(value_params, concat_pool)
+
+        # 惩罚项：如果 Q 网络给生成的动作打分太高，就产生巨大的 Loss 惩罚它！
+        # 排除掉第0个(真实的动作)，只惩罚后面 7 个生成的动作
+        cql_penalty = jnp.mean(q_pool_fake[:, 1:])
+
+        # 综合 Loss：拟合真实回报 + 压制假动作的幻觉分数 (cql_weight 比如设为 1.0 或 5.0)
+        cql_weight = 1.0
+        total_v_loss = (mse_loss + cql_weight * cql_penalty) * self.config.value_loss_coeff * self.config.w_v_loss
+
+        return total_v_loss
 
     def get_schedule(self) -> FlowSchedule:
         full_t_path = jnp.linspace(1.0, 0.0, self.config.flow_steps + 1)
