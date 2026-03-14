@@ -154,15 +154,20 @@ class DGPOFMState:
         metrics.update(p_metrics)
 
         # Value (Q) 训练 (依然使用真实执行过的 action 和计算出的 empirical returns)
+        # 4. Value 训练 N 次
         def value_inner_step(carry, _):
             v_params, v_opt_state = carry
 
             def v_loss_fn(v_p):
-                return self._compute_value_loss(v_p, obs_norm, transitions.action, transitions.truncation, target_qs)
+                # 👑 加上最后的 pool_actions！
+                return self._compute_value_loss(
+                    v_p, obs_norm, transitions.action, transitions.truncation, target_qs, pool_actions
+                )
 
             v_loss_val, v_grads = jax.value_and_grad(v_loss_fn)(v_params)
             v_updates, next_v_opt_state = self.opt_value.update(v_grads, v_opt_state, v_params)
             next_v_params = optax.apply_updates(v_params, v_updates)
+
             return (next_v_params, next_v_opt_state), v_loss_val
 
         (new_value_params, new_opt_state_value), extra_v_losses = jax.lax.scan(
