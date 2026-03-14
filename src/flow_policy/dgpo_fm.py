@@ -300,36 +300,24 @@ class DGPOFMState:
             initial_indices = jax.random.choice(prng_cluster, N, shape=(C,), replace=False)
             centers = jax.lax.stop_gradient(combined_features[initial_indices])
 
-            # 提前计算特征的平方和，避免在循环内重复计算
-            sq_norms_features = jnp.sum(combined_features ** 2, axis=-1)
-
             labels = jnp.zeros((N,), dtype=jnp.int32)
             for _ in range(3):
-                # --- 高速距离计算 (利用矩阵乘法代替广播减法) ---
-                sq_norms_centers = jnp.sum(centers ** 2, axis=-1)
-                dist_to_centers = jnp.maximum(
-                    0.0,
-                    sq_norms_features[:, None] + sq_norms_centers[None, :] - 2 * jnp.matmul(combined_features,
-                                                                                            centers.T)
-                )
-
+                dist_to_centers = jnp.sum((combined_features[:, None, :] - centers[None, :, :]) ** 2, axis=-1)
                 labels = jnp.argmin(dist_to_centers, axis=-1)
                 one_hot = jax.nn.one_hot(labels, C)
                 centers = jnp.matmul(one_hot.T, combined_features) / (jnp.sum(one_hot, axis=0)[:, None] + 1e-8)
                 centers = jax.lax.stop_gradient(centers)
 
-            # --- 1. 离群点检测 (同样使用高速算法) ---
-            sq_norms_centers = jnp.sum(centers ** 2, axis=-1)
-            dist_to_centers = jnp.maximum(
-                0.0,
-                sq_norms_features[:, None] + sq_norms_centers[None, :] - 2 * jnp.matmul(combined_features, centers.T)
-            )
+            # --- 1. 离群点检测 ---
+            # 重新计算一次所有点到最终中心的距离
+            dist_to_centers = jnp.sum((combined_features[:, None, :] - centers[None, :, :]) ** 2, axis=-1)
             min_dists_sq = jnp.min(dist_to_centers, axis=-1)
 
-            # 由于加入了 h_s，距离绝对值会变大，这里的阈值可能需要按比例放大
+            # 判定阈值：大于 fixed_radius 的平方即为离群点
             is_outlier = min_dists_sq > (self.config.fixed_radius ** 2)
 
             one_hot_labels = jax.nn.one_hot(labels, C)
+            # 剥离离群点：在簇的有效掩码中，将离群点的位置抹零
             valid_one_hot = one_hot_labels * (~is_outlier[:, None])
 
             # --- 2. 簇内过滤与选优 (仅使用有效点) ---
