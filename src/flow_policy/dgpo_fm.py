@@ -399,25 +399,18 @@ class DGPOFMState:
             valid_one_hot = one_hot_labels * (~is_outlier[:, None])
 
             # =========================================================
-            # 4. 簇内有界线性比率选优 (Bounded Linear Scaling)
+            # 4. 簇内 Gumbel-Max 选优 (恢复 0.2844 版本的原生杀器)
             # =========================================================
-            masked_adv = jnp.where(valid_one_hot, flat_adv[:, None], 0.0)
+            masked_adv_cluster = jnp.where(valid_one_hot, flat_adv[:, None], -jnp.inf)
+            local_adv_pool = jnp.where(valid_one_hot, flat_adv[:, None], 0.0)
 
-            cluster_counts = jnp.sum(valid_one_hot, axis=0) + 1e-8
-            mean_adv_c = jnp.sum(masked_adv, axis=0) / cluster_counts
-            std_adv_c = jnp.sqrt(
-                jnp.sum((masked_adv - mean_adv_c[None, :]) ** 2 * valid_one_hot, axis=0) / cluster_counts)
+            # 计算簇内动态温度
+            local_scale_c = jax.lax.stop_gradient(jnp.max(jnp.abs(local_adv_pool), axis=0))
+            dynamic_alpha_c = self.config.resampling_alpha * (local_scale_c + 1e-6)
 
-            # 簇内相对表现 Z-Score
-            z_score_adv = jnp.where(valid_one_hot,
-                                    (flat_adv[:, None] - mean_adv_c[None, :]) / (std_adv_c[None, :] + 1e-8), 0.0)
-
-            # 你的线性比例截断逻辑: 最大5倍，最小0.1倍，彻底解决赢者通吃
-            beta = 1.0
-            raw_ratio = 1.0 + beta * z_score_adv
-            bounded_ratio = jnp.clip(raw_ratio, 0.1, 5.0)
-
-            logits_c = jnp.where(valid_one_hot, jnp.log(bounded_ratio), -jnp.inf)
+            # 转换为极具剥削性 (Exploitative) 的指数 Logits
+            max_adv_c = jnp.max(masked_adv_cluster, axis=0, keepdims=True)
+            logits_c = jnp.where(valid_one_hot, (masked_adv_cluster - max_adv_c) / dynamic_alpha_c[None, :], -jnp.inf)
 
             gumbel_noise_c = jax.random.gumbel(prng_resample, shape=(N, C))
             sampled_idx_per_cluster = jnp.argmax(logits_c + gumbel_noise_c, axis=0)
@@ -426,6 +419,7 @@ class DGPOFMState:
             a_hat_normal = cluster_sampled_actions[labels]
 
             a_hat = jnp.where(is_outlier[:, None], flat_actions, a_hat_normal)
+
 
             # --- 监控指标 ---
             cluster_sizes = jnp.sum(valid_one_hot, axis=0)
