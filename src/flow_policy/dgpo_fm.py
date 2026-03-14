@@ -192,8 +192,9 @@ class DGPOFMState:
         # =========================================================
         # 当前步骤的 Q(s, a)
         concat_inputs = jnp.concatenate([obs_norm, transitions.action], axis=-1)
+        # 修正：
         q_pred, _ = networks.value_mlp_fwd_with_features(self.params.value, concat_inputs)
-        q_pred = jax.lax.stop_gradient(q_pred.squeeze(-1))
+        q_pred = jax.lax.stop_gradient(q_pred[..., 0])  # 直接取最后一维的第一个，最安全
 
         # Bootstrap 步骤的 Q(s', a') -> 需要生成一个 a'
         bootstrap_obs = transitions.next_obs[-1:, :, :]
@@ -214,8 +215,9 @@ class DGPOFMState:
         bootstrap_act, _ = jax.lax.scan(boot_step_fn, boot_noise, (schedule.t_current, schedule.t_next))
 
         bootstrap_concat = jnp.concatenate([bootstrap_obs, bootstrap_act], axis=-1)
+        # 修正：
         bootstrap_q, _ = networks.value_mlp_fwd_with_features(self.params.value, bootstrap_concat)
-        bootstrap_q = jax.lax.stop_gradient(bootstrap_q.squeeze(-1))
+        bootstrap_q = jax.lax.stop_gradient(bootstrap_q[..., 0])
 
         # 借用 GAE 的数学框架，计算 SARSA(λ) 返回值作为 Target Q
         gae_qs, _ = jax.lax.stop_gradient(
@@ -260,8 +262,9 @@ class DGPOFMState:
         obs_pool_b = jnp.broadcast_to(flat_obs[:, None, :], (N, K + 1, obs_dim))
         concat_pool = jnp.concatenate([obs_pool_b, pool_actions], axis=-1)
 
+        # 修正：
         q_pool, _ = networks.value_mlp_fwd_with_features(self.params.value, concat_pool)
-        q_pool = jax.lax.stop_gradient(q_pool.squeeze(-1))  # (N, K+1)
+        q_pool = jax.lax.stop_gradient(q_pool[..., 0])  # 结果形状 (N, K+1)
 
         # =========================================================
         # 4. Softmax 加权 (Q-Guided Weighting)
@@ -319,7 +322,8 @@ class DGPOFMState:
     def _compute_value_loss(self, value_params, obs_norm, actions, truncation, target_qs):
         concat_inputs = jnp.concatenate([obs_norm, actions], axis=-1)
         q_pred, _ = networks.value_mlp_fwd_with_features(value_params, concat_inputs)
-        q_pred = q_pred.squeeze(-1)
+        # 修正：
+        q_pred = q_pred[..., 0]
 
         v_error = (target_qs - q_pred) * (1 - truncation)
         return jnp.mean(v_error ** 2) * self.config.value_loss_coeff * self.config.w_v_loss
