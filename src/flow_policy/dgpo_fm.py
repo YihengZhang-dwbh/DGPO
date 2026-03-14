@@ -424,7 +424,7 @@ class DGPOFMState:
             # --- 监控指标 ---
             cluster_sizes = jnp.sum(valid_one_hot, axis=0)
             metrics["dgpo/avg_neighbor_count"] = jnp.mean(cluster_sizes)
-            metrics["dgpo/dynamic_alpha_mean"] = jnp.mean(jnp.where(valid_one_hot, bounded_ratio, 0.0))
+            # metrics["dgpo/dynamic_alpha_mean"] = jnp.mean(jnp.where(valid_one_hot, bounded_ratio, 0.0))
             metrics["dgpo/outlier_ratio"] = jnp.mean(is_outlier)
             metrics["dgpo/est_clusters"] = jnp.array(C, dtype=jnp.float32)
             metrics["dgpo/local_scale_max"] = jnp.max(z_score_adv)
