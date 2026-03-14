@@ -382,7 +382,7 @@ class DGPOFMState:
                         jnp.sum(one_hot_labels, axis=0)[:, None] + 1e-8)
             physical_centers = jax.lax.stop_gradient(physical_centers)
 
-            动态物理半径
+            # 动态物理半径
             obs_dim = flat_obs.shape[-1]
             dynamic_radius = 2.0 * jnp.sqrt(obs_dim)
 
