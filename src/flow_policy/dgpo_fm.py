@@ -277,20 +277,17 @@ class DGPOFMState:
         if self.config.normalize_advantage:
             gae_advantages = (gae_advantages - gae_advantages.mean()) / (gae_advantages.std() + 1e-8)
 
-        # --- 核心：重采样逻辑必须放在 if 外面 ---
-        flat_obs = obs_norm.reshape((N, self.env.observation_size))
-        flat_actions = transitions.action.reshape((N, self.env.action_size))
-        flat_adv = gae_advantages.reshape((N,))
-        prng_resample = prng
-
         # === 极简融合逻辑 ===
         flat_hs = h_s.reshape((N, -1))
         flat_hs_norm = flat_hs / (jnp.linalg.norm(flat_hs, axis=-1, keepdims=True) + 1e-8)
 
-        # 直接乘上 config 里的权重！
+        # 1. 对物理状态也进行严格 L2 归一化
+        flat_obs_norm = flat_obs / (jnp.linalg.norm(flat_obs, axis=-1, keepdims=True) + 1e-8)
+
+        # 2. 勾股定理权重拼接 (平方和完美等于1)
         combined_features = jnp.concatenate([
-            flat_obs,
-            flat_hs_norm * self.config.semantic_weight
+            flat_obs_norm * ((1.0 - self.config.semantic_weight) ** 0.5),
+            flat_hs_norm * (self.config.semantic_weight ** 0.5)
         ], axis=-1)
 
         if self.config.resampling_mode == "cluster":
@@ -326,7 +323,7 @@ class DGPOFMState:
             )
             min_dists_sq = jnp.min(dist_to_centers, axis=-1)
 
-            # 由于加入了 h_s，距离绝对值会变大，这里的阈值可能需要按比例放大
+            # 由于加入了 h_s，距离绝对值会变大，这里的阈值可能需要按比例放大 （不用了，已L2范数约束为1）
             is_outlier = min_dists_sq > (self.config.fixed_radius ** 2)
 
             one_hot_labels = jax.nn.one_hot(labels, C)
