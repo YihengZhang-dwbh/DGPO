@@ -292,14 +292,13 @@ class DGPOFMState:
             # 1. 构造拓扑岛屿 (Forward: 价值驱动 | Reverse: 物理驱动)
             # =========================================================
             if K_island == 1:
-                # [新增]: 兼容 K=1，直接跳过第一层造岛，退化为单次全局聚类
                 if self.config.island_mode == "forward":
-                    # Forward 模式退化为纯物理聚类
                     fused_vectors = flat_obs
                 else:
-                    # Reverse 模式退化为纯语义聚类 (L2 归一化)
                     flat_hs = h_s.reshape((N, -1))
-                    fused_vectors = flat_hs / (jnp.linalg.norm(flat_hs, axis=-1, keepdims=True) + 1e-8)
+                    flat_hs_norm = flat_hs / (jnp.linalg.norm(flat_hs, axis=-1, keepdims=True) + 1e-8)
+                    # [修复]: 必须像旧版一样拼接物理状态，防止 Cluster Collapse！
+                    fused_vectors = jnp.concatenate([flat_obs, flat_hs_norm * self.config.semantic_weight], axis=-1)
             elif self.config.island_mode == "forward":
                 # --- 正向岛屿：价值分类 + 物理坐标压缩 ---
                 flat_vs = gae_vs.reshape((N, 1))
