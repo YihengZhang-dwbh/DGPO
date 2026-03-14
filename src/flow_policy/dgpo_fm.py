@@ -192,9 +192,10 @@ class DGPOFMState:
         # =========================================================
         # 当前步骤的 Q(s, a)
         concat_inputs = jnp.concatenate([obs_norm, transitions.action], axis=-1)
-        # 修正：
-        q_pred, _ = networks.value_mlp_fwd_with_features(self.params.value, concat_inputs)
-        q_pred = jax.lax.stop_gradient(q_pred[..., 0])  # 直接取最后一维的第一个，最安全
+        q_pred, h_s = networks.value_mlp_fwd_with_features(self.params.value, concat_inputs)
+
+        # 🚨 检查点：请确保这里就是光秃秃的 q_pred，千万不要有 [..., 0] 或 .squeeze(-1)
+        q_pred = jax.lax.stop_gradient(q_pred)
 
         # Bootstrap 步骤的 Q(s', a') -> 需要生成一个 a'
         bootstrap_obs = transitions.next_obs[-1:, :, :]
@@ -218,11 +219,9 @@ class DGPOFMState:
         bootstrap_act, _ = jax.lax.scan(boot_step_fn, boot_noise, (schedule.t_current, schedule.t_next))
 
         bootstrap_concat = jnp.concatenate([bootstrap_obs, bootstrap_act], axis=-1)
-
-
-        # 原报错代码：bootstrap_q = jax.lax.stop_gradient(bootstrap_q[..., 0])
-        # 👑 终极修复：
         bootstrap_q, _ = networks.value_mlp_fwd_with_features(self.params.value, bootstrap_concat)
+
+        # 🚨 检查点：这里也必须是光秃秃的
         bootstrap_q = jax.lax.stop_gradient(bootstrap_q)
 
         # 借用 GAE 的数学框架，计算 SARSA(λ) 返回值作为 Target Q
