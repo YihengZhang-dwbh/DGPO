@@ -193,13 +193,20 @@ class DGPOFMState:
         obs_norm = (
                                transitions.obs - self.obs_stats.mean) / self.obs_stats.std if self.config.normalize_observations else transitions.obs
 
-        # 2. 预计算固定目标 (a_hat 和 target_vs)
-        # 注意：这里我们把 obs_norm 传进去
-        a_hat, target_vs, metrics = self._compute_targets(transitions, obs_norm, prng_targets)
+        # 1. 预计算归一化观测值
+        obs_norm = (
+                               transitions.obs - self.obs_stats.mean) / self.obs_stats.std if self.config.normalize_observations else transitions.obs
 
-        # 3. Policy 训练 1 次
+        # 2. 获取权重 (把接收变量从 a_hat 改为 weights)
+        weights, target_vs, metrics = self._compute_targets(transitions, obs_norm, prng_targets)
+
+        # 提取当前 Batch 的原始动作 (N, action_size)
+        N = self.config.unroll_length * self.config.batch_size
+        flat_actions = transitions.action.reshape((N, self.env.action_size))
+
+        # 3. Policy 训练 1 次 (传入真实的 flat_actions 和 weights)
         def policy_loss_fn(p_params):
-            return self._compute_policy_loss(p_params, obs_norm, a_hat, prng_policy)
+            return self._compute_policy_loss(p_params, obs_norm, flat_actions, weights, prng_policy)
 
         (p_loss, p_metrics), p_grads = jax.value_and_grad(policy_loss_fn, has_aux=True)(self.params.policy)
         p_updates, new_opt_state_policy = self.opt_policy.update(p_grads, self.opt_state_policy, self.params.policy)
@@ -335,30 +342,44 @@ class DGPOFMState:
             one_hot_labels = jax.nn.one_hot(labels, C)
             valid_one_hot = one_hot_labels * (~is_outlier[:, None])
 
-            # --- 2. 簇内过滤与选优 (仅使用有效点) ---
-            flat_adv_sign = jnp.sign(flat_adv[:, None])
-            masked_adv_cluster = jnp.where(valid_one_hot, flat_adv_sign, -jnp.inf)
-            local_adv_pool = jnp.where(valid_one_hot, flat_adv_sign, 0.0)
+            # =========================================================
+            # 4. 簇内 Softmax 概率加权 (Local Advantage-Weighted)
+            # =========================================================
+            masked_adv_cluster = jnp.where(valid_one_hot, flat_adv[:, None], -jnp.inf)
+            local_adv_pool = jnp.where(valid_one_hot, flat_adv[:, None], 0.0)
+
+            # 计算簇内动态温度
             local_scale_c = jax.lax.stop_gradient(jnp.max(jnp.abs(local_adv_pool), axis=0))
             dynamic_alpha_c = self.config.resampling_alpha * (local_scale_c + 1e-6)
+
+            # 减去最大值防止指数爆炸
             max_adv_c = jnp.max(masked_adv_cluster, axis=0, keepdims=True)
-            logits_c = jnp.where(valid_one_hot, (masked_adv_cluster - max_adv_c) / dynamic_alpha_c[None, :],
-                                 -jnp.inf)
+            logits_c = jnp.where(valid_one_hot, (masked_adv_cluster - max_adv_c) / dynamic_alpha_c[None, :], -1e9)
 
-            gumbel_noise_c = jax.random.gumbel(prng_resample, shape=(N, C))
-            sampled_idx_per_cluster = jnp.argmax(logits_c + gumbel_noise_c, axis=0)
-            # --- 3. 行为克隆分配 ---
-            cluster_sampled_actions = flat_actions[sampled_idx_per_cluster]
-            a_hat_normal = cluster_sampled_actions[labels]
+            # --- 核心：手动安全 Softmax 计算簇内概率 ---
+            # (用 -1e9 代替 -inf 防止空簇导致的 NaN 错误)
+            exp_logits = jnp.exp(logits_c)
+            sum_exp = jnp.sum(exp_logits, axis=0, keepdims=True) + 1e-8
+            probs_c = exp_logits / sum_exp  # [N, C] 矩阵，每列和为 1
 
-            # 离群点不向簇中心学习，直接克隆自己本来的动作
-            a_hat = jnp.where(is_outlier[:, None], flat_actions, a_hat_normal)
-
-            # --- 4. 监控指标 ---
+            # --- 缩放对齐：概率乘以簇大小，保证全局梯度尺度不塌缩 ---
             cluster_sizes = jnp.sum(valid_one_hot, axis=0)
+            scaled_weights_c = probs_c * cluster_sizes[None, :]
+
+            # 提取每个样本在所属簇中的软权重
+            sample_weights = jnp.sum(scaled_weights_c * valid_one_hot, axis=-1)
+
+            # 对于离群点，赋予中立权重 1.0 (等效于普通的行为克隆)
+            final_weights = jnp.where(is_outlier, 1.0, sample_weights)
+
+            # --- 监控指标 ---
             metrics["dgpo/avg_neighbor_count"] = jnp.mean(cluster_sizes)
             metrics["dgpo/dynamic_alpha_mean"] = jnp.mean(dynamic_alpha_c)
-            metrics["dgpo/outlier_ratio"] = jnp.mean(is_outlier)  # 监控当前有多少比例是离群点
+            metrics["dgpo/outlier_ratio"] = jnp.mean(is_outlier)
+            metrics["dgpo/est_clusters"] = jnp.array(C, dtype=jnp.float32)
+            metrics["dgpo/weight_max"] = jnp.max(final_weights)  # 监控一下最大权重倍率
+            # 注意这里不再返回 a_hat，而是返回我们算好的连续权重！
+            return jax.lax.stop_gradient(final_weights), gae_vs, metrics
         else:
             raise ValueError("Mode must be cluster")
 
@@ -367,7 +388,8 @@ class DGPOFMState:
     # ==========================================
     # 3. 损失函数定义 (纯净计算)
     # ==========================================
-    def _compute_policy_loss(self, policy_params, obs_norm, a_hat, prng):
+    # 参数列表增加 actions 和 weights
+    def _compute_policy_loss(self, policy_params, obs_norm, actions, weights, prng):
         (timesteps, batch_dim, obs_dim) = obs_norm.shape
         N = timesteps * batch_dim
         flat_obs = obs_norm.reshape((N, obs_dim))
@@ -377,17 +399,21 @@ class DGPOFMState:
         t_idx = jax.random.randint(prng_t, (N, 1), 0, self.config.flow_steps)
         t = self.get_schedule().t_current[t_idx]
 
-        x_t = t * eps + (1.0 - t) * a_hat
+        # ODE 轨迹起点是真实的 actions
+        x_t = t * eps + (1.0 - t) * actions
         velocity_pred = networks.flow_mlp_fwd(
             policy_params, flat_obs, x_t, self.embed_timestep(t)
         ) * self.config.policy_mlp_output_scale
 
-        # 兼容你原来的 output_mode 逻辑
+        # 分别计算每个样本的 MSE (注意使用 axis=-1 求和保留 N 维度)
         if self.config.output_mode == "u_but_supervise_as_eps":
             x1_pred = (x_t - t * velocity_pred) + velocity_pred
-            policy_loss = jnp.mean((eps - x1_pred) ** 2)
+            error_sq = jnp.sum((eps - x1_pred) ** 2, axis=-1)
         else:
-            policy_loss = jnp.mean((velocity_pred - (eps - a_hat)) ** 2)
+            error_sq = jnp.sum((velocity_pred - (eps - actions)) ** 2, axis=-1)
+
+        # 👑 终极奥义：局部优势加权回归！
+        policy_loss = jnp.mean(weights * error_sq)
 
         return policy_loss, {"policy_loss": policy_loss}
 
