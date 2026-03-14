@@ -346,8 +346,14 @@ class DGPOFMState:
 
         # 👑 2. 加入 CQL 保守惩罚项 (打破死亡螺旋的核心)
         # 把生成的假动作丢进去算 Q 值
+        # 👑 2. 加入 CQL 保守惩罚项 (打破死亡螺旋的核心)
         N, K_plus_1, act_dim = pool_actions.shape
-        obs_b = jnp.broadcast_to(obs_norm[:, None, :], (N, K_plus_1, obs_norm.shape[-1]))
+
+        # 👇 关键修复：先把 (T, B, obs_dim) 展平为 (N, obs_dim)
+        flat_obs = obs_norm.reshape((N, obs_norm.shape[-1]))
+
+        # 然后再增加维度并广播
+        obs_b = jnp.broadcast_to(flat_obs[:, None, :], (N, K_plus_1, obs_norm.shape[-1]))
         concat_pool = jnp.concatenate([obs_b, pool_actions], axis=-1)
 
         q_pool_fake, _ = networks.value_mlp_fwd_with_features(value_params, concat_pool)
