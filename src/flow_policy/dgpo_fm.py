@@ -298,11 +298,12 @@ class DGPOFMState:
 
         # 关键：计算整个语义块的全局标准差，而不是每个维度的
         # 这样保留了 hs 内部不同神经元之间的“强弱”对比
-        global_std_hs = jnp.std(flat_hs) + 1e-6
-        flat_hs_scaled = (flat_hs - jnp.mean(flat_hs)) / global_std_hs
+        # global_std_hs = jnp.std(flat_hs) + 1e-6
+        # flat_hs_scaled = (flat_hs - jnp.mean(flat_hs)) / global_std_hs
 
         # 同样缩放到单位期望模长
-        flat_hs_scaled = flat_hs_scaled / jnp.sqrt(flat_hs.shape[-1])
+        # flat_hs_scaled = flat_hs_scaled / jnp.sqrt(flat_hs.shape[-1])
+        flat_hs_scaled = flat_hs / jnp.sqrt(flat_hs.shape[-1])
 
         # 3. 最终拼接
         combined_features = jnp.concatenate([
