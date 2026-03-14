@@ -277,6 +277,12 @@ class DGPOFMState:
         if self.config.normalize_advantage:
             gae_advantages = (gae_advantages - gae_advantages.mean()) / (gae_advantages.std() + 1e-8)
 
+        # --- 核心：重采样逻辑必须放在 if 外面 ---
+        flat_obs = obs_norm.reshape((N, self.env.observation_size))
+        flat_actions = transitions.action.reshape((N, self.env.action_size))
+        flat_adv = gae_advantages.reshape((N,))
+        prng_resample = prng
+
         # === 极简融合逻辑 ===
         flat_hs = h_s.reshape((N, -1))
         flat_hs_norm = flat_hs / (jnp.linalg.norm(flat_hs, axis=-1, keepdims=True) + 1e-8)
