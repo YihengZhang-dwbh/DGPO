@@ -27,6 +27,7 @@ class DGPOFMConfig:
     num_clusters: jdc.Static[int] = 64
     # [新增]: 语义特征融合权重 (0.0 表示纯物理状态聚类)
     semantic_weight: float = 0.0
+    L2_combined_regularized: jdc.Static[bool] = True
 
     # 控制损失权重
     w_v_loss: float = 1.
@@ -291,7 +292,8 @@ class DGPOFMState:
         # ==========================================================
         # === 新增：对融合后的向量进行全局 L2 归一化 (投影到超球面) ===
         # ==========================================================
-        combined_features = combined_features / (jnp.linalg.norm(combined_features, axis=-1, keepdims=True) + 1e-8)
+        if self.config.L2_combined_regularized:
+            combined_features = combined_features / (jnp.linalg.norm(combined_features, axis=-1, keepdims=True) + 1e-8)
 
         if self.config.resampling_mode == "cluster":
             # [K-Means 聚类逻辑...]
@@ -306,14 +308,16 @@ class DGPOFMState:
             labels = jnp.zeros((N,), dtype=jnp.int32)
             for _ in range(3):
                 # --- 高速距离计算 (利用矩阵乘法代替广播减法) ---
-                # sq_norms_centers = jnp.sum(centers ** 2, axis=-1)
-                # dist_to_centers = jnp.maximum(
-                #     0.0,
-                #     sq_norms_features[:, None] + sq_norms_centers[None, :] - 2 * jnp.matmul(combined_features,
-                #                                                                             centers.T)
-                # )
-                # 2.0 - 2 * cos_sim
-                dist_to_centers = jnp.maximum(0.0, 2.0 - 2.0 * jnp.matmul(combined_features, centers.T))
+                if not self.config.L2_combined_regularized:
+                    sq_norms_centers = jnp.sum(centers ** 2, axis=-1)
+                    dist_to_centers = jnp.maximum(
+                        0.0,
+                        sq_norms_features[:, None] + sq_norms_centers[None, :] - 2 * jnp.matmul(combined_features,
+                                                                                                centers.T)
+                    )
+                else:
+                    # 2.0 - 2 * cos_sim
+                    dist_to_centers = jnp.maximum(0.0, 2.0 - 2.0 * jnp.matmul(combined_features, centers.T))
 
                 labels = jnp.argmin(dist_to_centers, axis=-1)
                 one_hot = jax.nn.one_hot(labels, C)
