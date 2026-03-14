@@ -363,7 +363,7 @@ class DGPOFMState:
             probs_c = exp_logits / sum_exp  # [N, C] 矩阵，每列和为 1
 
             # # --- 缩放对齐：概率乘以簇大小，保证全局梯度尺度不塌缩 ---
-            # cluster_sizes = jnp.sum(valid_one_hot, axis=0)
+            cluster_sizes = jnp.sum(valid_one_hot, axis=0)
             # scaled_weights_c = probs_c * cluster_sizes[None, :]
             #
             # # 提取每个样本在所属簇中的软权重
