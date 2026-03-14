@@ -292,20 +292,24 @@ class DGPOFMState:
 
         # === 修复后的融合逻辑：保留幅度信息 ===
         flat_hs = h_s.reshape((N, -1))
-        flat_hs_norm = flat_hs / (jnp.linalg.norm(flat_hs, axis=-1, keepdims=True) + 1e-8)
+        # 1. 先拼接出原始融合向量 (保留原始幅度)
+        raw_combined = jnp.concatenate([flat_obs, flat_hs], axis=-1)
 
-        # 获取物理观测维度
+        # 2. 【核心】：执行跨样本的同维度归一化
+        # 计算当前 Batch 的均值和标准差
+        mean_feat = jnp.mean(raw_combined, axis=0, keepdims=True)
+        std_feat = jnp.std(raw_combined, axis=0, keepdims=True) + 1e-8
+
+        # 标准化：(x - mu) / sigma
+        # 现在每一个维度的期望值都是 0，方差都是 1
+        standardized_features = (raw_combined - mean_feat) / std_feat
+
+        # 3. 最后再应用 semantic_weight 进行“块级别”的权重分配
+        # 此时权重分配是极其精准的，因为两边的基准面（方差）已经完全平齐了
         obs_dim = flat_obs.shape[-1]
-
-        # [核心改动]: 不再做 L2 归一化，而是除以维度平方根
-        # 这样 flat_obs_scaled 的期望平方和约为 1.0
-        # 但它保留了物理空间内的欧氏距离比例（长短、远近信息全都在）
-        flat_obs_scaled = flat_obs / jnp.sqrt(obs_dim)
-
-        # 勾股定理权重拼接 (现在它衡量的是两个空间的“能量占比”)
         combined_features = jnp.concatenate([
-            flat_obs_scaled * ((1.0 - self.config.semantic_weight) ** 0.5),
-            flat_hs_norm * (self.config.semantic_weight ** 0.5)
+            standardized_features[:, :obs_dim] * ((1.0 - self.config.semantic_weight) ** 0.5),
+            standardized_features[:, obs_dim:] * (self.config.semantic_weight ** 0.5)
         ], axis=-1)
 
         if self.config.resampling_mode == "cluster":
