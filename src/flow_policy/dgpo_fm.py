@@ -336,6 +336,7 @@ class DGPOFMState:
             valid_one_hot = one_hot_labels * (~is_outlier[:, None])
 
             # --- 2. 簇内过滤与选优 (仅使用有效点) ---
+            flat_adv = jnp.sign(flat_adv[:, None])
             masked_adv_cluster = jnp.where(valid_one_hot, flat_adv[:, None], -jnp.inf)
             local_adv_pool = jnp.where(valid_one_hot, flat_adv[:, None], 0.0)
             local_scale_c = jax.lax.stop_gradient(jnp.max(jnp.abs(local_adv_pool), axis=0))
