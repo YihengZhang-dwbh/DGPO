@@ -300,29 +300,31 @@ class DGPOFMState:
         flat_obs = obs_norm.reshape((N, obs_norm.shape[-1]))
 
         prng_eps, prng_t = jax.random.split(prng, 2)
-        # 为每个状态生成唯一的噪声和时间戳，并在 K+1 个动作中共享 (极大地降低方差)
-        eps = jax.random.normal(prng_eps, (N, 1, act_dim))
-        t_idx = jax.random.randint(prng_t, (N, 1, 1), 0, self.config.flow_steps)
+        # 👑 你的神级修复：为每个候选动作分配【独立】的噪声和时间戳！
+        # 这样网络就能把不同的动作映射到不同的高斯噪声球面上，保留双峰分布！
+        eps = jax.random.normal(prng_eps, (N, K_plus_1, act_dim))
+        t_idx = jax.random.randint(prng_t, (N, K_plus_1, 1), 0, self.config.flow_steps)
         t = self.get_schedule().t_current[t_idx]
 
+        # ODE 轨迹起点 (完全独立的轨迹)
         x_t = t * eps + (1.0 - t) * actions_pool
         obs_b = jnp.broadcast_to(flat_obs[:, None, :], (N, K_plus_1, flat_obs.shape[-1]))
 
-        t_embed = self.embed_timestep(t)  # (N, 1, t_dim)
-        t_embed_b = jnp.broadcast_to(t_embed, (N, K_plus_1, self.config.timestep_embed_dim))
+        t_embed = self.embed_timestep(t)  # (N, K+1, t_dim)
 
         vel_pred = networks.flow_mlp_fwd(
-            policy_params, obs_b, x_t, t_embed_b
+            policy_params, obs_b, x_t, t_embed
         ) * self.config.policy_mlp_output_scale
 
         if self.config.output_mode == "u_but_supervise_as_eps":
             x1_pred = (x_t - t * vel_pred) + vel_pred
-            error_sq = jnp.sum((eps - x1_pred) ** 2, axis=-1)  # (N, K+1)
+            error_sq = jnp.sum((eps - x1_pred) ** 2, axis=-1)
         else:
             error_sq = jnp.sum((vel_pred - (eps - actions_pool)) ** 2, axis=-1)
 
-        # 将权重乘到误差上，并在 K+1 及 N 的维度上求平均
+        # 依然用 Softmax 权重加权，但现在它是在对分布进行重塑，而不是对动作进行求均值
         policy_loss = jnp.mean(jnp.sum(weights_pool * error_sq, axis=-1))
+
         return policy_loss, {"policy_loss": policy_loss}
 
     # ==========================================
