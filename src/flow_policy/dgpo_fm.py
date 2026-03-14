@@ -290,16 +290,21 @@ class DGPOFMState:
         flat_adv = gae_advantages.reshape((N,))
         prng_resample = prng
 
-        # === 极简融合逻辑 ===
+        # === 修复后的融合逻辑：保留幅度信息 ===
         flat_hs = h_s.reshape((N, -1))
         flat_hs_norm = flat_hs / (jnp.linalg.norm(flat_hs, axis=-1, keepdims=True) + 1e-8)
 
-        # 1. 对物理状态也进行严格 L2 归一化
-        flat_obs_norm = flat_obs / (jnp.linalg.norm(flat_obs, axis=-1, keepdims=True) + 1e-8)
+        # 获取物理观测维度
+        obs_dim = flat_obs.shape[-1]
 
-        # 2. 勾股定理权重拼接 (平方和完美等于1)
+        # [核心改动]: 不再做 L2 归一化，而是除以维度平方根
+        # 这样 flat_obs_scaled 的期望平方和约为 1.0
+        # 但它保留了物理空间内的欧氏距离比例（长短、远近信息全都在）
+        flat_obs_scaled = flat_obs / jnp.sqrt(obs_dim)
+
+        # 勾股定理权重拼接 (现在它衡量的是两个空间的“能量占比”)
         combined_features = jnp.concatenate([
-            flat_obs_norm * ((1.0 - self.config.semantic_weight) ** 0.5),
+            flat_obs_scaled * ((1.0 - self.config.semantic_weight) ** 0.5),
             flat_hs_norm * (self.config.semantic_weight ** 0.5)
         ], axis=-1)
 
