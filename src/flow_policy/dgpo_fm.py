@@ -285,103 +285,27 @@ class DGPOFMState:
             gae_advantages = (gae_advantages - gae_advantages.mean()) / (gae_advantages.std() + 1e-8)
 
         # --- 核心：重采样逻辑必须放在 if 外面 ---
-        flat_obs = obs_norm.reshape((N, self.env.observation_size))
-        flat_actions = transitions.action.reshape((N, self.env.action_size))
+        # flat_obs = obs_norm.reshape((N, self.env.observation_size))
+        # flat_actions = transitions.action.reshape((N, self.env.action_size))
+        # flat_adv = gae_advantages.reshape((N,))
         flat_adv = gae_advantages.reshape((N,))
-        prng_resample = prng
 
-        # === 极简融合逻辑 ===
-        flat_hs = h_s.reshape((N, -1))
-        flat_hs_norm = flat_hs / (jnp.linalg.norm(flat_hs, axis=-1, keepdims=True) + 1e-8)
+        # 1. 直接计算全局指数权重
+        # 为了数值稳定，通常要减去最大值
+        max_adv = jnp.max(flat_adv)
+        raw_weights = jnp.exp((flat_adv - max_adv) / self.config.resampling_alpha)
 
-        # 1. 对物理状态也进行严格 L2 归一化
-        flat_obs_norm = flat_obs / (jnp.linalg.norm(flat_obs, axis=-1, keepdims=True) + 1e-8)
+        # 2. 【关键】归一化权重，保证平均权重为 1.0，避免破坏学习率
+        final_weights = raw_weights / (jnp.mean(raw_weights) + 1e-8)
 
-        # 2. 勾股定理权重拼接 (平方和完美等于1)
-        combined_features = jnp.concatenate([
-            flat_obs_norm * ((1.0 - self.config.semantic_weight) ** 0.5),
-            flat_hs_norm * (self.config.semantic_weight ** 0.5)
-        ], axis=-1)
+        # 监控指标
+        metrics = {
+            "dgpo/weight_max": jnp.max(final_weights),
+            "dgpo/weight_std": jnp.std(final_weights),
+            "advantages_mean": jnp.mean(gae_advantages),
+        }
 
-        if self.config.resampling_mode == "cluster":
-            # [K-Means 聚类逻辑...]
-            C = self.config.num_clusters
-            prng_cluster, prng_resample = jax.random.split(prng_resample)
-            initial_indices = jax.random.choice(prng_cluster, N, shape=(C,), replace=False)
-            centers = jax.lax.stop_gradient(combined_features[initial_indices])
-
-            # 提前计算特征的平方和，避免在循环内重复计算
-            sq_norms_features = jnp.sum(combined_features ** 2, axis=-1)
-
-            labels = jnp.zeros((N,), dtype=jnp.int32)
-            for _ in range(3):
-                # --- 高速距离计算 (利用矩阵乘法代替广播减法) ---
-                sq_norms_centers = jnp.sum(centers ** 2, axis=-1)
-                dist_to_centers = jnp.maximum(
-                    0.0,
-                    sq_norms_features[:, None] + sq_norms_centers[None, :] - 2 * jnp.matmul(combined_features,
-                                                                                            centers.T)
-                )
-
-                labels = jnp.argmin(dist_to_centers, axis=-1)
-                one_hot = jax.nn.one_hot(labels, C)
-                centers = jnp.matmul(one_hot.T, combined_features) / (jnp.sum(one_hot, axis=0)[:, None] + 1e-8)
-                centers = jax.lax.stop_gradient(centers)
-
-            # --- 1. 离群点检测 (同样使用高速算法) ---
-            sq_norms_centers = jnp.sum(centers ** 2, axis=-1)
-            dist_to_centers = jnp.maximum(
-                0.0,
-                sq_norms_features[:, None] + sq_norms_centers[None, :] - 2 * jnp.matmul(combined_features, centers.T)
-            )
-            min_dists_sq = jnp.min(dist_to_centers, axis=-1)
-
-            # 由于加入了 h_s，距离绝对值会变大，这里的阈值可能需要按比例放大 （不用了，已L2范数约束为1）
-            is_outlier = min_dists_sq > (self.config.fixed_radius ** 2)
-
-            one_hot_labels = jax.nn.one_hot(labels, C)
-            valid_one_hot = one_hot_labels * (~is_outlier[:, None])
-
-            # =========================================================
-            # 4. 簇内 Softmax 概率加权 (Local Advantage-Weighted)
-            # =========================================================
-            masked_adv_cluster = jnp.where(valid_one_hot, flat_adv[:, None], -jnp.inf)
-            local_adv_pool = jnp.where(valid_one_hot, flat_adv[:, None], 0.0)
-
-            # 计算簇内动态温度
-            local_scale_c = jax.lax.stop_gradient(jnp.max(jnp.abs(local_adv_pool), axis=0))
-            dynamic_alpha_c = self.config.resampling_alpha * (local_scale_c + 1e-6)
-
-            # 减去最大值防止指数爆炸
-            max_adv_c = jnp.max(masked_adv_cluster, axis=0, keepdims=True)
-            logits_c = jnp.where(valid_one_hot, (masked_adv_cluster - max_adv_c) / dynamic_alpha_c[None, :], -1e9)
-
-            # --- 核心：手动安全 Softmax 计算簇内概率 ---
-            # (用 -1e9 代替 -inf 防止空簇导致的 NaN 错误)
-            exp_logits = jnp.exp(logits_c)
-            sum_exp = jnp.sum(exp_logits, axis=0, keepdims=True) + 1e-8
-            probs_c = exp_logits / sum_exp  # [N, C] 矩阵，每列和为 1
-
-            # --- 缩放对齐：概率乘以簇大小，保证全局梯度尺度不塌缩 ---
-            cluster_sizes = jnp.sum(valid_one_hot, axis=0)
-            scaled_weights_c = probs_c * cluster_sizes[None, :]
-
-            # 提取每个样本在所属簇中的软权重
-            sample_weights = jnp.sum(scaled_weights_c * valid_one_hot, axis=-1)
-
-            # 对于离群点，赋予中立权重 1.0 (等效于普通的行为克隆)
-            final_weights = jnp.where(is_outlier, 1.0, sample_weights)
-
-            # --- 监控指标 ---
-            metrics["dgpo/avg_neighbor_count"] = jnp.mean(cluster_sizes)
-            metrics["dgpo/dynamic_alpha_mean"] = jnp.mean(dynamic_alpha_c)
-            metrics["dgpo/outlier_ratio"] = jnp.mean(is_outlier)
-            metrics["dgpo/est_clusters"] = jnp.array(C, dtype=jnp.float32)
-            metrics["dgpo/weight_max"] = jnp.max(final_weights)  # 监控一下最大权重倍率
-            # 注意这里不再返回 a_hat，而是返回我们算好的连续权重！
-            return jax.lax.stop_gradient(final_weights), gae_vs, metrics
-        else:
-            raise ValueError("Mode must be cluster")
+        return jax.lax.stop_gradient(final_weights), gae_vs, metrics
 
 
     # ==========================================
