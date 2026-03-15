@@ -171,31 +171,63 @@ class DGPOFMState:
         pool_actions, target_qs, metrics = self._compute_targets(transitions, obs_norm, prng_targets)
 
         # ==========================================
-        # 👑 2. 纯粹的 Q 网络小灶 (回归标准 PPO/SAC)
+        # 👑 2. Q 网络小灶 & Auto-CQL 动态调温
         # ==========================================
         q_update_steps = self.config.loop_v
 
         def value_inner_step(carry, _):
-            v_params, v_opt_state = carry
+            v_params, v_opt_state, current_log_alpha = carry
+            current_alpha = jax.lax.stop_gradient(jnp.exp(current_log_alpha))
 
             def v_loss_fn(v_p):
-                return self._compute_value_loss(v_p, obs_norm, transitions.action, transitions.truncation, target_qs)
+                total_loss, aux_tuple = self._compute_value_loss(
+                    v_p, obs_norm, transitions.action, transitions.truncation, target_qs, pool_actions, current_alpha
+                )
+                return total_loss, aux_tuple
 
-            v_loss_val, v_grads = jax.value_and_grad(v_loss_fn)(v_params)
+            (v_loss_val, (current_penalty, dyn_margin)), v_grads = jax.value_and_grad(v_loss_fn, has_aux=True)(v_params)
             v_updates, next_v_opt_state = self.opt_value.update(v_grads, v_opt_state, v_params)
             next_v_params = optax.apply_updates(v_params, v_updates)
 
-            return (next_v_params, next_v_opt_state), {"v_loss/total": v_loss_val}
+            if self.config.cql_decay_mode == "auto":
+                alpha_grad = current_penalty - dyn_margin
+                next_log_alpha = current_log_alpha + self.config.cql_alpha_lr * alpha_grad
 
-        # 执行极简 scan 循环
-        (new_value_params, new_opt_state_value), extra_v_metrics = jax.lax.scan(
+                # 👑 动态天花板 (防核爆与防通缩的完美平衡)
+                steps_per_iter = self.config.iterations_per_env * self.config.num_envs
+                total_iterations = self.config.num_timesteps // steps_per_iter
+                total_updates = total_iterations * self.config.num_minibatches * self.config.num_updates_per_batch
+                decay_updates = total_updates * self.config.cql_decay_ratio
+                progress = jnp.minimum(1.0, self.steps / decay_updates)
+
+                # 天花板从 0.1 降到 0.01
+                safe_ceiling = 0.01 + (self.config.cql_init_weight - 0.01) * (1.0 - progress)
+
+                next_log_alpha = jnp.clip(
+                    next_log_alpha,
+                    a_min=jnp.log(self.config.cql_final_weight),
+                    a_max=jnp.log(safe_ceiling)
+                )
+            else:
+                next_log_alpha = current_log_alpha
+
+            aux_metrics = {
+                "v_loss/total": v_loss_val,
+                "v_loss/cql_penalty": current_penalty,
+                "v_loss/current_cql_weight": jnp.exp(next_log_alpha),
+                "v_loss/dynamic_margin": dyn_margin
+            }
+            return (next_v_params, next_v_opt_state, next_log_alpha), aux_metrics
+
+        (new_value_params, new_opt_state_value, new_log_alpha), extra_v_metrics = jax.lax.scan(
             value_inner_step,
-            (self.params.value, self.opt_state_value),
+            (self.params.value, self.opt_state_value, self.log_cql_weight),
             None,
             length=q_update_steps
         )
 
-        metrics["v_loss/total"] = extra_v_metrics["v_loss/total"][-1]
+        for k, v in extra_v_metrics.items():
+            metrics[k] = v[-1]
         final_v_loss = extra_v_metrics["v_loss/total"][-1]
 
         # ==========================================
@@ -229,13 +261,32 @@ class DGPOFMState:
     # ==========================================
     # 极简版 Value Loss (再也没有 Penalty 的干扰了)
     # ==========================================
-    def _compute_value_loss(self, value_params, obs_norm, actions, truncation, target_qs):
+    def _compute_value_loss(self, value_params, obs_norm, actions, truncation, target_qs, pool_actions, current_cql_weight):
+        # 1. 计算 MSE Loss
         concat_inputs = jnp.concatenate([obs_norm, actions], axis=-1)
         q_pred, _ = networks.value_mlp_fwd_with_features(value_params, concat_inputs)
         v_error = (target_qs - q_pred) * (1 - truncation)
         mse_loss = jnp.mean(v_error ** 2)
-        total_v_loss = mse_loss * self.config.value_loss_coeff * self.config.w_v_loss
-        return total_v_loss
+
+        # 2. 拿到假动作
+        N, K_plus_1, act_dim = pool_actions.shape
+        flat_obs = obs_norm.reshape((N, obs_norm.shape[-1]))
+        obs_b = jnp.broadcast_to(flat_obs[:, None, :], (N, K_plus_1, obs_norm.shape[-1]))
+        concat_pool = jnp.concatenate([obs_b, pool_actions], axis=-1)
+        q_pool_fake, _ = networks.value_mlp_fwd_with_features(value_params, concat_pool)
+
+        # 3. 截断真实动作 (防 Q 值飞天)
+        q_real_sg = jax.lax.stop_gradient(q_pool_fake[:, 0:1])
+        q_fake = q_pool_fake[:, 1:]
+        cql_penalty = jnp.mean(jax.nn.relu(q_fake - q_real_sg))
+
+        # 👑 动态容忍度：基础 1.0 + 0.1% 的 Q 值自适应放宽
+        dynamic_margin = self.config.cql_target_margin + jnp.abs(jnp.mean(q_real_sg)) * 0.001
+
+        # 4. 加上惩罚保命！
+        total_v_loss = (mse_loss + current_cql_weight * cql_penalty) * self.config.value_loss_coeff * self.config.w_v_loss
+
+        return total_v_loss, (cql_penalty, dynamic_margin)
 
     def _compute_fresh_weights(self, value_params, obs_norm, pool_actions, final_v_loss) -> tuple[Array, dict[str, Array]]:
         N, K_plus_1, act_dim = pool_actions.shape
