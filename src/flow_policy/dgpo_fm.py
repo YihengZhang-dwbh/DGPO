@@ -519,11 +519,15 @@ class DGPOFMState:
         q_pool_fake, _ = networks.value_mlp_fwd_with_features(value_params, concat_pool)
 
         # 3. 计算 Penalty
+        # 👑 核心防爆锁：切断惩罚项对真实动作 Q 值的反向传播！
+        q_real_sg = jax.lax.stop_gradient(q_pool_fake[:, 0:1])
+        q_fake = q_pool_fake[:, 1:]
+
         if self.config.use_hinge_cql:
-            # Hinge 惩罚：只有当假动作比真动作高时才产生正的 penalty
-            cql_penalty = jnp.mean(jax.nn.relu(q_pool_fake[:, 1:] - q_pool_fake[:, 0:1]))
+            # Hinge 惩罚：只把高于 real_q 的 fake_q 往下压，绝不把 real_q 往上拔！
+            cql_penalty = jnp.mean(jax.nn.relu(q_fake - q_real_sg))
         else:
-            cql_penalty = jnp.mean(q_pool_fake[:, 1:] - q_pool_fake[:, 0:1])
+            cql_penalty = jnp.mean(q_fake - q_real_sg)
 
         # 4. 综合 Loss (接收外面传进来的 current_cql_weight)
         total_v_loss = (
