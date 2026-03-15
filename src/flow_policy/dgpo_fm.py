@@ -29,7 +29,13 @@ class DGPOFMConfig:
     learning_rate_p: float = 3e-4
     learning_rate_v: float = 3e-4
     loop_v: jdc.Static[int] = 1
-    cql_weight: float = 0.1
+
+    # 👑 CQL 与 Hinge 控制
+    use_hinge_cql: jdc.Static[bool] = True
+    cql_decay_mode: jdc.Static[Literal["none", "linear", "cosine"]] = "cosine"
+    cql_init_weight: float = 0.1
+    cql_final_weight: float = 0.001
+    cql_decay_ratio: float = 0.5  # 👑 新增：默认在前 50% 的训练总步数内完成衰减
 
     # Flow parameters.
     flow_steps: jdc.Static[int] = 10
@@ -164,15 +170,21 @@ class DGPOFMState:
                     v_p, obs_norm, transitions.action, transitions.truncation, target_qs, pool_actions
                 )
 
-            v_loss_val, v_grads = jax.value_and_grad(v_loss_fn)(v_params)
+            # 使用 has_aux=True 来接收额外的 metrics
+            (v_loss_val, aux), v_grads = jax.value_and_grad(v_loss_fn, has_aux=True)(v_params)
             v_updates, next_v_opt_state = self.opt_value.update(v_grads, v_opt_state, v_params)
             next_v_params = optax.apply_updates(v_params, v_updates)
-            return (next_v_params, next_v_opt_state), v_loss_val
 
-        (new_value_params, new_opt_state_value), extra_v_losses = jax.lax.scan(
+            # 把 aux 传出去
+            return (next_v_params, next_v_opt_state), aux
+
+        (new_value_params, new_opt_state_value), extra_v_metrics = jax.lax.scan(
             value_inner_step, (self.params.value, self.opt_state_value), None, length=q_update_steps
         )
-        metrics["v_loss"] = extra_v_losses[-1]  # 记录最后一次收敛的 loss
+
+        # jax.lax.scan 会把字典里的标量堆叠成数组，我们取最后一次循环的值 [-1]
+        for k, v in extra_v_metrics.items():
+            metrics[k] = v[-1]
 
         # ==========================================
         # 👑 3. 速度场 (Policy) 滞后更新
@@ -395,48 +407,59 @@ class DGPOFMState:
     # ==========================================
     # 修改 _compute_value_loss，我们需要传入生成的动作 pool_actions 来惩罚它们
     def _compute_value_loss(self, value_params, obs_norm, actions, truncation, target_qs, pool_actions):
-        # 1. 计算真实动作的 Q 值，拟合 Target (保持不变)
+        # 1. 计算真实动作的 Q 值，拟合 Target
         concat_inputs = jnp.concatenate([obs_norm, actions], axis=-1)
         q_pred, _ = networks.value_mlp_fwd_with_features(value_params, concat_inputs)
 
         v_error = (target_qs - q_pred) * (1 - truncation)
         mse_loss = jnp.mean(v_error ** 2)
 
-        # 👑 2. 加入 CQL 保守惩罚项 (打破死亡螺旋的核心)
-        # 把生成的假动作丢进去算 Q 值
-        # 👑 2. 加入 CQL 保守惩罚项 (打破死亡螺旋的核心)
+        # 2. 计算假动作的 Q 值
         N, K_plus_1, act_dim = pool_actions.shape
-
-        # 👇 关键修复：先把 (T, B, obs_dim) 展平为 (N, obs_dim)
         flat_obs = obs_norm.reshape((N, obs_norm.shape[-1]))
-
-        # 然后再增加维度并广播
         obs_b = jnp.broadcast_to(flat_obs[:, None, :], (N, K_plus_1, obs_norm.shape[-1]))
         concat_pool = jnp.concatenate([obs_b, pool_actions], axis=-1)
 
         q_pool_fake, _ = networks.value_mlp_fwd_with_features(value_params, concat_pool)
 
-        # 惩罚项：如果 Q 网络给生成的动作打分太高，就产生巨大的 Loss 惩罚它！
-        # 排除掉第0个(真实的动作)，只惩罚后面 7 个生成的动作
-        cql_penalty = jnp.mean(q_pool_fake[:, 1:])
+        # 3. 静态分支：决定是否使用 Hinge
+        if self.config.use_hinge_cql:
+            cql_penalty = jnp.mean(jax.nn.relu(q_pool_fake[:, 1:] - q_pool_fake[:, 0:1]))
+        else:
+            cql_penalty = jnp.mean(q_pool_fake[:, 1:])
 
-        # ==========================================
-        # 👑 3. 极简版余弦衰减 (直接使用 self.steps)
-        # ==========================================
-        init_weight = self.config.cql_weight  # 起始最高惩罚，比如 0.1
-        final_weight = 0. #0.001  # 最终保留的底线惩罚
-        decay_steps = self.config.num_timesteps * 1  # 在前 100% 的训练步数内完成衰减
+        # 👑 4. 静态分支：决定调度器模式 (使用 Ratio 计算)
+        init_w = self.config.cql_init_weight
+        final_w = self.config.cql_final_weight
 
-        # self.steps 也是一个 JAX Array，直接参与计算没有任何问题
+        # 动态计算绝对衰减步数
+        decay_steps = self.config.num_timesteps * self.config.cql_decay_ratio
+
         progress = jnp.minimum(1.0, self.steps / decay_steps)
-        cosine_decay = 0.5 * (1.0 + jnp.cos(jnp.pi * progress))
-        current_cql_weight = final_weight + (init_weight - final_weight) * cosine_decay
 
-        # 4. 综合 Loss
+        if self.config.cql_decay_mode == "none":
+            current_cql_weight = init_w
+        elif self.config.cql_decay_mode == "linear":
+            current_cql_weight = init_w - progress * (init_w - final_w)
+        elif self.config.cql_decay_mode == "cosine":
+            cosine_decay = 0.5 * (1.0 + jnp.cos(jnp.pi * progress))
+            current_cql_weight = final_w + (init_w - final_w) * cosine_decay
+        else:
+            raise ValueError(f"未知的衰减模式: {self.config.cql_decay_mode}")
+
+        # 5. 综合 Loss
         total_v_loss = (
                                    mse_loss + current_cql_weight * cql_penalty) * self.config.value_loss_coeff * self.config.w_v_loss
 
-        return total_v_loss
+        # 👑 把当前的 weight 和 penalty 传出去，方便监控
+        aux_metrics = {
+            "v_loss/total": total_v_loss,
+            "v_loss/mse": mse_loss,
+            "v_loss/cql_penalty": cql_penalty,
+            "v_loss/current_cql_weight": current_cql_weight
+        }
+
+        return total_v_loss, aux_metrics
 
     def get_schedule(self) -> FlowSchedule:
         full_t_path = jnp.linspace(1.0, 0.0, self.config.flow_steps + 1)
