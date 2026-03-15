@@ -359,7 +359,7 @@ class DGPOFMState:
         pool_actions = jnp.concatenate([flat_acts_real, generated_acts], axis=1)  # (N, K+1, act_dim)
 
 
-        return jax.lax.stop_gradient(pool_actions), jax.lax.stop_gradient(pool_probs), gae_qs, metrics
+        return jax.lax.stop_gradient(pool_actions), gae_qs, metrics
 
     # ==========================================
     # 5. AW-Flow: 局部优势加权速度场
