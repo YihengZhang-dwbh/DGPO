@@ -164,19 +164,26 @@ class DGPOFMState:
         )
 
     def _step_minibatch(self, transitions: DGPOFMTransition, prng: Array) -> tuple[DGPOFMState, dict[str, Array]]:
-        # 👑 计算当前进度下的动态 K
-        # 假设在 decay_ratio (例如 50% 进度) 时达到最大 K
-        total_steps = self.config.num_timesteps // (self.config.num_envs * self.config.unroll_length)
-        progress = jnp.minimum(1.0, self.steps / (total_steps * self.config.cql_decay_ratio))
+        prng_targets, prng_policy = jax.random.split(prng, 2)
+        # 👑 必须先定义 obs_norm，供后面使用
+        obs_norm = (
+                               transitions.obs - self.obs_stats.mean) / self.obs_stats.std if self.config.normalize_observations else transitions.obs
 
-        # 线性增加 K
+        # 👑 计算当前进度下的动态 K
+        steps_per_iter = self.config.iterations_per_env * self.config.num_envs
+        total_iterations = self.config.num_timesteps // steps_per_iter
+        # 假设在 decay_ratio 进度时达到最大 K (比如 50% 进度)
+        progress = jnp.minimum(1.0, self.steps / (total_iterations * self.config.cql_decay_ratio))
+
         current_K = (self.config.num_generated_actions_min +
                      progress * (self.config.num_generated_actions_max - self.config.num_generated_actions_min)).astype(
             jnp.int32)
 
-        # 将 current_K 传给 _compute_targets
+        # 1. 获取打分和 Targets (传入动态 K)
         pool_actions, pool_weights, target_qs, metrics = self._compute_targets(transitions, obs_norm, prng_targets,
                                                                                current_K)
+
+        # ... 后面更新 V 的逻辑保持不变 ...
         # ... 后续逻辑 ...
         # ==========================================
         # 👑 2. Q 网络小灶 & Auto-CQL 动态调温
@@ -440,50 +447,44 @@ class DGPOFMState:
     # ==========================================
     def _compute_policy_loss(self, policy_params, obs_norm, actions_pool, weights_pool, prng):
         N, K_plus_1, act_dim = actions_pool.shape
-        M = self.config.num_epsilon_samples # 固定为 8
+        M = self.config.num_epsilon_samples # 8 个噪声探测器
         flat_obs = obs_norm.reshape((N, obs_norm.shape[-1]))
 
         if self.config.use_hard_resampling:
             prng_idx, prng_eps, prng_t = jax.random.split(prng, 3)
 
-            # 👑 1. 大乱斗采样：为 M 个噪声分别从 K+1 个动作中选出赢家
-            # weights_pool: (N, K+1) -> sampled_indices: (N, M)
+            # 👑 1. 独立重采样：为 M 个噪声分别选出赢家
+            # weights_pool: (N, K+1) -> 扩展到 (N, 1, K+1) 进行批量采样
             logits = jnp.log(weights_pool + 1e-8)
-            sampled_indices = jax.random.categorical(prng_idx, logits[:, None, :], axis=-1)
+            sampled_indices = jax.random.categorical(prng_idx, logits[:, None, :], axis=-1) # (N, M)
 
-            # 👑 2. 批量提取选中的动作 (N, M, act_dim)
-            # 使用 take_along_axis 确保支持动态的 K+1 维度
+            # 👑 2. 批量提取 (N, M, act_dim)
+            # 使用 take_along_axis，这能完美处理动态的 K+1 维度
             sampled_actions = jnp.take_along_axis(
-                actions_pool[:, None, :, :],
-                sampled_indices[:, :, None, None],
+                actions_pool[:, None, :, :], # (N, 1, K+1, act_dim)
+                sampled_indices[:, :, None, None], # (N, M, 1, 1)
                 axis=2
-            ).squeeze(2)
+            ).squeeze(2) # (N, M, act_dim)
 
-            # 3. 带着这 M 个动作去配对 M 个噪声
+            # 3. 准备噪声和时间步
             eps = jax.random.normal(prng_eps, (N, M, act_dim))
             t_idx = jax.random.randint(prng_t, (N, M, 1), 0, self.config.flow_steps)
             t = self.get_schedule().t_current[t_idx]
 
-            # ... 后续 ODE 训练逻辑保持不变 ...
-
-            # 3. 把选中的动作和观测，广播复制 M 份以对齐张量
-            a_target = jnp.broadcast_to(sampled_actions[:, None, :], (N, M, act_dim))
+            # 4. 构造轨迹与前向传播 (注意：sampled_actions 已经是 (N, M, act_dim))
             obs_b = jnp.broadcast_to(flat_obs[:, None, :], (N, M, flat_obs.shape[-1]))
+            x_t = t * eps + (1.0 - t) * sampled_actions
+            t_embed = self.embed_timestep(t)
 
-            # 4. 构造 M 条截然不同的 ODE 轨迹
-            x_t = t * eps + (1.0 - t) * a_target
-            t_embed = self.embed_timestep(t)  # (N, M, t_dim)
-
-            # 5. 前向传播计算速度场
             vel_pred = networks.flow_mlp_fwd(policy_params, obs_b, x_t, t_embed) * self.config.policy_mlp_output_scale
 
+            # 5. 计算 Error
             if self.config.output_mode == "u_but_supervise_as_eps":
                 x1_pred = (x_t - t * vel_pred) + vel_pred
                 error_sq = jnp.sum((eps - x1_pred) ** 2, axis=-1)
             else:
-                error_sq = jnp.sum((vel_pred - (eps - a_target)) ** 2, axis=-1)
+                error_sq = jnp.sum((vel_pred - (eps - sampled_actions)) ** 2, axis=-1)
 
-            # 6. 对这 M 个不同时空点上的 Error 求平均，得到极低方差的平滑梯度
             policy_loss = jnp.mean(error_sq)
 
         else:
