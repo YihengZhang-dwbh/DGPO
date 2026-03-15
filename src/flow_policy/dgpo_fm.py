@@ -178,6 +178,7 @@ class DGPOFMState:
         # 👑 3. 速度场 (Policy) 滞后更新
         # ==========================================
         # 注意：如果你想用刚刚训好的、最新鲜的 new_value_params 重新打分，可以在这里再调一次 Q 网络。
+
         # 但通常为了计算效率，使用步骤 1 里的旧权重 (Delayed Update) 效果就足够好了，甚至更稳定。
         def policy_loss_fn(p_params):
             return self._compute_policy_loss(p_params, obs_norm, pool_actions, pool_weights, prng_policy)
@@ -197,38 +198,28 @@ class DGPOFMState:
 
         return state, metrics
 
-    def _compute_targets(self, transitions: DGPOFMTransition, obs_norm: Array, prng: Array) -> tuple[
-        Array, Array, Array, dict[str, Array]]:
-        metrics = dict[str, Array]()
+    def _compute_targets(self, transitions: DGPOFMTransition, obs_norm: Array, prng: Array) -> tuple[Array, Array]:
         T, B, obs_dim = obs_norm.shape
         act_dim = self.env.action_size
         N = T * B
 
-        prng_boot, prng_gen, prng_eval = jax.random.split(prng, 3)
+        prng_boot, prng_gen = jax.random.split(prng, 2)  # 不再需要 prng_eval
 
         # =========================================================
-        # 1. 估算 SARSA(λ) Targets (完全真实的物理环境反馈)
+        # 1. 估算 SARSA(λ) Targets (保持不变)
         # =========================================================
-        # 当前步骤的 Q(s, a)
         concat_inputs = jnp.concatenate([obs_norm, transitions.action], axis=-1)
         q_pred, h_s = networks.value_mlp_fwd_with_features(self.params.value, concat_inputs)
-
-        # 🚨 检查点：请确保这里就是光秃秃的 q_pred，千万不要有 [..., 0] 或 .squeeze(-1)
         q_pred = jax.lax.stop_gradient(q_pred)
 
-        # Bootstrap 步骤的 Q(s', a') -> 需要生成一个 a'
         bootstrap_obs = transitions.next_obs[-1:, :, :]
         if self.config.normalize_observations:
             bootstrap_obs = (bootstrap_obs - self.obs_stats.mean) / self.obs_stats.std
 
-        # 快速为 next_obs 生成一个动作
         def boot_step_fn(x, t_tuple):
             t_curr, t_next = t_tuple
-            # 简化逻辑：先变成 (1, 1) 的输入，得到 (1, 8) 的输出
-            t_embed_raw = self.embed_timestep(jnp.array([t_curr])[..., None])  # (1, 8)
-            # 广播到 (1, B, embed_dim)
+            t_embed_raw = self.embed_timestep(jnp.array([t_curr])[..., None])
             t_embed = jnp.broadcast_to(t_embed_raw[:, None, :], (1, B, self.config.timestep_embed_dim))
-
             vel = networks.flow_mlp_fwd(self.params.policy, bootstrap_obs, x,
                                         t_embed) * self.config.policy_mlp_output_scale
             return x + (t_next - t_curr) * vel, None
@@ -239,11 +230,8 @@ class DGPOFMState:
 
         bootstrap_concat = jnp.concatenate([bootstrap_obs, bootstrap_act], axis=-1)
         bootstrap_q, _ = networks.value_mlp_fwd_with_features(self.params.value, bootstrap_concat)
-
-        # 🚨 检查点：这里也必须是光秃秃的
         bootstrap_q = jax.lax.stop_gradient(bootstrap_q)
 
-        # 借用 GAE 的数学框架，计算 SARSA(λ) 返回值作为 Target Q
         gae_qs, _ = jax.lax.stop_gradient(
             rollouts.compute_gae(
                 truncation=transitions.truncation,
@@ -256,67 +244,58 @@ class DGPOFMState:
         )
 
         # =========================================================
-        # 2. 核心：自生成 K 个动作与“原配动作”组成候选池
+        # 2. 生成 K 个动作组成候选池 (保持不变)
         # =========================================================
         K = self.config.num_generated_actions
         flat_obs = obs_norm.reshape((N, obs_dim))
         flat_acts_real = transitions.action.reshape((N, 1, act_dim))
 
-        # 并行批量生成 K 个动作
         x_t = jax.random.normal(prng_gen, (N, K, act_dim))
         obs_b = jnp.broadcast_to(flat_obs[:, None, :], (N, K, obs_dim))
 
         def gen_step_fn(x, t_tuple):
             t_curr, t_next = t_tuple
-            # 同样简化：得到 (1, 8) 的基础嵌入
-            t_embed_raw = self.embed_timestep(jnp.array([t_curr])[..., None])  # (1, 8)
-            # 广播到 (N, K, embed_dim)
+            t_embed_raw = self.embed_timestep(jnp.array([t_curr])[..., None])
             t_embed = jnp.broadcast_to(t_embed_raw[:, None, :], (N, K, self.config.timestep_embed_dim))
-
-            # 必须 stop_gradient
             p_params = jax.lax.stop_gradient(self.params.policy)
             vel = networks.flow_mlp_fwd(p_params, obs_b, x, t_embed) * self.config.policy_mlp_output_scale
             return x + (t_next - t_curr) * vel, None
 
         generated_acts, _ = jax.lax.scan(gen_step_fn, x_t, (schedule.t_current, schedule.t_next))
+        pool_actions = jnp.concatenate([flat_acts_real, generated_acts], axis=1)
 
-        # 拼成 K+1 大小的动作池
-        pool_actions = jnp.concatenate([flat_acts_real, generated_acts], axis=1)  # (N, K+1, act_dim)
+        # 🚨 注意：这里只返回动作池和 Target Q
+        return jax.lax.stop_gradient(pool_actions), gae_qs
 
-        # =========================================================
-        # 3. 裁判打分：用 Q 网络评估这 K+1 个动作
-        # =========================================================
-        obs_pool_b = jnp.broadcast_to(flat_obs[:, None, :], (N, K + 1, obs_dim))
+    def _compute_fresh_weights(self, value_params, obs_norm, pool_actions) -> tuple[Array, dict[str, Array]]:
+        N, K_plus_1, act_dim = pool_actions.shape
+        flat_obs = obs_norm.reshape((N, obs_norm.shape[-1]))
+
+        # 1. 裁判打分：用最新的 Q 网络评估 K+1 个动作
+        obs_pool_b = jnp.broadcast_to(flat_obs[:, None, :], (N, K + 1, flat_obs.shape[-1]))
         concat_pool = jnp.concatenate([obs_pool_b, pool_actions], axis=-1)
 
-        # 原报错代码：q_pool = jax.lax.stop_gradient(q_pool[..., 0])
-        # 👑 终极修复：
-        q_pool, _ = networks.value_mlp_fwd_with_features(self.params.value, concat_pool)
-        q_pool = jax.lax.stop_gradient(q_pool)  # 此时它天然就是完美的 (N, K+1)
+        q_pool, _ = networks.value_mlp_fwd_with_features(value_params, concat_pool)
+        q_pool = jax.lax.stop_gradient(q_pool)
 
-        # =========================================================
-        # 4. Softmax 加权 (Q-Guided Weighting)
-        # =========================================================
+        # 2. Softmax 加权计算
         if self.config.use_dynamic_alpha:
-            # 原有的动态缩放逻辑 (根据极差自适应)
             local_scale = jnp.max(jnp.abs(q_pool - jnp.mean(q_pool, axis=-1, keepdims=True)), axis=-1)
             alpha = self.config.resampling_alpha * (local_scale + 1e-6)
-            alpha = alpha[:, None]  # (N, 1) 以便广播
+            alpha = alpha[:, None]
         else:
-            # 👑 新的静态逻辑：直接使用全局固定的温度值
             alpha = self.config.resampling_alpha
 
-        # 减去 max 防止指数爆炸，然后除以温度
         logits = (q_pool - jnp.max(q_pool, axis=-1, keepdims=True)) / alpha
-        pool_probs = jax.nn.softmax(logits, axis=-1)  # (N, K+1)
+        pool_probs = jax.nn.softmax(logits, axis=-1)
 
-        # --- 监控指标 ---
-        metrics["q_guided/q_real_mean"] = jnp.mean(q_pool[:, 0])
-        metrics["q_guided/q_generated_mean"] = jnp.mean(q_pool[:, 1:])
-        metrics["q_guided/prob_real_mean"] = jnp.mean(pool_probs[:, 0])
-        metrics["q_guided/alpha_mean"] = jnp.mean(alpha)  # 统一指标名称
-
-        return jax.lax.stop_gradient(pool_actions), jax.lax.stop_gradient(pool_probs), gae_qs, metrics
+        metrics = {
+            "q_guided/q_real_mean": jnp.mean(q_pool[:, 0]),
+            "q_guided/q_generated_mean": jnp.mean(q_pool[:, 1:]),
+            "q_guided/prob_real_mean": jnp.mean(pool_probs[:, 0]),
+            "q_guided/alpha_mean": jnp.mean(alpha)
+        }
+        return jax.lax.stop_gradient(pool_probs), metrics
 
     # ==========================================
     # 5. AW-Flow: 局部优势加权速度场
