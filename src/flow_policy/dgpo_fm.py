@@ -277,37 +277,25 @@ class DGPOFMState:
         # 2. 核心：自生成 K 个动作
         # =========================================================
         K_max = self.config.num_generated_actions_max
+        N = obs_norm.shape[0] * obs_norm.shape[1]
 
-        # 👑 修复：使用静态的 obs_dim 执行 reshape
-        flat_obs = obs_norm.reshape((N, obs_dim))
-        flat_acts_real = transitions.action.reshape((N, 1, act_dim))
+        # 1. 依然生成 K_max 个，但我们要动态截取
+        generated_acts_all, _ = jax.lax.scan(gen_step_fn, x_t_gen, ...)
 
-        obs_b = jnp.broadcast_to(flat_obs[:, None, :], (N, K_max, obs_dim))
+        # 👑 核心修复：只取前 current_K 个假动作，其余填 0
+        # 这样 Q 网络在打分时，后面的位置都是 0 动作，干扰极小
+        mask = jnp.arange(K_max) < current_K
+        generated_acts = generated_acts_all * mask[None, :, None]
 
-        def gen_step_fn(x, t_tuple):
-            t_curr, t_next = t_tuple
-            t_embed = jnp.broadcast_to(self.embed_timestep(jnp.array([t_curr])[..., None])[:, None, :],
-                                       (N, K_max, self.config.timestep_embed_dim))
-            vel = networks.flow_mlp_fwd(jax.lax.stop_gradient(self.params.policy), obs_b, x,
-                                        t_embed) * self.config.policy_mlp_output_scale
-            return x + (t_next - t_curr) * vel, None
+        pool_actions = jnp.concatenate([flat_acts_real, generated_acts], axis=1) # (N, K_max+1, act_dim)
 
-        x_t_gen = jax.random.normal(jax.random.split(prng)[1], (N, K_max, act_dim))
-        generated_acts, _ = jax.lax.scan(gen_step_fn, x_t_gen,
-                                         (self.get_schedule().t_current, self.get_schedule().t_next))
+        # 2. 这里的打分也要配合 Mask
+        q_pool, _ = networks.value_mlp_fwd_with_features(...)
 
-        pool_actions = jnp.concatenate([flat_acts_real, generated_acts], axis=1)
+        # 👑 重点：除了真动作(index 0)和前 current_K 个假动作，其余 Q 值必须死死压住
+        full_mask = jnp.arange(K_max + 1) <= current_K
+        q_pool_masked = jnp.where(full_mask[None, :], q_pool, -1e10)
 
-        # 👑 修复：这里也要用静态 obs_dim
-        obs_pool_b = jnp.broadcast_to(flat_obs[:, None, :], (N, K_max + 1, obs_dim))
-        q_pool, _ = networks.value_mlp_fwd_with_features(self.params.value,
-                                                         jnp.concatenate([obs_pool_b, pool_actions], axis=-1))
-        q_pool = jax.lax.stop_gradient(q_pool)
-
-        # Mask 逻辑
-        indices = jnp.arange(K_max + 1)
-        mask = indices <= current_K
-        q_pool_masked = jnp.where(mask[None, :], q_pool, -1e10)
 
         pool_probs = jax.nn.softmax(
             (q_pool_masked - jnp.max(q_pool_masked, axis=-1, keepdims=True)) / self.config.resampling_alpha_min,
@@ -355,13 +343,13 @@ class DGPOFMState:
         q_pool_fake, _ = networks.value_mlp_fwd_with_features(value_params, jnp.concatenate(
             [jnp.broadcast_to(flat_obs[:, None, :], (N, K_plus_1, obs_dim)), pool_actions], axis=-1))
 
-        indices = jnp.arange(K_plus_1)
-        mask = indices <= current_K
-        fake_mask = mask[1:]
+        # 👑 核心修复：只惩罚“第一个”假动作（或者前 current_K 个）
+        # 我们不再用 mean，因为 mean 会随 K 变化改变梯度量级
+        penalty_all = jax.nn.relu(q_pool_fake[:, 1:] - q_real_sg)  # (N, K_max)
 
-        q_real_sg = jax.lax.stop_gradient(q_pool_fake[:, 0:1])
-        penalty_raw = jax.nn.relu(q_pool_fake[:, 1:] - q_real_sg)
-        cql_penalty = jnp.sum(penalty_raw * fake_mask[None, :]) / (jnp.sum(fake_mask) + 1e-6)
+        # 关键：我们只取前 current_K 个动作的惩罚，并且只除以 current_K
+        active_mask = jnp.arange(self.config.num_generated_actions_max) < current_K
+        cql_penalty = jnp.sum(penalty_all * active_mask[None, :]) / jnp.maximum(1.0, jnp.sum(active_mask))
 
         total_v_loss = (
                                    mse_loss + current_cql_weight * cql_penalty) * self.config.value_loss_coeff * self.config.w_v_loss
