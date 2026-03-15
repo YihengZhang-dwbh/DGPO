@@ -198,28 +198,38 @@ class DGPOFMState:
 
         return state, metrics
 
-    def _compute_targets(self, transitions: DGPOFMTransition, obs_norm: Array, prng: Array) -> tuple[Array, Array]:
+    def _compute_targets(self, transitions: DGPOFMTransition, obs_norm: Array, prng: Array) -> tuple[
+        Array, Array, Array, dict[str, Array]]:
+        metrics = dict[str, Array]()
         T, B, obs_dim = obs_norm.shape
         act_dim = self.env.action_size
         N = T * B
 
-        prng_boot, prng_gen = jax.random.split(prng, 2)  # 不再需要 prng_eval
+        prng_boot, prng_gen, prng_eval = jax.random.split(prng, 3)
 
         # =========================================================
-        # 1. 估算 SARSA(λ) Targets (保持不变)
+        # 1. 估算 SARSA(λ) Targets (完全真实的物理环境反馈)
         # =========================================================
+        # 当前步骤的 Q(s, a)
         concat_inputs = jnp.concatenate([obs_norm, transitions.action], axis=-1)
         q_pred, h_s = networks.value_mlp_fwd_with_features(self.params.value, concat_inputs)
+
+        # 🚨 检查点：请确保这里就是光秃秃的 q_pred，千万不要有 [..., 0] 或 .squeeze(-1)
         q_pred = jax.lax.stop_gradient(q_pred)
 
+        # Bootstrap 步骤的 Q(s', a') -> 需要生成一个 a'
         bootstrap_obs = transitions.next_obs[-1:, :, :]
         if self.config.normalize_observations:
             bootstrap_obs = (bootstrap_obs - self.obs_stats.mean) / self.obs_stats.std
 
+        # 快速为 next_obs 生成一个动作
         def boot_step_fn(x, t_tuple):
             t_curr, t_next = t_tuple
-            t_embed_raw = self.embed_timestep(jnp.array([t_curr])[..., None])
+            # 简化逻辑：先变成 (1, 1) 的输入，得到 (1, 8) 的输出
+            t_embed_raw = self.embed_timestep(jnp.array([t_curr])[..., None])  # (1, 8)
+            # 广播到 (1, B, embed_dim)
             t_embed = jnp.broadcast_to(t_embed_raw[:, None, :], (1, B, self.config.timestep_embed_dim))
+
             vel = networks.flow_mlp_fwd(self.params.policy, bootstrap_obs, x,
                                         t_embed) * self.config.policy_mlp_output_scale
             return x + (t_next - t_curr) * vel, None
@@ -230,8 +240,11 @@ class DGPOFMState:
 
         bootstrap_concat = jnp.concatenate([bootstrap_obs, bootstrap_act], axis=-1)
         bootstrap_q, _ = networks.value_mlp_fwd_with_features(self.params.value, bootstrap_concat)
+
+        # 🚨 检查点：这里也必须是光秃秃的
         bootstrap_q = jax.lax.stop_gradient(bootstrap_q)
 
+        # 借用 GAE 的数学框架，计算 SARSA(λ) 返回值作为 Target Q
         gae_qs, _ = jax.lax.stop_gradient(
             rollouts.compute_gae(
                 truncation=transitions.truncation,
@@ -244,58 +257,67 @@ class DGPOFMState:
         )
 
         # =========================================================
-        # 2. 生成 K 个动作组成候选池 (保持不变)
+        # 2. 核心：自生成 K 个动作与“原配动作”组成候选池
         # =========================================================
         K = self.config.num_generated_actions
         flat_obs = obs_norm.reshape((N, obs_dim))
         flat_acts_real = transitions.action.reshape((N, 1, act_dim))
 
+        # 并行批量生成 K 个动作
         x_t = jax.random.normal(prng_gen, (N, K, act_dim))
         obs_b = jnp.broadcast_to(flat_obs[:, None, :], (N, K, obs_dim))
 
         def gen_step_fn(x, t_tuple):
             t_curr, t_next = t_tuple
-            t_embed_raw = self.embed_timestep(jnp.array([t_curr])[..., None])
+            # 同样简化：得到 (1, 8) 的基础嵌入
+            t_embed_raw = self.embed_timestep(jnp.array([t_curr])[..., None])  # (1, 8)
+            # 广播到 (N, K, embed_dim)
             t_embed = jnp.broadcast_to(t_embed_raw[:, None, :], (N, K, self.config.timestep_embed_dim))
+
+            # 必须 stop_gradient
             p_params = jax.lax.stop_gradient(self.params.policy)
             vel = networks.flow_mlp_fwd(p_params, obs_b, x, t_embed) * self.config.policy_mlp_output_scale
             return x + (t_next - t_curr) * vel, None
 
         generated_acts, _ = jax.lax.scan(gen_step_fn, x_t, (schedule.t_current, schedule.t_next))
-        pool_actions = jnp.concatenate([flat_acts_real, generated_acts], axis=1)
 
-        # 🚨 注意：这里只返回动作池和 Target Q
-        return jax.lax.stop_gradient(pool_actions), gae_qs
+        # 拼成 K+1 大小的动作池
+        pool_actions = jnp.concatenate([flat_acts_real, generated_acts], axis=1)  # (N, K+1, act_dim)
 
-    def _compute_fresh_weights(self, value_params, obs_norm, pool_actions) -> tuple[Array, dict[str, Array]]:
-        N, K_plus_1, act_dim = pool_actions.shape
-        flat_obs = obs_norm.reshape((N, obs_norm.shape[-1]))
-
-        # 1. 裁判打分：用最新的 Q 网络评估 K+1 个动作
-        obs_pool_b = jnp.broadcast_to(flat_obs[:, None, :], (N, K + 1, flat_obs.shape[-1]))
+        # =========================================================
+        # 3. 裁判打分：用 Q 网络评估这 K+1 个动作
+        # =========================================================
+        obs_pool_b = jnp.broadcast_to(flat_obs[:, None, :], (N, K + 1, obs_dim))
         concat_pool = jnp.concatenate([obs_pool_b, pool_actions], axis=-1)
 
-        q_pool, _ = networks.value_mlp_fwd_with_features(value_params, concat_pool)
-        q_pool = jax.lax.stop_gradient(q_pool)
+        # 原报错代码：q_pool = jax.lax.stop_gradient(q_pool[..., 0])
+        # 👑 终极修复：
+        q_pool, _ = networks.value_mlp_fwd_with_features(self.params.value, concat_pool)
+        q_pool = jax.lax.stop_gradient(q_pool)  # 此时它天然就是完美的 (N, K+1)
 
-        # 2. Softmax 加权计算
+        # =========================================================
+        # 4. Softmax 加权 (Q-Guided Weighting)
+        # =========================================================
         if self.config.use_dynamic_alpha:
+            # 原有的动态缩放逻辑 (根据极差自适应)
             local_scale = jnp.max(jnp.abs(q_pool - jnp.mean(q_pool, axis=-1, keepdims=True)), axis=-1)
             alpha = self.config.resampling_alpha * (local_scale + 1e-6)
-            alpha = alpha[:, None]
+            alpha = alpha[:, None]  # (N, 1) 以便广播
         else:
+            # 👑 新的静态逻辑：直接使用全局固定的温度值
             alpha = self.config.resampling_alpha
 
+        # 减去 max 防止指数爆炸，然后除以温度
         logits = (q_pool - jnp.max(q_pool, axis=-1, keepdims=True)) / alpha
-        pool_probs = jax.nn.softmax(logits, axis=-1)
+        pool_probs = jax.nn.softmax(logits, axis=-1)  # (N, K+1)
 
-        metrics = {
-            "q_guided/q_real_mean": jnp.mean(q_pool[:, 0]),
-            "q_guided/q_generated_mean": jnp.mean(q_pool[:, 1:]),
-            "q_guided/prob_real_mean": jnp.mean(pool_probs[:, 0]),
-            "q_guided/alpha_mean": jnp.mean(alpha)
-        }
-        return jax.lax.stop_gradient(pool_probs), metrics
+        # --- 监控指标 ---
+        metrics["q_guided/q_real_mean"] = jnp.mean(q_pool[:, 0])
+        metrics["q_guided/q_generated_mean"] = jnp.mean(q_pool[:, 1:])
+        metrics["q_guided/prob_real_mean"] = jnp.mean(pool_probs[:, 0])
+        metrics["q_guided/alpha_mean"] = jnp.mean(alpha)  # 统一指标名称
+
+        return jax.lax.stop_gradient(pool_actions), jax.lax.stop_gradient(pool_probs), gae_qs, metrics
 
     # ==========================================
     # 5. AW-Flow: 局部优势加权速度场
@@ -373,34 +395,39 @@ class DGPOFMState:
     # ==========================================
     # 修改 _compute_value_loss，我们需要传入生成的动作 pool_actions 来惩罚它们
     def _compute_value_loss(self, value_params, obs_norm, actions, truncation, target_qs, pool_actions):
-        # 1. 计算真实动作的 Q 值，拟合 Target (保持不变)
+        # 1. 计算真实动作的 Q 值，拟合 Target
         concat_inputs = jnp.concatenate([obs_norm, actions], axis=-1)
         q_pred, _ = networks.value_mlp_fwd_with_features(value_params, concat_inputs)
 
         v_error = (target_qs - q_pred) * (1 - truncation)
         mse_loss = jnp.mean(v_error ** 2)
 
-        # 👑 2. 加入 CQL 保守惩罚项 (打破死亡螺旋的核心)
-        # 把生成的假动作丢进去算 Q 值
-        # 👑 2. 加入 CQL 保守惩罚项 (打破死亡螺旋的核心)
+        # 2. 加入 CQL 保守惩罚项
         N, K_plus_1, act_dim = pool_actions.shape
-
-        # 👇 关键修复：先把 (T, B, obs_dim) 展平为 (N, obs_dim)
         flat_obs = obs_norm.reshape((N, obs_norm.shape[-1]))
-
-        # 然后再增加维度并广播
         obs_b = jnp.broadcast_to(flat_obs[:, None, :], (N, K_plus_1, obs_norm.shape[-1]))
         concat_pool = jnp.concatenate([obs_b, pool_actions], axis=-1)
 
         q_pool_fake, _ = networks.value_mlp_fwd_with_features(value_params, concat_pool)
 
-        # 惩罚项：如果 Q 网络给生成的动作打分太高，就产生巨大的 Loss 惩罚它！
-        # 排除掉第0个(真实的动作)，只惩罚后面 7 个生成的动作
-        cql_penalty = jnp.mean(q_pool_fake[:, 1:])
+        # 强烈建议使用 Hinge Loss 作为惩罚底线
+        cql_penalty = jnp.mean(jax.nn.relu(q_pool_fake[:, 1:] - q_pool_fake[:, 0:1]))
 
-        # 综合 Loss：拟合真实回报 + 压制假动作的幻觉分数 (cql_weight 比如设为 1.0 或 5.0)
-        cql_weight = self.config.cql_weight
-        total_v_loss = (mse_loss + cql_weight * cql_penalty) * self.config.value_loss_coeff * self.config.w_v_loss
+        # ==========================================
+        # 👑 3. 极简版余弦衰减 (直接使用 self.steps)
+        # ==========================================
+        init_weight = self.config.cql_weight  # 起始最高惩罚，比如 0.1
+        final_weight = 0.001  # 最终保留的底线惩罚
+        decay_steps = self.config.num_timesteps * 0.5  # 在前 50% 的训练步数内完成衰减
+
+        # self.steps 也是一个 JAX Array，直接参与计算没有任何问题
+        progress = jnp.minimum(1.0, self.steps / decay_steps)
+        cosine_decay = 0.5 * (1.0 + jnp.cos(jnp.pi * progress))
+        current_cql_weight = final_weight + (init_weight - final_weight) * cosine_decay
+
+        # 4. 综合 Loss
+        total_v_loss = (
+                                   mse_loss + current_cql_weight * cql_penalty) * self.config.value_loss_coeff * self.config.w_v_loss
 
         return total_v_loss
 
