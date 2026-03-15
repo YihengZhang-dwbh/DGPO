@@ -17,13 +17,19 @@ from . import math_utils, networks, rollouts
 class DGPOFMConfig:
     # --- 全新 Q-Guided 生成控制核心 ---
     resampling_alpha: float = 0.1
-    use_dynamic_alpha: jdc.Static[bool] = False  # 👑 新增：默认关闭动态，使用固定温度
-    num_generated_actions: jdc.Static[int] = 7  # 每个状态额外生成 7 个动作 (凑成 8 个的簇)
+    use_dynamic_alpha: jdc.Static[bool] = False
+    num_generated_actions: jdc.Static[int] = 7
+    num_epsilon_samples: jdc.Static[int] = 8
+
+    # 👑 新增：纯重采样开关 (True 为根据概率抛骰子硬采样，False 为加权)
+    use_hard_resampling: jdc.Static[bool] = True
 
     # 控制损失权重
     w_v_loss: float = 1.0
     learning_rate_p: float = 3e-4
     learning_rate_v: float = 3e-4
+    loop_v: jdc.Static[int] = 1
+    cql_weight: float = 0.1
 
     # Flow parameters.
     flow_steps: jdc.Static[int] = 10
@@ -148,7 +154,7 @@ class DGPOFMState:
         # ==========================================
         # 这里把 length 改为 4 或 8 (这就是 Q-Network 的 UTD ratio)
         # 意味着在一个 Minibatch 里，Q 网络会拿着同样的经验反复自我修正 4 次
-        q_update_steps = 4
+        q_update_steps = self.config.loop_v
 
         def value_inner_step(carry, _):
             v_params, v_opt_state = carry
@@ -319,31 +325,67 @@ class DGPOFMState:
         N, K_plus_1, act_dim = actions_pool.shape
         flat_obs = obs_norm.reshape((N, obs_norm.shape[-1]))
 
-        prng_eps, prng_t = jax.random.split(prng, 2)
-        # 👑 你的神级修复：为每个候选动作分配【独立】的噪声和时间戳！
-        # 这样网络就能把不同的动作映射到不同的高斯噪声球面上，保留双峰分布！
-        eps = jax.random.normal(prng_eps, (N, K_plus_1, act_dim))
-        t_idx = jax.random.randint(prng_t, (N, K_plus_1, 1), 0, self.config.flow_steps)
-        t = self.get_schedule().t_current[t_idx]
+        if self.config.use_hard_resampling:
+            # ==========================================
+            # 路线 A：硬重采样 + FPO 对齐 (多噪声方差缩减)
+            # ==========================================
+            M = self.config.num_epsilon_samples  # 对齐 FPO，设为 4 或 8
 
-        # ODE 轨迹起点 (完全独立的轨迹)
-        x_t = t * eps + (1.0 - t) * actions_pool
-        obs_b = jnp.broadcast_to(flat_obs[:, None, :], (N, K_plus_1, flat_obs.shape[-1]))
+            prng_idx, prng_eps, prng_t = jax.random.split(prng, 3)
 
-        t_embed = self.embed_timestep(t)  # (N, K+1, t_dim)
+            # 1. 抛骰子：抽出那个唯一的 Target Action
+            logits = jnp.log(weights_pool + 1e-8)
+            sampled_indices = jax.random.categorical(prng_idx, logits, axis=-1)  # (N,)
+            sampled_actions = actions_pool[jnp.arange(N), sampled_indices]  # (N, act_dim)
 
-        vel_pred = networks.flow_mlp_fwd(
-            policy_params, obs_b, x_t, t_embed
-        ) * self.config.policy_mlp_output_scale
+            # 👑 2. FPO 对齐：为这唯一的目标动作，分配 M 个不同的时间步和纯噪声！
+            eps = jax.random.normal(prng_eps, (N, M, act_dim))
+            t_idx = jax.random.randint(prng_t, (N, M, 1), 0, self.config.flow_steps)
+            t = self.get_schedule().t_current[t_idx]  # (N, M, 1)
 
-        if self.config.output_mode == "u_but_supervise_as_eps":
-            x1_pred = (x_t - t * vel_pred) + vel_pred
-            error_sq = jnp.sum((eps - x1_pred) ** 2, axis=-1)
+            # 3. 把选中的动作和观测，广播复制 M 份以对齐张量
+            a_target = jnp.broadcast_to(sampled_actions[:, None, :], (N, M, act_dim))
+            obs_b = jnp.broadcast_to(flat_obs[:, None, :], (N, M, flat_obs.shape[-1]))
+
+            # 4. 构造 M 条截然不同的 ODE 轨迹
+            x_t = t * eps + (1.0 - t) * a_target
+            t_embed = self.embed_timestep(t)  # (N, M, t_dim)
+
+            # 5. 前向传播计算速度场
+            vel_pred = networks.flow_mlp_fwd(policy_params, obs_b, x_t, t_embed) * self.config.policy_mlp_output_scale
+
+            if self.config.output_mode == "u_but_supervise_as_eps":
+                x1_pred = (x_t - t * vel_pred) + vel_pred
+                error_sq = jnp.sum((eps - x1_pred) ** 2, axis=-1)
+            else:
+                error_sq = jnp.sum((vel_pred - (eps - a_target)) ** 2, axis=-1)
+
+            # 6. 对这 M 个不同时空点上的 Error 求平均，得到极低方差的平滑梯度
+            policy_loss = jnp.mean(error_sq)
+
         else:
-            error_sq = jnp.sum((vel_pred - (eps - actions_pool)) ** 2, axis=-1)
+            # ==========================================
+            # 路线 B：软加权 (Soft Weighting - 你之前的版本)
+            # ==========================================
+            prng_eps, prng_t = jax.random.split(prng, 2)
+            eps = jax.random.normal(prng_eps, (N, K_plus_1, act_dim))
+            t_idx = jax.random.randint(prng_t, (N, K_plus_1, 1), 0, self.config.flow_steps)
+            t = self.get_schedule().t_current[t_idx]
 
-        # 依然用 Softmax 权重加权，但现在它是在对分布进行重塑，而不是对动作进行求均值
-        policy_loss = jnp.mean(jnp.sum(weights_pool * error_sq, axis=-1))
+            x_t = t * eps + (1.0 - t) * actions_pool
+            obs_b = jnp.broadcast_to(flat_obs[:, None, :], (N, K_plus_1, flat_obs.shape[-1]))
+            t_embed = self.embed_timestep(t)
+
+            vel_pred = networks.flow_mlp_fwd(policy_params, obs_b, x_t, t_embed) * self.config.policy_mlp_output_scale
+
+            if self.config.output_mode == "u_but_supervise_as_eps":
+                x1_pred = (x_t - t * vel_pred) + vel_pred
+                error_sq = jnp.sum((eps - x1_pred) ** 2, axis=-1)
+            else:
+                error_sq = jnp.sum((vel_pred - (eps - actions_pool)) ** 2, axis=-1)
+
+            # 加权求和
+            policy_loss = jnp.mean(jnp.sum(weights_pool * error_sq, axis=-1))
 
         return policy_loss, {"policy_loss": policy_loss}
 
@@ -378,7 +420,7 @@ class DGPOFMState:
         cql_penalty = jnp.mean(q_pool_fake[:, 1:])
 
         # 综合 Loss：拟合真实回报 + 压制假动作的幻觉分数 (cql_weight 比如设为 1.0 或 5.0)
-        cql_weight = 0.1
+        cql_weight = self.config.cql_weight
         total_v_loss = (mse_loss + cql_weight * cql_penalty) * self.config.value_loss_coeff * self.config.w_v_loss
 
         return total_v_loss
