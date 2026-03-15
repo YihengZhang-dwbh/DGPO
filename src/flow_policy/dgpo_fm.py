@@ -231,14 +231,25 @@ class DGPOFMState:
         for k, v in extra_v_metrics.items():
             metrics[k] = v[-1]
 
-        # ==========================================
-        # 👑 3. 速度场 (Policy) 滞后更新
-        # ==========================================
-        # 注意：如果你想用刚刚训好的、最新鲜的 new_value_params 重新打分，可以在这里再调一次 Q 网络。
+        # 👑 提取出刚刚算完的、最新鲜的 V-Loss
+        final_v_loss = extra_v_metrics["v_loss/total"][-1]
 
-        # 但通常为了计算效率，使用步骤 1 里的旧权重 (Delayed Update) 效果就足够好了，甚至更稳定。
+        # ==========================================
+        # 👑 3. 带着 V-Loss 重新打分 (Fresh Weighting)
+        # ==========================================
+        # 使用最新的 Q 网络和 V-Loss，计算出带有自适应避震器的 pool_weights
+        fresh_pool_weights, q_metrics = self._compute_fresh_weights(
+            new_value_params, obs_norm, pool_actions, final_v_loss
+        )
+        # 把监控指标加进去 (这会覆盖掉 step 1 里旧的打分 metrics)
+        metrics.update(q_metrics)
+
+        # ==========================================
+        # 👑 4. 速度场 (Policy) 滞后更新
+        # ==========================================
         def policy_loss_fn(p_params):
-            return self._compute_policy_loss(p_params, obs_norm, pool_actions, pool_weights, prng_policy)
+            # 这里的 fresh_pool_weights 已经是防抖处理过的了！
+            return self._compute_policy_loss(p_params, obs_norm, pool_actions, fresh_pool_weights, prng_policy)
 
         (p_loss, p_metrics), p_grads = jax.value_and_grad(policy_loss_fn, has_aux=True)(self.params.policy)
         p_updates, new_opt_state_policy = self.opt_policy.update(p_grads, self.opt_state_policy, self.params.policy)
@@ -255,6 +266,46 @@ class DGPOFMState:
             state.steps = state.steps + 1
 
         return state, metrics
+
+    def _compute_fresh_weights(self, value_params, obs_norm, pool_actions, final_v_loss) -> tuple[
+        Array, dict[str, Array]]:
+        """使用最新更新的 Q 网络和 V-Loss 来计算动作的 Softmax 权重"""
+        N, K_plus_1, act_dim = pool_actions.shape
+        flat_obs = obs_norm.reshape((N, obs_norm.shape[-1]))
+
+        obs_pool_b = jnp.broadcast_to(flat_obs[:, None, :], (N, K_plus_1, flat_obs.shape[-1]))
+        concat_pool = jnp.concatenate([obs_pool_b, pool_actions], axis=-1)
+
+        # 用刚刚更新完的 Q 网络打分
+        q_pool, _ = networks.value_mlp_fwd_with_features(value_params, concat_pool)
+        q_pool = jax.lax.stop_gradient(q_pool)
+
+        # ==========================================
+        # 👑 Loss-Guided Temperature (基于 V-Loss 的避震器)
+        # ==========================================
+        if self.config.use_dynamic_alpha:
+            # final_v_loss 是个标量 (比如 65 或者 892)
+            # 因为 v_loss 主要是 MSE，我们开个根号 (RMSE) 把它拉回到和 Q 值同一线性维度
+            rmse = jnp.sqrt(final_v_loss + 1e-8)
+
+            # 用 RMSE 作为缩放因子。
+            # 如果 RMSE=30 (裁判极度迷茫)，alpha = 0.1 * 31 = 3.1，拉平分布保命
+            # 如果 RMSE=1 (裁判极其自信)，alpha = 0.1 * 2 = 0.2，锋利选择好动作
+            alpha = self.config.resampling_alpha * (rmse + 1.0)
+        else:
+            alpha = self.config.resampling_alpha
+
+        # Softmax 归一化
+        logits = (q_pool - jnp.max(q_pool, axis=-1, keepdims=True)) / alpha
+        pool_probs = jax.nn.softmax(logits, axis=-1)
+
+        metrics = {
+            "q_guided/q_real_mean": jnp.mean(q_pool[:, 0]),
+            "q_guided/q_generated_mean": jnp.mean(q_pool[:, 1:]),
+            "q_guided/prob_real_mean": jnp.mean(pool_probs[:, 0]),
+            "q_guided/alpha_mean": jnp.mean(alpha)  # 👑 监控它随着 V-Loss 的起伏！
+        }
+        return jax.lax.stop_gradient(pool_probs), metrics
 
     def _compute_targets(self, transitions: DGPOFMTransition, obs_norm: Array, prng: Array) -> tuple[
         Array, Array, Array, dict[str, Array]]:
