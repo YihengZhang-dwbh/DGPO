@@ -451,11 +451,15 @@ class DGPOFMState:
             cosine_decay = 0.5 * (1.0 + jnp.cos(jnp.pi * progress))
             current_cql_weight = final_w + (init_w - final_w) * cosine_decay
 
+
         elif self.config.cql_decay_mode == "exponential":
-            # 负指数衰减: W_init * (W_final / W_init)^progress
-            # 加上 1e-8 防止除以 0 的极其罕见情况
-            ratio = jnp.maximum(final_w, 1e-8) / jnp.maximum(init_w, 1e-8)
-            current_cql_weight = init_w * jnp.power(ratio, progress)
+
+            # 👑 换用最稳定、最标准的自然指数衰减写法: W_init * e^(-k * progress)
+            # 计算衰减系数 k (由于 final_w < init_w，这里的 decay_rate 必然是正数)
+            decay_rate = -jnp.log(jnp.maximum(final_w, 1e-8) / jnp.maximum(init_w, 1e-8))
+            # 使用 jnp.exp 确保严格的负指数递减
+
+            current_cql_weight = init_w * jnp.exp(-decay_rate * progress)
 
         elif self.config.cql_decay_mode == "inverse":
             # 反比例衰减: W_init / (1 + c * progress)
