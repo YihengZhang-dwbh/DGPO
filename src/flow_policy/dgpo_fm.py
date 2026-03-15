@@ -39,8 +39,10 @@ class DGPOFMConfig:
     cql_decay_ratio: float = 0.5
 
     # 👑 新增：Auto-CQL 超参
-    cql_target_margin: float = 0.1  # 我们期望真实动作比假动作高多少分？(安全缓冲区)
-    cql_alpha_lr: float = 3e-4  # 动态权重本身的“学习率”
+    # 👑 Auto-CQL / PI 控制器超参
+    cql_target_margin: float = 0.1  # 容忍底线
+    cql_alpha_lr: float = 3e-4  # 也就是 Ki (积分系数/基础学习率)，负责长期稳态
+    cql_alpha_kp: float = 0.05  # 👑 新增：Kp (比例系数)，负责瞬间镇压坏动作的力度
 
     # Flow parameters.
     flow_steps: jdc.Static[int] = 10
@@ -189,22 +191,20 @@ class DGPOFMState:
 
             # ... 前面算出了 current_penalty ...
 
+            # 👑 PI 控制器核心逻辑
             error = current_penalty - self.config.cql_target_margin
-
-            # 👑 你的直觉：限制每次误差累积的最大步长 (比如把误差钳制在 [-5.0, 5.0] 之间)
-            # 防止极端的 penalty 瞬间摧毁长期记忆
             clipped_error = jnp.clip(error, -5.0, 5.0)
 
-            # 1. 积分项 (I)：使用被截断的、安全的误差来缓慢更新底座
-            ki = 3e-4
+            # 1. 积分项 (I)：使用被截断的误差和 Config 里的 LR
+            ki = self.config.cql_alpha_lr  # 👈 这里！它回来了！
             next_log_alpha = current_log_alpha + ki * clipped_error
-            # 👑 修复：明确定义对数空间的上下限
+
             min_log = jnp.log(self.config.cql_final_weight)
             max_log = jnp.log(self.config.cql_init_weight)
-            next_log_alpha = jnp.clip(next_log_alpha, min_log, max_log)  # 绝对上下限
+            next_log_alpha = jnp.clip(next_log_alpha, min_log, max_log)
 
-            # 2. 比例项 (P)：使用未截断的、真实的误差来做瞬间应急反应！
-            kp = 0.05
+            # 2. 比例项 (P)：使用真实误差和 Config 里的 Kp
+            kp = self.config.cql_alpha_kp  # 👈 新引入的 P 项超参
             instant_log_alpha = next_log_alpha + kp * error
 
             effective_alpha = jax.lax.stop_gradient(jnp.exp(instant_log_alpha))
