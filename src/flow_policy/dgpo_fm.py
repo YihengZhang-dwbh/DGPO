@@ -32,10 +32,11 @@ class DGPOFMConfig:
 
     # 👑 CQL 与 Hinge 控制
     use_hinge_cql: jdc.Static[bool] = True
-    cql_decay_mode: jdc.Static[Literal["none", "linear", "cosine"]] = "cosine"
+    # 扩充 Literal 类型，加入 exponential 和 inverse
+    cql_decay_mode: jdc.Static[Literal["none", "linear", "cosine", "exponential", "inverse"]] = "exponential"
     cql_init_weight: float = 0.1
     cql_final_weight: float = 0.001
-    cql_decay_ratio: float = 0.5  # 👑 新增：默认在前 50% 的训练总步数内完成衰减
+    cql_decay_ratio: float = 0.5
 
     # Flow parameters.
     flow_steps: jdc.Static[int] = 10
@@ -428,37 +429,49 @@ class DGPOFMState:
         else:
             cql_penalty = jnp.mean(q_pool_fake[:, 1:])
 
-        # 👑 4. 静态分支：决定调度器模式 (与外部 train_dgpo_fm.py 完美对齐)
+        # 👑 4. 静态分支：决定调度器模式 (五大模式火力全开)
         init_w = self.config.cql_init_weight
         final_w = self.config.cql_final_weight
 
-        # 步骤 A：使用和外部程序一模一样的逻辑，计算总 Iteration 数量
+        # 算出进度 (0.0 到 1.0)
         steps_per_iter = self.config.iterations_per_env * self.config.num_envs
         total_iterations = self.config.num_timesteps // steps_per_iter
-
-        # 步骤 B：算出生命周期内真正的梯度更新总数 (self.steps 的最大值)
-        total_updates = total_iterations * self.config.num_updates_per_batch * self.config.num_minibatches
-
-        # 步骤 C：乘以比例 (比如 0.5 就是在第 30 个 Iteration 结束衰减)
+        total_updates = total_iterations * self.config.num_minibatches * self.config.num_updates_per_batch
         decay_updates = total_updates * self.config.cql_decay_ratio
 
-        # 计算当前的真实进度 (0.0 到 1.0)
         progress = jnp.minimum(1.0, self.steps / decay_updates)
 
         if self.config.cql_decay_mode == "none":
             current_cql_weight = init_w
+
         elif self.config.cql_decay_mode == "linear":
             current_cql_weight = init_w - progress * (init_w - final_w)
+
         elif self.config.cql_decay_mode == "cosine":
             cosine_decay = 0.5 * (1.0 + jnp.cos(jnp.pi * progress))
             current_cql_weight = final_w + (init_w - final_w) * cosine_decay
+
+        elif self.config.cql_decay_mode == "exponential":
+            # 负指数衰减: W_init * (W_final / W_init)^progress
+            # 加上 1e-8 防止除以 0 的极其罕见情况
+            ratio = jnp.maximum(final_w, 1e-8) / jnp.maximum(init_w, 1e-8)
+            current_cql_weight = init_w * jnp.power(ratio, progress)
+
+        elif self.config.cql_decay_mode == "inverse":
+            # 反比例衰减: W_init / (1 + c * progress)
+            # 通过代数推导，当 progress=1 时到达 final_w 的常数 c 为:
+            c = (init_w / jnp.maximum(final_w, 1e-8)) - 1.0
+            current_cql_weight = init_w / (1.0 + c * progress)
+
         else:
             raise ValueError(f"未知的衰减模式: {self.config.cql_decay_mode}")
 
-        # 5. 综合 Loss
-        total_v_loss = (
-                                   mse_loss + current_cql_weight * cql_penalty) * self.config.value_loss_coeff * self.config.w_v_loss
+            # 终极安全锁：由于浮点精度问题，以防万一越界，钳制在上下限之间
+            current_cql_weight = jnp.clip(current_cql_weight, final_w, init_w)
 
+            # 5. 综合 Loss (后续不变)
+            total_v_loss = (
+                                       mse_loss + current_cql_weight * cql_penalty) * self.config.value_loss_coeff * self.config.w_v_loss
         # 👑 把当前的 weight 和 penalty 传出去，方便监控
         aux_metrics = {
             "v_loss/total": total_v_loss,
