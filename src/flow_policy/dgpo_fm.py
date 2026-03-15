@@ -42,7 +42,9 @@ class DGPOFMConfig:
     # 👑 Auto-CQL / PI 控制器超参
     cql_target_margin: float = 0.1  # 容忍底线
     cql_alpha_lr: float = 3e-4  # 也就是 Ki (积分系数/基础学习率)，负责长期稳态
-    cql_alpha_kp: float = 0.05  # 👑 新增：Kp (比例系数)，负责瞬间镇压坏动作的力度
+    cql_alpha_kp: float = 0.05  # 👑 新增：Kp (比例系数)，负责瞬间镇压坏动作的力度#
+    # 👑 新增：是否开启权重上下限的安全锁 (默认开启保命)
+    cql_clip_alpha: jdc.Static[bool] = True
 
     # Flow parameters.
     flow_steps: jdc.Static[int] = 10
@@ -196,15 +198,17 @@ class DGPOFMState:
             clipped_error = jnp.clip(error, -5.0, 5.0)
 
             # 1. 积分项 (I)：使用被截断的误差和 Config 里的 LR
-            ki = self.config.cql_alpha_lr  # 👈 这里！它回来了！
+            ki = self.config.cql_alpha_lr
             next_log_alpha = current_log_alpha + ki * clipped_error
 
-            min_log = jnp.log(self.config.cql_final_weight)
-            max_log = jnp.log(self.config.cql_init_weight)
-            next_log_alpha = jnp.clip(next_log_alpha, min_log, max_log)
+            # 👑 静态分支：由你掌控的安全锁
+            if self.config.cql_clip_alpha:
+                min_log = jnp.log(self.config.cql_final_weight)
+                max_log = jnp.log(self.config.cql_init_weight)
+                next_log_alpha = jnp.clip(next_log_alpha, min_log, max_log)
 
             # 2. 比例项 (P)：使用真实误差和 Config 里的 Kp
-            kp = self.config.cql_alpha_kp  # 👈 新引入的 P 项超参
+            kp = self.config.cql_alpha_kp
             instant_log_alpha = next_log_alpha + kp * error
 
             effective_alpha = jax.lax.stop_gradient(jnp.exp(instant_log_alpha))
