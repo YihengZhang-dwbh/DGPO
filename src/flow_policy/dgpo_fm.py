@@ -137,14 +137,42 @@ class DGPOFMState:
 
     def _step_minibatch(self, transitions: DGPOFMTransition, prng: Array) -> tuple[DGPOFMState, dict[str, Array]]:
         prng_targets, prng_policy = jax.random.split(prng, 2)
-
         obs_norm = (
                                transitions.obs - self.obs_stats.mean) / self.obs_stats.std if self.config.normalize_observations else transitions.obs
 
-        # 获取动作候选池、对应的权重，以及 Q 网络拟合的 Target
+        # 1. 依然先获取打分和 Targets
         pool_actions, pool_weights, target_qs, metrics = self._compute_targets(transitions, obs_norm, prng_targets)
 
-        # Policy 训练 (传入候选池和权重)
+        # ==========================================
+        # 👑 2. Q 网络“小灶”先行循环 (先训 Q)
+        # ==========================================
+        # 这里把 length 改为 4 或 8 (这就是 Q-Network 的 UTD ratio)
+        # 意味着在一个 Minibatch 里，Q 网络会拿着同样的经验反复自我修正 4 次
+        q_update_steps = 4
+
+        def value_inner_step(carry, _):
+            v_params, v_opt_state = carry
+
+            def v_loss_fn(v_p):
+                return self._compute_value_loss(
+                    v_p, obs_norm, transitions.action, transitions.truncation, target_qs, pool_actions
+                )
+
+            v_loss_val, v_grads = jax.value_and_grad(v_loss_fn)(v_params)
+            v_updates, next_v_opt_state = self.opt_value.update(v_grads, v_opt_state, v_params)
+            next_v_params = optax.apply_updates(v_params, v_updates)
+            return (next_v_params, next_v_opt_state), v_loss_val
+
+        (new_value_params, new_opt_state_value), extra_v_losses = jax.lax.scan(
+            value_inner_step, (self.params.value, self.opt_state_value), None, length=q_update_steps
+        )
+        metrics["v_loss"] = extra_v_losses[-1]  # 记录最后一次收敛的 loss
+
+        # ==========================================
+        # 👑 3. 速度场 (Policy) 滞后更新
+        # ==========================================
+        # 注意：如果你想用刚刚训好的、最新鲜的 new_value_params 重新打分，可以在这里再调一次 Q 网络。
+        # 但通常为了计算效率，使用步骤 1 里的旧权重 (Delayed Update) 效果就足够好了，甚至更稳定。
         def policy_loss_fn(p_params):
             return self._compute_policy_loss(p_params, obs_norm, pool_actions, pool_weights, prng_policy)
 
@@ -153,34 +181,14 @@ class DGPOFMState:
         new_policy_params = optax.apply_updates(self.params.policy, p_updates)
         metrics.update(p_metrics)
 
-        # Value (Q) 训练 (依然使用真实执行过的 action 和计算出的 empirical returns)
-        # 4. Value 训练 N 次
-        def value_inner_step(carry, _):
-            v_params, v_opt_state = carry
-
-            def v_loss_fn(v_p):
-                # 👑 加上最后的 pool_actions！
-                return self._compute_value_loss(
-                    v_p, obs_norm, transitions.action, transitions.truncation, target_qs, pool_actions
-                )
-
-            v_loss_val, v_grads = jax.value_and_grad(v_loss_fn)(v_params)
-            v_updates, next_v_opt_state = self.opt_value.update(v_grads, v_opt_state, v_params)
-            next_v_params = optax.apply_updates(v_params, v_updates)
-
-            return (next_v_params, next_v_opt_state), v_loss_val
-
-        (new_value_params, new_opt_state_value), extra_v_losses = jax.lax.scan(
-            value_inner_step, (self.params.value, self.opt_state_value), None, length=1
-        )
-        metrics["v_loss"] = extra_v_losses[-1]
-
+        # 保存更新
         new_params = DGPOFMParams(policy=new_policy_params, value=new_value_params)
         with jdc.copy_and_mutate(self) as state:
             state.params = new_params
             state.opt_state_policy = new_opt_state_policy
             state.opt_state_value = new_opt_state_value
             state.steps = state.steps + 1
+
         return state, metrics
 
     def _compute_targets(self, transitions: DGPOFMTransition, obs_norm: Array, prng: Array) -> tuple[
@@ -363,7 +371,7 @@ class DGPOFMState:
         cql_penalty = jnp.mean(q_pool_fake[:, 1:])
 
         # 综合 Loss：拟合真实回报 + 压制假动作的幻觉分数 (cql_weight 比如设为 1.0 或 5.0)
-        cql_weight = 1.0
+        cql_weight = 0.1
         total_v_loss = (mse_loss + cql_weight * cql_penalty) * self.config.value_loss_coeff * self.config.w_v_loss
 
         return total_v_loss
