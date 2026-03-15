@@ -420,9 +420,21 @@ class DGPOFMState:
         # 排除掉第0个(真实的动作)，只惩罚后面 7 个生成的动作
         cql_penalty = jnp.mean(q_pool_fake[:, 1:])
 
-        # 综合 Loss：拟合真实回报 + 压制假动作的幻觉分数 (cql_weight 比如设为 1.0 或 5.0)
-        cql_weight = self.config.cql_weight
-        total_v_loss = (mse_loss + cql_weight * cql_penalty) * self.config.value_loss_coeff * self.config.w_v_loss
+        # ==========================================
+        # 👑 3. 极简版余弦衰减 (直接使用 self.steps)
+        # ==========================================
+        init_weight = self.config.cql_weight  # 起始最高惩罚，比如 0.1
+        final_weight = 0. #0.001  # 最终保留的底线惩罚
+        decay_steps = self.config.num_timesteps * 1  # 在前 100% 的训练步数内完成衰减
+
+        # self.steps 也是一个 JAX Array，直接参与计算没有任何问题
+        progress = jnp.minimum(1.0, self.steps / decay_steps)
+        cosine_decay = 0.5 * (1.0 + jnp.cos(jnp.pi * progress))
+        current_cql_weight = final_weight + (init_weight - final_weight) * cosine_decay
+
+        # 4. 综合 Loss
+        total_v_loss = (
+                                   mse_loss + current_cql_weight * cql_penalty) * self.config.value_loss_coeff * self.config.w_v_loss
 
         return total_v_loss
 
