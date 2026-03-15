@@ -24,6 +24,7 @@ class DGPOFMConfig:
 
     # 👑 新增：纯重采样开关 (True 为根据概率抛骰子硬采样，False 为加权)
     use_hard_resampling: jdc.Static[bool] = True
+    q_guided_max_ratio: float = 8.0
 
     # 控制损失权重
     w_v_loss: float = 1.0
