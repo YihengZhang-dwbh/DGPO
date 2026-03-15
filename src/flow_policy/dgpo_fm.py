@@ -176,21 +176,20 @@ class DGPOFMState:
         q_update_steps = self.config.loop_v
 
         # 循环不仅传递参数，还传递当前的 log_cql_weight
+        # 循环不仅传递参数，还传递当前的 log_cql_weight
         def value_inner_step(carry, _):
             v_params, v_opt_state, current_log_alpha = carry
-
-            # 还原出真正的权重 (永远为正)
             current_alpha = jax.lax.stop_gradient(jnp.exp(current_log_alpha))
 
             def v_loss_fn(v_p):
-                # 传入 current_alpha
-                total_loss, penalty = self._compute_value_loss(
+                # 接收拆包后的 tuple
+                total_loss, aux_tuple = self._compute_value_loss(
                     v_p, obs_norm, transitions.action, transitions.truncation, target_qs, pool_actions, current_alpha
                 )
-                return total_loss, penalty
+                return total_loss, aux_tuple
 
-            # 拿到 Q 网络的梯度和当前的 penalty
-            (v_loss_val, current_penalty), v_grads = jax.value_and_grad(v_loss_fn, has_aux=True)(v_params)
+            # 拿到 Q 网络的梯度和当前的 penalty & 动态 margin
+            (v_loss_val, (current_penalty, dyn_margin)), v_grads = jax.value_and_grad(v_loss_fn, has_aux=True)(v_params)
 
             # 更新 Q 网络
             v_updates, next_v_opt_state = self.opt_value.update(v_grads, v_opt_state, v_params)
@@ -198,9 +197,8 @@ class DGPOFMState:
 
             # 👑 魔法发生：更新动态权重 (Lagrange Update)
             if self.config.cql_decay_mode == "auto":
-                # 公式：如果 penalty 大于 target_margin，差值为正，log_alpha 变大 (加强惩罚)
-                # 反之，log_alpha 变小 (松绑)
-                alpha_grad = current_penalty - self.config.cql_target_margin
+                # 👑 使用刚刚算出来的、适配当前 Q 值量级的 dyn_margin
+                alpha_grad = current_penalty - dyn_margin
                 next_log_alpha = current_log_alpha + self.config.cql_alpha_lr * alpha_grad
 
                 # 限制上下限，防止爆炸或跌穿
@@ -210,15 +208,16 @@ class DGPOFMState:
                     a_max=jnp.log(self.config.cql_init_weight)
                 )
             else:
-                # 如果没开 auto，就保持不动 (你可以把前面写的各种衰减 schedule 放这里，为了纯粹，我们这里只演示 auto)
                 next_log_alpha = current_log_alpha
 
             aux_metrics = {
                 "v_loss/total": v_loss_val,
                 "v_loss/cql_penalty": current_penalty,
-                "v_loss/current_cql_weight": jnp.exp(next_log_alpha)
+                "v_loss/current_cql_weight": jnp.exp(next_log_alpha),
+                "v_loss/dynamic_margin": dyn_margin  # 加个监控，看着它涨！
             }
             return (next_v_params, next_v_opt_state, next_log_alpha), aux_metrics
+
 
         # 执行 scan 循环
         (new_value_params, new_opt_state_value, new_log_alpha), extra_v_metrics = jax.lax.scan(
@@ -500,8 +499,7 @@ class DGPOFMState:
     # ==========================================
     # 6. Q 网络训练 (拟合真实回报)
     # ==========================================
-    def _compute_value_loss(self, value_params, obs_norm, actions, truncation, target_qs, pool_actions,
-                            current_cql_weight):
+    def _compute_value_loss(self, value_params, obs_norm, actions, truncation, target_qs, pool_actions, current_cql_weight):
         # 1. 计算 MSE Loss
         concat_inputs = jnp.concatenate([obs_norm, actions], axis=-1)
         q_pred, _ = networks.value_mlp_fwd_with_features(value_params, concat_inputs)
@@ -516,21 +514,23 @@ class DGPOFMState:
         q_pool_fake, _ = networks.value_mlp_fwd_with_features(value_params, concat_pool)
 
         # 3. 计算 Penalty
-        # 👑 核心防爆锁：切断惩罚项对真实动作 Q 值的反向传播！
         q_real_sg = jax.lax.stop_gradient(q_pool_fake[:, 0:1])
         q_fake = q_pool_fake[:, 1:]
 
         if self.config.use_hinge_cql:
-            # Hinge 惩罚：只把高于 real_q 的 fake_q 往下压，绝不把 real_q 往上拔！
             cql_penalty = jnp.mean(jax.nn.relu(q_fake - q_real_sg))
         else:
             cql_penalty = jnp.mean(q_fake - q_real_sg)
 
-        # 4. 综合 Loss (接收外面传进来的 current_cql_weight)
-        total_v_loss = (
-                                   mse_loss + current_cql_weight * cql_penalty) * self.config.value_loss_coeff * self.config.w_v_loss
+        # 👑 核心进化：计算动态 Margin
+        # 如果 Q 是 0，margin 就是 3.0；如果 Q 是 1500，margin 就是 3.0 + 7.5 = 10.5
+        dynamic_margin = self.config.cql_target_margin + jnp.abs(jnp.mean(q_real_sg)) * 0.005
 
-        return total_v_loss, cql_penalty
+        # 4. 综合 Loss
+        total_v_loss = (mse_loss + current_cql_weight * cql_penalty) * self.config.value_loss_coeff * self.config.w_v_loss
+
+        # 把 dynamic_margin 也传出去
+        return total_v_loss, (cql_penalty, dynamic_margin)
 
     # # 修改 _compute_value_loss，我们需要传入生成的动作 pool_actions 来惩罚它们
     # def _compute_value_loss(self, value_params, obs_norm, actions, truncation, target_qs, pool_actions):
