@@ -137,22 +137,20 @@ class DGPOFMState:
 
     def _step_minibatch(self, transitions: DGPOFMTransition, prng: Array) -> tuple[DGPOFMState, dict[str, Array]]:
         prng_targets, prng_policy = jax.random.split(prng, 2)
-        obs_norm = (
-                               transitions.obs - self.obs_stats.mean) / self.obs_stats.std if self.config.normalize_observations else transitions.obs
+        obs_norm = (transitions.obs - self.obs_stats.mean) / self.obs_stats.std if self.config.normalize_observations else transitions.obs
 
-        # 👑 计算进度逻辑
+        # 👑 修复：计算进度时，总步数应该是静态的
         steps_per_iter = self.config.iterations_per_env * self.config.num_envs
+        # 确保这里参与计算的都是静态常数
         total_iterations = self.config.num_timesteps // steps_per_iter
-        progress = jnp.minimum(1.0, self.steps / (total_iterations * self.config.cql_decay_ratio))
+        decay_steps = total_iterations * self.config.cql_decay_ratio
+        progress = jnp.minimum(1.0, self.steps / jnp.maximum(1.0, decay_steps))
 
-        # current_K 只是一个逻辑门，不控制 Array Shape
         current_K = (self.config.num_generated_actions_min +
-                     progress * (self.config.num_generated_actions_max - self.config.num_generated_actions_min)).astype(
-            jnp.int32)
+                     progress * (self.config.num_generated_actions_max - self.config.num_generated_actions_min)).astype(jnp.int32)
 
-        # 1. 估算 Targets (传入 current_K 用作 Mask)
-        pool_actions, pool_weights, target_qs, metrics = self._compute_targets(transitions, obs_norm, prng_targets,
-                                                                               current_K)
+        # 1. 传给 compute_targets
+        pool_actions, pool_weights, target_qs, metrics = self._compute_targets(transitions, obs_norm, prng_targets, current_K)
 
         q_update_steps = self.config.loop_v
 
@@ -214,7 +212,7 @@ class DGPOFMState:
     def _compute_fresh_weights(self, value_params, obs_norm, pool_actions, final_v_loss, current_K) -> tuple[
         Array, dict[str, Array]]:
         N, K_plus_1, act_dim = pool_actions.shape
-        flat_obs = obs_norm.reshape((N, obs_norm.shape[-1]))
+        flat_obs = obs_norm.reshape((N, self.env.observation_size))
         obs_pool_b = jnp.broadcast_to(flat_obs[:, None, :], (N, K_plus_1, flat_obs.shape[-1]))
         q_pool, _ = networks.value_mlp_fwd_with_features(value_params,
                                                          jnp.concatenate([obs_pool_b, pool_actions], axis=-1))
@@ -239,7 +237,9 @@ class DGPOFMState:
                                                    "q_guided/alpha_mean": jnp.mean(alpha)}
 
     def _compute_targets(self, transitions, obs_norm, prng, current_K):
+        metrics = dict[str, Array]()
         T, B, _ = obs_norm.shape
+        obs_dim = self.env.observation_size # 👑 明确获取静态维度
         act_dim = self.env.action_size
         N = T * B
         prng_boot, prng_gen, _ = jax.random.split(prng, 3)
@@ -273,9 +273,16 @@ class DGPOFMState:
                                                                values=q_pred, bootstrap_value=bootstrap_q,
                                                                gae_lambda=self.config.gae_lambda))
 
+        # =========================================================
+        # 2. 核心：自生成 K 个动作
+        # =========================================================
         K_max = self.config.num_generated_actions_max
-        flat_obs = obs_norm.reshape((N, _))
-        obs_b = jnp.broadcast_to(flat_obs[:, None, :], (N, K_max, _))
+
+        # 👑 修复：使用静态的 obs_dim 执行 reshape
+        flat_obs = obs_norm.reshape((N, obs_dim))
+        flat_acts_real = transitions.action.reshape((N, 1, act_dim))
+
+        obs_b = jnp.broadcast_to(flat_obs[:, None, :], (N, K_max, obs_dim))
 
         def gen_step_fn(x, t_tuple):
             t_curr, t_next = t_tuple
@@ -285,22 +292,29 @@ class DGPOFMState:
                                         t_embed) * self.config.policy_mlp_output_scale
             return x + (t_next - t_curr) * vel, None
 
-        generated_acts, _ = jax.lax.scan(gen_step_fn, jax.random.normal(prng_gen, (N, K_max, act_dim)),
-                                         (schedule.t_current, schedule.t_next))
-        pool_actions = jnp.concatenate([transitions.action.reshape((N, 1, act_dim)), generated_acts], axis=1)
+        x_t_gen = jax.random.normal(jax.random.split(prng)[1], (N, K_max, act_dim))
+        generated_acts, _ = jax.lax.scan(gen_step_fn, x_t_gen,
+                                         (self.get_schedule().t_current, self.get_schedule().t_next))
 
-        q_pool, _ = networks.value_mlp_fwd_with_features(self.params.value, jnp.concatenate(
-            [jnp.broadcast_to(flat_obs[:, None, :], (N, K_max + 1, _)), pool_actions], axis=-1))
+        pool_actions = jnp.concatenate([flat_acts_real, generated_acts], axis=1)
+
+        # 👑 修复：这里也要用静态 obs_dim
+        obs_pool_b = jnp.broadcast_to(flat_obs[:, None, :], (N, K_max + 1, obs_dim))
+        q_pool, _ = networks.value_mlp_fwd_with_features(self.params.value,
+                                                         jnp.concatenate([obs_pool_b, pool_actions], axis=-1))
         q_pool = jax.lax.stop_gradient(q_pool)
 
+        # Mask 逻辑
         indices = jnp.arange(K_max + 1)
         mask = indices <= current_K
-        alpha = self.config.resampling_alpha_min
         q_pool_masked = jnp.where(mask[None, :], q_pool, -1e10)
-        pool_probs = jax.nn.softmax((q_pool_masked - jnp.max(q_pool_masked, axis=-1, keepdims=True)) / alpha, axis=-1)
+
+        pool_probs = jax.nn.softmax(
+            (q_pool_masked - jnp.max(q_pool_masked, axis=-1, keepdims=True)) / self.config.resampling_alpha_min,
+            axis=-1)
 
         return jax.lax.stop_gradient(pool_actions), jax.lax.stop_gradient(pool_probs), gae_qs, {
-            "q_guided/q_real_mean": jnp.mean(q_pool[:, 0]), "q_guided/prob_real_mean": jnp.mean(pool_probs[:, 0])}
+            "q_guided/q_real_mean": jnp.mean(q_pool[:, 0])}
 
     def _compute_policy_loss(self, policy_params, obs_norm, actions_pool, weights_pool, prng):
         N, K_plus_1, act_dim = actions_pool.shape
@@ -330,14 +344,17 @@ class DGPOFMState:
 
     def _compute_value_loss(self, value_params, obs_norm, actions, truncation, target_qs, pool_actions,
                             current_cql_weight, current_K):
+        # 👑 修复：这里同样要把动态的 _ 换成静态的 observation_size
+        obs_dim = self.env.observation_size
         q_pred, _ = networks.value_mlp_fwd_with_features(value_params, jnp.concatenate([obs_norm, actions], axis=-1))
         mse_loss = jnp.mean(((target_qs - q_pred) * (1 - truncation)) ** 2)
 
         N, K_plus_1, _ = pool_actions.shape
+        # 👑 修复：reshape 使用静态 obs_dim
+        flat_obs = obs_norm.reshape((N, obs_dim))
         q_pool_fake, _ = networks.value_mlp_fwd_with_features(value_params, jnp.concatenate(
-            [jnp.broadcast_to(obs_norm.reshape((N, _))[:, None, :], (N, K_plus_1, _)), pool_actions], axis=-1))
+            [jnp.broadcast_to(flat_obs[:, None, :], (N, K_plus_1, obs_dim)), pool_actions], axis=-1))
 
-        # 👑 CQL Mask 逻辑
         indices = jnp.arange(K_plus_1)
         mask = indices <= current_K
         fake_mask = mask[1:]
