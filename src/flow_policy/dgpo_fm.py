@@ -19,7 +19,8 @@ class DGPOFMConfig:
     resampling_alpha_k: float = 0.1
     resampling_alpha_min: float = 0.3
     use_dynamic_alpha: jdc.Static[bool] = False
-    num_generated_actions: jdc.Static[int] = 1
+    num_generated_actions_min: jdc.Static[int] = 1
+    num_generated_actions_max: jdc.Static[int] = 8
     num_epsilon_samples: jdc.Static[int] = 8
 
     # 👑 新增：纯重采样开关 (True 为根据概率抛骰子硬采样，False 为加权)
