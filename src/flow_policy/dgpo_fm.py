@@ -195,8 +195,8 @@ class DGPOFMState:
 
             # 👑 PI 控制器核心逻辑
             error = current_penalty - self.config.cql_target_margin
-            clipped_error = jnp.clip(error, -5.0, 5.0)
 
+            clipped_error = jnp.clip(error, -5.0, 5.0) if self.config.cql_clip_alpha else error
             # 1. 积分项 (I)：使用被截断的误差和 Config 里的 LR
             ki = self.config.cql_alpha_lr
             next_log_alpha = current_log_alpha + ki * clipped_error
@@ -209,7 +209,7 @@ class DGPOFMState:
 
             # 2. 比例项 (P)：使用真实误差和 Config 里的 Kp
             kp = self.config.cql_alpha_kp
-            instant_log_alpha = next_log_alpha + kp * error
+            instant_log_alpha = next_log_alpha + kp * error if self.config.cql_clip_alpha else next_log_alpha
 
             effective_alpha = jax.lax.stop_gradient(jnp.exp(instant_log_alpha))
 
