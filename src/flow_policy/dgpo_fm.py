@@ -470,12 +470,13 @@ class DGPOFMState:
         else:
             raise ValueError(f"未知的衰减模式: {self.config.cql_decay_mode}")
 
-            # 终极安全锁：由于浮点精度问题，以防万一越界，钳制在上下限之间
-            current_cql_weight = jnp.clip(current_cql_weight, final_w, init_w)
+        # 终极安全锁：由于浮点精度问题，以防万一越界，钳制在上下限之间
+        current_cql_weight = jnp.clip(current_cql_weight, final_w, init_w)
 
-            # 5. 综合 Loss (后续不变)
-            total_v_loss = (
-                                       mse_loss + current_cql_weight * cql_penalty) * self.config.value_loss_coeff * self.config.w_v_loss
+        # 5. 综合 Loss (后续不变)
+        total_v_loss = (
+                                   mse_loss + current_cql_weight * cql_penalty) * self.config.value_loss_coeff * self.config.w_v_loss
+
         # 👑 把当前的 weight 和 penalty 传出去，方便监控
         aux_metrics = {
             "v_loss/total": total_v_loss,
