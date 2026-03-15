@@ -187,24 +187,23 @@ class DGPOFMState:
                 v_params, obs_norm, transitions.action, transitions.truncation, target_qs, pool_actions, base_alpha
             )
 
-            # 👑 PI 控制器核心逻辑
+            # ... 前面算出了 current_penalty ...
+
             error = current_penalty - self.config.cql_target_margin
 
-            # 1. 积分项 (I) - 也就是传统的梯度下降，更新长期记忆
-            ki = 3e-4  # 可以放到 config 里
-            next_log_alpha = current_log_alpha + ki * error
-            next_log_alpha = jnp.clip(
-                next_log_alpha,
-                a_min=jnp.log(self.config.cql_final_weight),
-                a_max=jnp.log(self.config.cql_init_weight)
-            )
+            # 👑 你的直觉：限制每次误差累积的最大步长 (比如把误差钳制在 [-5.0, 5.0] 之间)
+            # 防止极端的 penalty 瞬间摧毁长期记忆
+            clipped_error = jnp.clip(error, -5.0, 5.0)
 
-            # 2. 比例项 (P) - 应对突发状况的瞬时惩罚放大！
-            kp = 0.05  # 可以放到 config 里，通常比 ki 大两个数量级
-            # 如果 error > 0 (危险)，P 项瞬间拉高 alpha；如果 error < 0 (安全)，P 项瞬间降低 alpha
+            # 1. 积分项 (I)：使用被截断的、安全的误差来缓慢更新底座
+            ki = 3e-4
+            next_log_alpha = current_log_alpha + ki * clipped_error
+            next_log_alpha = jnp.clip(next_log_alpha, min_log, max_log)  # 绝对上下限
+
+            # 2. 比例项 (P)：使用未截断的、真实的误差来做瞬间应急反应！
+            kp = 0.05
             instant_log_alpha = next_log_alpha + kp * error
 
-            # 计算出带有 PI 综合控制的、用来真正算梯度的 effective_alpha
             effective_alpha = jax.lax.stop_gradient(jnp.exp(instant_log_alpha))
 
             # 🚨 第 2 次前向传播：带着最完美的 effective_alpha 去算真正的 Q 网络梯度
