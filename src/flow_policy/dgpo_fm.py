@@ -428,20 +428,21 @@ class DGPOFMState:
         else:
             cql_penalty = jnp.mean(q_pool_fake[:, 1:])
 
-        # 👑 4. 静态分支：决定调度器模式 (使用统一的梯度更新次数计算)
+        # 👑 4. 静态分支：决定调度器模式 (与外部 train_dgpo_fm.py 完美对齐)
         init_w = self.config.cql_init_weight
         final_w = self.config.cql_final_weight
 
-        # 将环境总帧数换算为总的 Iteration 数量
-        total_iterations = self.config.num_timesteps / (self.config.num_envs * self.config.unroll_length)
+        # 步骤 A：使用和外部程序一模一样的逻辑，计算总 Iteration 数量
+        steps_per_iter = self.config.iterations_per_env * self.config.num_envs
+        total_iterations = self.config.num_timesteps // steps_per_iter
 
-        # 计算整个训练生命周期内，一共会执行多少次梯度更新 (self.steps 的最大值)
+        # 步骤 B：算出生命周期内真正的梯度更新总数 (self.steps 的最大值)
         total_updates = total_iterations * self.config.num_updates_per_batch * self.config.num_minibatches
 
-        # 动态计算绝对衰减步数 (以梯度更新次数为单位)
+        # 步骤 C：乘以比例 (比如 0.5 就是在第 30 个 Iteration 结束衰减)
         decay_updates = total_updates * self.config.cql_decay_ratio
 
-        # 现在单位统一了，可以放心除
+        # 计算当前的真实进度 (0.0 到 1.0)
         progress = jnp.minimum(1.0, self.steps / decay_updates)
 
         if self.config.cql_decay_mode == "none":
