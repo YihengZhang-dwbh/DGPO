@@ -308,7 +308,7 @@ class DGPOFMState:
         max_logit_diff = jnp.log(self.config.q_guided_max_ratio)
 
         # 只限制上限，不限制下限 (比真动作差的动作，让它们概率趋近于 0 是合理的)
-        clipped_logits_diff = jnp.clip(logits_diff, a_min=None, a_max=max_logit_diff)
+        clipped_logits_diff = jnp.clip(logits_diff, a_min=-max_logit_diff, a_max=max_logit_diff)
 
         # 4. 安全地计算最终概率
         pool_probs = jax.nn.softmax(clipped_logits_diff, axis=-1)
