@@ -198,6 +198,9 @@ class DGPOFMState:
             # 1. 积分项 (I)：使用被截断的、安全的误差来缓慢更新底座
             ki = 3e-4
             next_log_alpha = current_log_alpha + ki * clipped_error
+            # 👑 修复：明确定义对数空间的上下限
+            min_log = jnp.log(self.config.cql_final_weight)
+            max_log = jnp.log(self.config.cql_init_weight)
             next_log_alpha = jnp.clip(next_log_alpha, min_log, max_log)  # 绝对上下限
 
             # 2. 比例项 (P)：使用未截断的、真实的误差来做瞬间应急反应！
