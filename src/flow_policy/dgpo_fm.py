@@ -292,7 +292,7 @@ class DGPOFMState:
             # 用 RMSE 作为缩放因子。
             # 如果 RMSE=30 (裁判极度迷茫)，alpha = 0.1 * 31 = 3.1，拉平分布保命
             # 如果 RMSE=1 (裁判极其自信)，alpha = 0.1 * 2 = 0.2，锋利选择好动作
-            alpha = max(self.config.resampling_alpha_k * rmse, self.config.resampling_alpha_min)
+            alpha = jnp.maximum(self.config.resampling_alpha_k * rmse, self.config.resampling_alpha_min)
         else:
             alpha = self.config.resampling_alpha_min
 
