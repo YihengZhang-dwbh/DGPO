@@ -272,54 +272,51 @@ class DGPOFMState:
 
     def _compute_fresh_weights(self, value_params, obs_norm, pool_actions, final_v_loss) -> tuple[
         Array, dict[str, Array]]:
-        """使用最新更新的 Q 网络和 V-Loss 来计算动作的 Softmax 权重"""
         N, K_plus_1, act_dim = pool_actions.shape
+        K = K_plus_1 - 1
         flat_obs = obs_norm.reshape((N, obs_norm.shape[-1]))
 
+        # 1. 打分逻辑保持不变
         obs_pool_b = jnp.broadcast_to(flat_obs[:, None, :], (N, K_plus_1, flat_obs.shape[-1]))
         concat_pool = jnp.concatenate([obs_pool_b, pool_actions], axis=-1)
-
-        # 用刚刚更新完的 Q 网络打分
         q_pool, _ = networks.value_mlp_fwd_with_features(value_params, concat_pool)
         q_pool = jax.lax.stop_gradient(q_pool)
 
-        # ==========================================
-        # 👑 Loss-Guided Temperature (基于 V-Loss 的避震器)
-        # ==========================================
+        # 2. 动态温度逻辑保持不变
         if self.config.use_dynamic_alpha:
-            # final_v_loss 是个标量 (比如 65 或者 892)
-            # 因为 v_loss 主要是 MSE，我们开个根号 (RMSE) 把它拉回到和 Q 值同一线性维度
-            rmse = jnp.abs(final_v_loss + 1e-8)
+            rmse = jnp.sqrt(final_v_loss + 1e-8)
             alpha = jnp.maximum(self.config.resampling_alpha_k * rmse, self.config.resampling_alpha_min)
         else:
             alpha = self.config.resampling_alpha_min
 
         # ==========================================
-        # 👑 你的核心魔法：组内概率比上限 (Ratio Clipping)
+        # 👑 核心逻辑修改：分组 1 vs 1 对抗
         # ==========================================
-        # 1. 提取真动作的打分 (作为绝对锚点)
-        q_real_sg = jax.lax.stop_gradient(q_pool[:, 0:1])
+        q_real = q_pool[:, 0:1]  # (N, 1)
+        q_fakes = q_pool[:, 1:]  # (N, K)
 
-        # 2. 计算所有动作相对于锚点的 Logit 差值
-        logits_diff = (q_pool - q_real_sg) / alpha
+        # 构造 K 组对决的 Logits: (N, K, 2)
+        # 每组第0位是 real，第1位是对应的那个 fake
+        logits_real = jnp.zeros_like(q_fakes)  # 相对差值基准
+        logits_fakes = (q_fakes - q_real) / alpha
 
-        # 3. 限制 P_fake / P_real <= max_ratio
-        # 取对数后，就等价于限制 Logits 差值的上限！
+        # 👑 应用你的 max_ratio 魔法：限制组内假动作相对于真动作的优势
         max_logit_diff = jnp.log(self.config.q_guided_max_ratio)
+        logits_fakes = jnp.clip(logits_fakes, a_min=None, a_max=max_logit_diff)
 
-        # 只限制上限，不限制下限 (比真动作差的动作，让它们概率趋近于 0 是合理的)
-        clipped_logits_diff = jnp.clip(logits_diff, a_min=-max_logit_diff, a_max=max_logit_diff)
+        # 拼合每组的两个选手
+        group_logits = jnp.stack([logits_real, logits_fakes], axis=-1)  # (N, K, 2)
 
-        # 4. 安全地计算最终概率
-        pool_probs = jax.nn.softmax(clipped_logits_diff, axis=-1)
+        # 在组内做 Softmax，算出每组内谁该赢
+        group_probs = jax.nn.softmax(group_logits, axis=-1)  # (N, K, 2)
 
         metrics = {
-            "q_guided/q_real_mean": jnp.mean(q_pool[:, 0]),
-            "q_guided/q_generated_mean": jnp.mean(q_pool[:, 1:]),
-            "q_guided/prob_real_mean": jnp.mean(pool_probs[:, 0]),
-            "q_guided/alpha_mean": jnp.mean(alpha)  # 👑 监控它随着 V-Loss 的起伏！
+            "q_guided/q_real_mean": jnp.mean(q_real),
+            "q_guided/q_generated_mean": jnp.mean(q_fakes),
+            "q_guided/prob_real_mean": jnp.mean(group_probs[:, :, 0]),  # 平均每组真动作胜率
+            "q_guided/alpha_mean": jnp.mean(alpha)
         }
-        return jax.lax.stop_gradient(pool_probs), metrics
+        return jax.lax.stop_gradient(group_probs), metrics
 
     def _compute_targets(self, transitions: DGPOFMTransition, obs_norm: Array, prng: Array) -> tuple[
         Array, Array, Array, dict[str, Array]]:
@@ -445,59 +442,41 @@ class DGPOFMState:
     # ==========================================
     # 5. AW-Flow: 局部优势加权速度场
     # ==========================================
-    def _compute_policy_loss(self, policy_params, obs_norm, actions_pool, weights_pool, prng):
+    def _compute_policy_loss(self, policy_params, obs_norm, actions_pool, group_probs, prng):
         N, K_plus_1, act_dim = actions_pool.shape
+        K = K_plus_1 - 1
         flat_obs = obs_norm.reshape((N, obs_norm.shape[-1]))
 
         if self.config.use_hard_resampling:
             # ==========================================
-            # 路线 A：硬重采样 + FPO 对齐 (多噪声方差缩减)
+            # 👑 路线 A：小组 1-vs-1 硬重采样
             # ==========================================
-            M = self.config.num_epsilon_samples  # 对齐 FPO，设为 4 或 8
-
             prng_idx, prng_eps, prng_t = jax.random.split(prng, 3)
 
-            # 1. 抛骰子：抽出那个唯一的 Target Action
-            logits = jnp.log(weights_pool + 1e-8)
-            sampled_indices = jax.random.categorical(prng_idx, logits, axis=-1)  # (N,)
-            sampled_actions = actions_pool[jnp.arange(N), sampled_indices]  # (N, act_dim)
+            # 1. 在 K 个小组里分别抛骰子 (N, K)
+            # group_probs 是 (N, K, 2)
+            group_logits = jnp.log(group_probs + 1e-8)
+            # 选出每组的赢家索引 (0 或 1)
+            sampled_indices = jax.random.categorical(prng_idx, group_logits, axis=-1)  # (N, K)
 
-            # 👑 2. FPO 对齐：为这唯一的目标动作，分配 M 个不同的时间步和纯噪声！
+            # 2. 根据索引提取动作
+            a_real = actions_pool[:, 0:1, :]  # (N, 1, act_dim)
+            a_fakes = actions_pool[:, 1:, :]  # (N, K, act_dim)
+
+            # 如果索引是0选real，索引是1选fake
+            # 我们用 where 逻辑来实现这种分组提取
+            mask = sampled_indices[:, :, None].astype(jnp.float32)  # (N, K, 1)
+            sampled_actions = (1.0 - mask) * a_real + mask * a_fakes  # (N, K, act_dim)
+
+            # 3. 准备噪声和时间步 (正好配对 K 组采样出的动作)
+            M = K
             eps = jax.random.normal(prng_eps, (N, M, act_dim))
             t_idx = jax.random.randint(prng_t, (N, M, 1), 0, self.config.flow_steps)
-            t = self.get_schedule().t_current[t_idx]  # (N, M, 1)
-
-            # 3. 把选中的动作和观测，广播复制 M 份以对齐张量
-            a_target = jnp.broadcast_to(sampled_actions[:, None, :], (N, M, act_dim))
-            obs_b = jnp.broadcast_to(flat_obs[:, None, :], (N, M, flat_obs.shape[-1]))
-
-            # 4. 构造 M 条截然不同的 ODE 轨迹
-            x_t = t * eps + (1.0 - t) * a_target
-            t_embed = self.embed_timestep(t)  # (N, M, t_dim)
-
-            # 5. 前向传播计算速度场
-            vel_pred = networks.flow_mlp_fwd(policy_params, obs_b, x_t, t_embed) * self.config.policy_mlp_output_scale
-
-            if self.config.output_mode == "u_but_supervise_as_eps":
-                x1_pred = (x_t - t * vel_pred) + vel_pred
-                error_sq = jnp.sum((eps - x1_pred) ** 2, axis=-1)
-            else:
-                error_sq = jnp.sum((vel_pred - (eps - a_target)) ** 2, axis=-1)
-
-            # 6. 对这 M 个不同时空点上的 Error 求平均，得到极低方差的平滑梯度
-            policy_loss = jnp.mean(error_sq)
-
-        else:
-            # ==========================================
-            # 路线 B：软加权 (Soft Weighting - 你之前的版本)
-            # ==========================================
-            prng_eps, prng_t = jax.random.split(prng, 2)
-            eps = jax.random.normal(prng_eps, (N, K_plus_1, act_dim))
-            t_idx = jax.random.randint(prng_t, (N, K_plus_1, 1), 0, self.config.flow_steps)
             t = self.get_schedule().t_current[t_idx]
 
-            x_t = t * eps + (1.0 - t) * actions_pool
-            obs_b = jnp.broadcast_to(flat_obs[:, None, :], (N, K_plus_1, flat_obs.shape[-1]))
+            # 4. 标准训练逻辑
+            obs_b = jnp.broadcast_to(flat_obs[:, None, :], (N, M, flat_obs.shape[-1]))
+            x_t = t * eps + (1.0 - t) * sampled_actions
             t_embed = self.embed_timestep(t)
 
             vel_pred = networks.flow_mlp_fwd(policy_params, obs_b, x_t, t_embed) * self.config.policy_mlp_output_scale
@@ -506,10 +485,9 @@ class DGPOFMState:
                 x1_pred = (x_t - t * vel_pred) + vel_pred
                 error_sq = jnp.sum((eps - x1_pred) ** 2, axis=-1)
             else:
-                error_sq = jnp.sum((vel_pred - (eps - actions_pool)) ** 2, axis=-1)
+                error_sq = jnp.sum((vel_pred - (eps - sampled_actions)) ** 2, axis=-1)
 
-            # 加权求和
-            policy_loss = jnp.mean(jnp.sum(weights_pool * error_sq, axis=-1))
+            policy_loss = jnp.mean(error_sq)
 
         return policy_loss, {"policy_loss": policy_loss}
 
