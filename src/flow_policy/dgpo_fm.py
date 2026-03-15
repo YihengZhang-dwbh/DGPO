@@ -287,7 +287,7 @@ class DGPOFMState:
         if self.config.use_dynamic_alpha:
             # final_v_loss 是个标量 (比如 65 或者 892)
             # 因为 v_loss 主要是 MSE，我们开个根号 (RMSE) 把它拉回到和 Q 值同一线性维度
-            rmse = jnp.sqrt(final_v_loss + 1e-8)
+            rmse = jnp.abs(final_v_loss + 1e-8)
 
             # 用 RMSE 作为缩放因子。
             # 如果 RMSE=30 (裁判极度迷茫)，alpha = 0.1 * 31 = 3.1，拉平分布保命
