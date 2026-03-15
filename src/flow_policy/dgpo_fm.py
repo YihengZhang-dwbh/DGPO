@@ -13,11 +13,11 @@ from jax import numpy as jnp
 from flow_policy.networks import MlpWeights
 from . import math_utils, networks, rollouts
 
-
 @jdc.pytree_dataclass
 class DGPOFMConfig:
     # --- 全新 Q-Guided 生成控制核心 ---
     resampling_alpha: float = 0.1
+    use_dynamic_alpha: jdc.Static[bool] = False  # 👑 新增：默认关闭动态，使用固定温度
     num_generated_actions: jdc.Static[int] = 7  # 每个状态额外生成 7 个动作 (凑成 8 个的簇)
 
     # 控制损失权重
@@ -291,17 +291,24 @@ class DGPOFMState:
         # =========================================================
         # 4. Softmax 加权 (Q-Guided Weighting)
         # =========================================================
-        local_scale = jnp.max(jnp.abs(q_pool - jnp.mean(q_pool, axis=-1, keepdims=True)), axis=-1)
-        dynamic_alpha = self.config.resampling_alpha * (local_scale + 1e-6)
+        if self.config.use_dynamic_alpha:
+            # 原有的动态缩放逻辑 (根据极差自适应)
+            local_scale = jnp.max(jnp.abs(q_pool - jnp.mean(q_pool, axis=-1, keepdims=True)), axis=-1)
+            alpha = self.config.resampling_alpha * (local_scale + 1e-6)
+            alpha = alpha[:, None]  # (N, 1) 以便广播
+        else:
+            # 👑 新的静态逻辑：直接使用全局固定的温度值
+            alpha = self.config.resampling_alpha
 
-        logits = (q_pool - jnp.max(q_pool, axis=-1, keepdims=True)) / dynamic_alpha[:, None]
+        # 减去 max 防止指数爆炸，然后除以温度
+        logits = (q_pool - jnp.max(q_pool, axis=-1, keepdims=True)) / alpha
         pool_probs = jax.nn.softmax(logits, axis=-1)  # (N, K+1)
 
         # --- 监控指标 ---
         metrics["q_guided/q_real_mean"] = jnp.mean(q_pool[:, 0])
         metrics["q_guided/q_generated_mean"] = jnp.mean(q_pool[:, 1:])
         metrics["q_guided/prob_real_mean"] = jnp.mean(pool_probs[:, 0])
-        metrics["q_guided/dynamic_alpha_mean"] = jnp.mean(dynamic_alpha)
+        metrics["q_guided/alpha_mean"] = jnp.mean(alpha)  # 统一指标名称
 
         return jax.lax.stop_gradient(pool_actions), jax.lax.stop_gradient(pool_probs), gae_qs, metrics
 
