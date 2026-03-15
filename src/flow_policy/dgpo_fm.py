@@ -16,7 +16,8 @@ from . import math_utils, networks, rollouts
 @jdc.pytree_dataclass
 class DGPOFMConfig:
     # --- 全新 Q-Guided 生成控制核心 ---
-    resampling_alpha: float = 0.1
+    resampling_alpha_k: float = 0.1
+    resampling_alpha_min: float = 0.1
     use_dynamic_alpha: jdc.Static[bool] = False
     num_generated_actions: jdc.Static[int] = 7
     num_epsilon_samples: jdc.Static[int] = 8
@@ -291,9 +292,9 @@ class DGPOFMState:
             # 用 RMSE 作为缩放因子。
             # 如果 RMSE=30 (裁判极度迷茫)，alpha = 0.1 * 31 = 3.1，拉平分布保命
             # 如果 RMSE=1 (裁判极其自信)，alpha = 0.1 * 2 = 0.2，锋利选择好动作
-            alpha = min(self.config.resampling_alpha * (rmse + 1.0), 0.02)
+            alpha = max(self.config.resampling_alpha_k * rmse, self.config.resampling_alpha_min)
         else:
-            alpha = self.config.resampling_alpha
+            alpha = self.config.resampling_alpha_min
 
         # Softmax 归一化
         logits = (q_pool - jnp.max(q_pool, axis=-1, keepdims=True)) / alpha
@@ -410,11 +411,11 @@ class DGPOFMState:
         if self.config.use_dynamic_alpha and False:
             # 原有的动态缩放逻辑 (根据极差自适应)
             local_scale = jnp.max(jnp.abs(q_pool - jnp.mean(q_pool, axis=-1, keepdims=True)), axis=-1)
-            alpha = self.config.resampling_alpha * (local_scale + 1e-6)
+            alpha = self.config.resampling_alpha_min * (local_scale + 1e-6)
             alpha = alpha[:, None]  # (N, 1) 以便广播
         else:
             # 👑 新的静态逻辑：直接使用全局固定的温度值
-            alpha = self.config.resampling_alpha
+            alpha = self.config.resampling_alpha_min
 
         # 减去 max 防止指数爆炸，然后除以温度
         logits = (q_pool - jnp.max(q_pool, axis=-1, keepdims=True)) / alpha
