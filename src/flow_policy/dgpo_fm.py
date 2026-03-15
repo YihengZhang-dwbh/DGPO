@@ -239,18 +239,20 @@ class DGPOFMState:
     def _compute_targets(self, transitions, obs_norm, prng, current_K):
         metrics = dict[str, Array]()
         T, B, _ = obs_norm.shape
-        obs_dim = self.env.observation_size # 👑 明确获取静态维度
+        obs_dim = self.env.observation_size
         act_dim = self.env.action_size
         N = T * B
+
         prng_boot, prng_gen, _ = jax.random.split(prng, 3)
 
+        # --- 1. GAE 计算 (保持不变) ---
         concat_inputs = jnp.concatenate([obs_norm, transitions.action], axis=-1)
         q_pred, _ = networks.value_mlp_fwd_with_features(self.params.value, concat_inputs)
         q_pred = jax.lax.stop_gradient(q_pred)
 
         bootstrap_obs = transitions.next_obs[-1:, :, :]
-        if self.config.normalize_observations: bootstrap_obs = (
-                                                                           bootstrap_obs - self.obs_stats.mean) / self.obs_stats.std
+        if self.config.normalize_observations:
+            bootstrap_obs = (bootstrap_obs - self.obs_stats.mean) / self.obs_stats.std
 
         def boot_step_fn(x, t_tuple):
             t_curr, t_next = t_tuple
@@ -267,36 +269,53 @@ class DGPOFMState:
                                                               jnp.concatenate([bootstrap_obs, bootstrap_act], axis=-1))
         bootstrap_q = jax.lax.stop_gradient(bootstrap_q)
 
-        gae_qs, _ = jax.lax.stop_gradient(rollouts.compute_gae(truncation=transitions.truncation,
-                                                               discount=transitions.discount * self.config.discounting,
-                                                               rewards=transitions.reward * self.config.reward_scaling,
-                                                               values=q_pred, bootstrap_value=bootstrap_q,
-                                                               gae_lambda=self.config.gae_lambda))
+        gae_qs, _ = jax.lax.stop_gradient(rollouts.compute_gae(
+            truncation=transitions.truncation,
+            discount=transitions.discount * self.config.discounting,
+            rewards=transitions.reward * self.config.reward_scaling,
+            values=q_pred,
+            bootstrap_value=bootstrap_q,
+            gae_lambda=self.config.gae_lambda))
 
         # =========================================================
-        # 2. 核心：自生成 K 个动作
+        # 👑 2. 物理级动作生成 (K_max 静态锁定)
         # =========================================================
         K_max = self.config.num_generated_actions_max
-        N = obs_norm.shape[0] * obs_norm.shape[1]
+        flat_obs = obs_norm.reshape((N, obs_dim))
+        flat_acts_real = transitions.action.reshape((N, 1, act_dim))
 
-        # 1. 依然生成 K_max 个，但我们要动态截取
-        generated_acts_all, _ = jax.lax.scan(gen_step_fn, x_t_gen, ...)
+        # 定义 gen_step_fn (修复 NameError)
+        obs_b = jnp.broadcast_to(flat_obs[:, None, :], (N, K_max, obs_dim))
 
-        # 👑 核心修复：只取前 current_K 个假动作，其余填 0
-        # 这样 Q 网络在打分时，后面的位置都是 0 动作，干扰极小
-        mask = jnp.arange(K_max) < current_K
-        generated_acts = generated_acts_all * mask[None, :, None]
+        def gen_step_fn(x, t_tuple):
+            t_curr, t_next = t_tuple
+            t_embed = jnp.broadcast_to(self.embed_timestep(jnp.array([t_curr])[..., None])[:, None, :],
+                                       (N, K_max, self.config.timestep_embed_dim))
+            p_params = jax.lax.stop_gradient(self.params.policy)
+            vel = networks.flow_mlp_fwd(p_params, obs_b, x, t_embed) * self.config.policy_mlp_output_scale
+            return x + (t_next - t_curr) * vel, None
 
-        pool_actions = jnp.concatenate([flat_acts_real, generated_acts], axis=1) # (N, K_max+1, act_dim)
+        # 生成全量 K_max 动作
+        x_t_gen = jax.random.normal(prng_gen, (N, K_max, act_dim))
+        generated_acts_all, _ = jax.lax.scan(gen_step_fn, x_t_gen, (schedule.t_current, schedule.t_next))
 
-        # 2. 这里的打分也要配合 Mask
-        q_pool, _ = networks.value_mlp_fwd_with_features(...)
+        # 👑 物理切片：抹除尚未解锁的动作
+        # 这一步极其关键，它保证了 Q 网络在 Iteration 0 只看到 1 个假动作
+        gen_mask = jnp.arange(K_max) < current_K
+        generated_acts = generated_acts_all * gen_mask[None, :, None]
+        pool_actions = jnp.concatenate([flat_acts_real, generated_acts], axis=1)  # (N, K_max+1, act_dim)
 
-        # 👑 重点：除了真动作(index 0)和前 current_K 个假动作，其余 Q 值必须死死压住
+        # --- 3. 裁判打分 ---
+        obs_pool_b = jnp.broadcast_to(flat_obs[:, None, :], (N, K_max + 1, obs_dim))
+        q_pool, _ = networks.value_mlp_fwd_with_features(self.params.value,
+                                                         jnp.concatenate([obs_pool_b, pool_actions], axis=-1))
+        q_pool = jax.lax.stop_gradient(q_pool)
+
+        # 👑 逻辑屏蔽：除了 real 和 current_K 内的假动作，其余全部禁言
         full_mask = jnp.arange(K_max + 1) <= current_K
         q_pool_masked = jnp.where(full_mask[None, :], q_pool, -1e10)
 
-
+        # Softmax 重采样概率
         pool_probs = jax.nn.softmax(
             (q_pool_masked - jnp.max(q_pool_masked, axis=-1, keepdims=True)) / self.config.resampling_alpha_min,
             axis=-1)
