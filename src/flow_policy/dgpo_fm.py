@@ -24,6 +24,8 @@ class DGPOFMConfig:
 
     # 👑 新增：纯重采样开关 (True 为根据概率抛骰子硬采样，False 为加权)
     use_hard_resampling: jdc.Static[bool] = True
+    # 👑 新增：终极防线，组内概率比上限
+    q_guided_max_ratio: float = 8.0
 
     # 控制损失权重
     w_v_loss: float = 1.0
@@ -288,17 +290,28 @@ class DGPOFMState:
             # final_v_loss 是个标量 (比如 65 或者 892)
             # 因为 v_loss 主要是 MSE，我们开个根号 (RMSE) 把它拉回到和 Q 值同一线性维度
             rmse = jnp.abs(final_v_loss + 1e-8)
-
-            # 用 RMSE 作为缩放因子。
-            # 如果 RMSE=30 (裁判极度迷茫)，alpha = 0.1 * 31 = 3.1，拉平分布保命
-            # 如果 RMSE=1 (裁判极其自信)，alpha = 0.1 * 2 = 0.2，锋利选择好动作
             alpha = jnp.maximum(self.config.resampling_alpha_k * rmse, self.config.resampling_alpha_min)
         else:
             alpha = self.config.resampling_alpha_min
 
-        # Softmax 归一化
-        logits = (q_pool - jnp.max(q_pool, axis=-1, keepdims=True)) / alpha
-        pool_probs = jax.nn.softmax(logits, axis=-1)
+        # ==========================================
+        # 👑 你的核心魔法：组内概率比上限 (Ratio Clipping)
+        # ==========================================
+        # 1. 提取真动作的打分 (作为绝对锚点)
+        q_real_sg = jax.lax.stop_gradient(q_pool[:, 0:1])
+
+        # 2. 计算所有动作相对于锚点的 Logit 差值
+        logits_diff = (q_pool - q_real_sg) / alpha
+
+        # 3. 限制 P_fake / P_real <= max_ratio
+        # 取对数后，就等价于限制 Logits 差值的上限！
+        max_logit_diff = jnp.log(self.config.q_guided_max_ratio)
+
+        # 只限制上限，不限制下限 (比真动作差的动作，让它们概率趋近于 0 是合理的)
+        clipped_logits_diff = jnp.clip(logits_diff, a_min=None, a_max=max_logit_diff)
+
+        # 4. 安全地计算最终概率
+        pool_probs = jax.nn.softmax(clipped_logits_diff, axis=-1)
 
         metrics = {
             "q_guided/q_real_mean": jnp.mean(q_pool[:, 0]),
