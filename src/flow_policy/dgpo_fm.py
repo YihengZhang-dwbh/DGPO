@@ -395,39 +395,34 @@ class DGPOFMState:
     # ==========================================
     # 修改 _compute_value_loss，我们需要传入生成的动作 pool_actions 来惩罚它们
     def _compute_value_loss(self, value_params, obs_norm, actions, truncation, target_qs, pool_actions):
-        # 1. 计算真实动作的 Q 值，拟合 Target
+        # 1. 计算真实动作的 Q 值，拟合 Target (保持不变)
         concat_inputs = jnp.concatenate([obs_norm, actions], axis=-1)
         q_pred, _ = networks.value_mlp_fwd_with_features(value_params, concat_inputs)
 
         v_error = (target_qs - q_pred) * (1 - truncation)
         mse_loss = jnp.mean(v_error ** 2)
 
-        # 2. 加入 CQL 保守惩罚项
+        # 👑 2. 加入 CQL 保守惩罚项 (打破死亡螺旋的核心)
+        # 把生成的假动作丢进去算 Q 值
+        # 👑 2. 加入 CQL 保守惩罚项 (打破死亡螺旋的核心)
         N, K_plus_1, act_dim = pool_actions.shape
+
+        # 👇 关键修复：先把 (T, B, obs_dim) 展平为 (N, obs_dim)
         flat_obs = obs_norm.reshape((N, obs_norm.shape[-1]))
+
+        # 然后再增加维度并广播
         obs_b = jnp.broadcast_to(flat_obs[:, None, :], (N, K_plus_1, obs_norm.shape[-1]))
         concat_pool = jnp.concatenate([obs_b, pool_actions], axis=-1)
 
         q_pool_fake, _ = networks.value_mlp_fwd_with_features(value_params, concat_pool)
 
-        # 强烈建议使用 Hinge Loss 作为惩罚底线
-        cql_penalty = jnp.mean(jax.nn.relu(q_pool_fake[:, 1:] - q_pool_fake[:, 0:1]))
+        # 惩罚项：如果 Q 网络给生成的动作打分太高，就产生巨大的 Loss 惩罚它！
+        # 排除掉第0个(真实的动作)，只惩罚后面 7 个生成的动作
+        cql_penalty = jnp.mean(q_pool_fake[:, 1:])
 
-        # ==========================================
-        # 👑 3. 极简版余弦衰减 (直接使用 self.steps)
-        # ==========================================
-        init_weight = self.config.cql_weight  # 起始最高惩罚，比如 0.1
-        final_weight = 0.001  # 最终保留的底线惩罚
-        decay_steps = self.config.num_timesteps * 0.5  # 在前 50% 的训练步数内完成衰减
-
-        # self.steps 也是一个 JAX Array，直接参与计算没有任何问题
-        progress = jnp.minimum(1.0, self.steps / decay_steps)
-        cosine_decay = 0.5 * (1.0 + jnp.cos(jnp.pi * progress))
-        current_cql_weight = final_weight + (init_weight - final_weight) * cosine_decay
-
-        # 4. 综合 Loss
-        total_v_loss = (
-                                   mse_loss + current_cql_weight * cql_penalty) * self.config.value_loss_coeff * self.config.w_v_loss
+        # 综合 Loss：拟合真实回报 + 压制假动作的幻觉分数 (cql_weight 比如设为 1.0 或 5.0)
+        cql_weight = self.config.cql_weight
+        total_v_loss = (mse_loss + cql_weight * cql_penalty) * self.config.value_loss_coeff * self.config.w_v_loss
 
         return total_v_loss
 
