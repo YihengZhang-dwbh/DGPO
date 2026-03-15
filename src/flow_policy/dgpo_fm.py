@@ -407,7 +407,7 @@ class DGPOFMState:
         # =========================================================
         # 4. Softmax 加权 (Q-Guided Weighting)
         # =========================================================
-        if self.config.use_dynamic_alpha:
+        if self.config.use_dynamic_alpha and False:
             # 原有的动态缩放逻辑 (根据极差自适应)
             local_scale = jnp.max(jnp.abs(q_pool - jnp.mean(q_pool, axis=-1, keepdims=True)), axis=-1)
             alpha = self.config.resampling_alpha * (local_scale + 1e-6)
