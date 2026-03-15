@@ -174,45 +174,52 @@ class DGPOFMState:
         def value_inner_step(carry, _):
             v_params, v_opt_state, current_log_alpha = carry
 
-            # 还原出真正的权重 (永远为正)
-            current_alpha = jax.lax.stop_gradient(jnp.exp(current_log_alpha))
-
-            def v_loss_fn(v_p):
-                # 传入 current_alpha
+            def v_loss_fn(v_p, alpha_val):
                 total_loss, penalty = self._compute_value_loss(
-                    v_p, obs_norm, transitions.action, transitions.truncation, target_qs, pool_actions, current_alpha
+                    v_p, obs_norm, transitions.action, transitions.truncation, target_qs, pool_actions, alpha_val
                 )
                 return total_loss, penalty
 
-            # 拿到 Q 网络的梯度和当前的 penalty
-            (v_loss_val, current_penalty), v_grads = jax.value_and_grad(v_loss_fn, has_aux=True)(v_params)
+            # 🚨 第 1 次前向传播：只为了拿到当前的 penalty 来算误差！
+            # 注意：这里我们传入一个 stop_gradient 的基础 alpha 探路
+            base_alpha = jax.lax.stop_gradient(jnp.exp(current_log_alpha))
+            _, current_penalty = self._compute_value_loss(
+                v_params, obs_norm, transitions.action, transitions.truncation, target_qs, pool_actions, base_alpha
+            )
 
-            # 更新 Q 网络
+            # 👑 PI 控制器核心逻辑
+            error = current_penalty - self.config.cql_target_margin
+
+            # 1. 积分项 (I) - 也就是传统的梯度下降，更新长期记忆
+            ki = 3e-4  # 可以放到 config 里
+            next_log_alpha = current_log_alpha + ki * error
+            next_log_alpha = jnp.clip(
+                next_log_alpha,
+                a_min=jnp.log(self.config.cql_final_weight),
+                a_max=jnp.log(self.config.cql_init_weight)
+            )
+
+            # 2. 比例项 (P) - 应对突发状况的瞬时惩罚放大！
+            kp = 0.05  # 可以放到 config 里，通常比 ki 大两个数量级
+            # 如果 error > 0 (危险)，P 项瞬间拉高 alpha；如果 error < 0 (安全)，P 项瞬间降低 alpha
+            instant_log_alpha = next_log_alpha + kp * error
+
+            # 计算出带有 PI 综合控制的、用来真正算梯度的 effective_alpha
+            effective_alpha = jax.lax.stop_gradient(jnp.exp(instant_log_alpha))
+
+            # 🚨 第 2 次前向传播：带着最完美的 effective_alpha 去算真正的 Q 网络梯度
+            (v_loss_val, _), v_grads = jax.value_and_grad(v_loss_fn, has_aux=True)(v_params, effective_alpha)
+
             v_updates, next_v_opt_state = self.opt_value.update(v_grads, v_opt_state, v_params)
             next_v_params = optax.apply_updates(v_params, v_updates)
-
-            # 👑 魔法发生：更新动态权重 (Lagrange Update)
-            if self.config.cql_decay_mode == "auto":
-                # 公式：如果 penalty 大于 target_margin，差值为正，log_alpha 变大 (加强惩罚)
-                # 反之，log_alpha 变小 (松绑)
-                alpha_grad = current_penalty - self.config.cql_target_margin
-                next_log_alpha = current_log_alpha + self.config.cql_alpha_lr * alpha_grad
-
-                # 限制上下限，防止爆炸或跌穿
-                next_log_alpha = jnp.clip(
-                    next_log_alpha,
-                    a_min=jnp.log(self.config.cql_final_weight),
-                    a_max=jnp.log(self.config.cql_init_weight)
-                )
-            else:
-                # 如果没开 auto，就保持不动 (你可以把前面写的各种衰减 schedule 放这里，为了纯粹，我们这里只演示 auto)
-                next_log_alpha = current_log_alpha
 
             aux_metrics = {
                 "v_loss/total": v_loss_val,
                 "v_loss/cql_penalty": current_penalty,
-                "v_loss/current_cql_weight": jnp.exp(next_log_alpha)
+                "v_loss/base_cql_weight": jnp.exp(next_log_alpha),  # 长期趋势
+                "v_loss/effective_cql_weight": effective_alpha  # 真实发力的惩罚
             }
+            # 返回时，状态里只保存积分项 (next_log_alpha)
             return (next_v_params, next_v_opt_state, next_log_alpha), aux_metrics
 
         # 执行 scan 循环
