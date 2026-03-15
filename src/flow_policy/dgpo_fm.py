@@ -273,9 +273,11 @@ class DGPOFMState:
         N, K_plus_1, act_dim = pool_actions.shape
         flat_obs = obs_norm.reshape((N, obs_norm.shape[-1]))
 
-        # 1. 裁判打分：用最新的 Q 网络评估 K+1 个动作
-        obs_pool_b = jnp.broadcast_to(flat_obs[:, None, :], (N, K + 1, flat_obs.shape[-1]))
+        # 👑 修复：把 (N, K + 1, ...) 改成 (N, K_plus_1, ...)
+        obs_pool_b = jnp.broadcast_to(flat_obs[:, None, :], (N, K_plus_1, flat_obs.shape[-1]))
+
         concat_pool = jnp.concatenate([obs_pool_b, pool_actions], axis=-1)
+        # ... 后面保持不变 ...
 
         q_pool, _ = networks.value_mlp_fwd_with_features(value_params, concat_pool)
         q_pool = jax.lax.stop_gradient(q_pool)
