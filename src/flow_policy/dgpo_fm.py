@@ -232,61 +232,49 @@ class DGPOFMState:
         probs, _ = self._compute_fresh_weights(new_v_params, obs_flat, pool_actions,
                                                extra_v_metrics["v_loss/total"][-1])
 
+        # 此时你可以放心地把 K 开到 4 或者 8
         def policy_loss_fn(p_params):
             M = cfg.num_epsilon_samples
-            p_idx, p_eps, p_t, p_acc, p_anneal = jax.random.split(prng_pol, 5)
+            p_idx, p_eps, p_t, p_acc = jax.random.split(prng_pol, 4)
+            logits = jnp.log(probs + 1e-8)
+
+            # 👑 普适化核心：在 K 个假动作中（索引 1 到 K），找出概率最大的那 1 个作为挑战者
+            # probs[:, 1:] 是所有假动作的概率，argmax 找到最大值的相对索引，+1 映射回真实索引
+            challenger_idx = jnp.argmax(probs[:, 1:], axis=-1) + 1  # 形状: (N,)
 
             if cfg.independent_noise_sampling:
-                # [独立采样模式]
-                # 步骤 A: 随机抽取 1 个假动作作为挑战者 (索引 1 到 K)
-                fake_idx = jax.random.randint(p_idx, (N, M), 1, K + 1)
-
-                # 步骤 B: 提取全局概率进行 1v1 对比
-                p_real_global = jnp.broadcast_to(probs[:, 0:1], (N, M))
-                p_fake_global = jnp.take_along_axis(probs[:, None, :], fake_idx[..., None], axis=-1).squeeze(-1)
-
-                # 步骤 C: 小池子重归一化
-                sum_p = p_real_global + p_fake_global
-                p_fake_local = p_fake_global / (sum_p + 1e-8)
-
-                # 步骤 D: 局部抽卡决定胜负
-                choose_fake = jax.random.uniform(p_acc, (N, M)) < p_fake_local
-                chosen_idx = jnp.where(choose_fake, fake_idx, 0)
-                a_target = jnp.take_along_axis(pool_actions[:, None, :, :], chosen_idx[..., None, None],
+                # 噪声在 K+1 个动作中自由抽签
+                sampled_indices = jax.random.categorical(p_idx, jnp.broadcast_to(logits[:, None, :], (N, M, K + 1)),
+                                                         axis=-1)
+                a_target = jnp.take_along_axis(pool_actions[:, None, :, :], sampled_indices[..., None, None],
                                                axis=2).squeeze(2)
+                rand_vals = jax.random.uniform(p_acc, (N, M))
 
-                # 步骤 E: 兜底防御机制
-                chosen_global_prob = jnp.where(choose_fake, p_fake_global, p_real_global)
-                rand_anneal = jax.random.uniform(p_anneal, (N, M))
-                anneal_pass = (chosen_idx == 0) | ((chosen_idx > 0) & (rand_anneal < p_accept))
-                threshold_pass = chosen_global_prob > cfg.rejection_threshold
+                # 只有真动作 (0) 和最强假动作 (challenger_idx) 才有资格参与更新
+                is_real = (sampled_indices == 0)
+                is_active_fake = (sampled_indices == challenger_idx[:, None]) & (rand_vals < p_accept)
+                valid_mask = (is_real | is_active_fake).astype(jnp.float32)
 
-                valid_mask = (anneal_pass & threshold_pass).astype(jnp.float32)
-                reject_ratio = jnp.mean((~threshold_pass).astype(jnp.float32))
+                # 剩下的 K-1 个假动作全部沦为吸收态 (Dummy)
+                is_dummy = (sampled_indices > 0) & (sampled_indices != challenger_idx[:, None])
+                dummy_absorption_ratio = jnp.mean(is_dummy.astype(jnp.float32))
 
             else:
-                # [一发入魂模式]
-                fake_idx = jax.random.randint(p_idx, (N,), 1, K + 1)
-                p_real_global = probs[:, 0]
-                p_fake_global = jnp.take_along_axis(probs, fake_idx[:, None], axis=-1).squeeze(-1)
+                # 一发入魂模式
+                sampled_indices = jax.random.categorical(p_idx, logits, axis=-1)[:, None]
+                a_target = jnp.broadcast_to(pool_actions[jnp.arange(N), sampled_indices[:, 0]][:, None, :],
+                                            (N, M, act_dim))
+                rand_vals = jnp.broadcast_to(jax.random.uniform(p_acc, (N, 1)), (N, M))
 
-                sum_p = p_real_global + p_fake_global
-                p_fake_local = p_fake_global / (sum_p + 1e-8)
-
-                choose_fake = jax.random.uniform(p_acc, (N,)) < p_fake_local
-                chosen_idx = jnp.where(choose_fake, fake_idx, 0)
-                a_target = jnp.broadcast_to(pool_actions[jnp.arange(N), chosen_idx][:, None, :], (N, M, act_dim))
-
-                chosen_global_prob = jnp.where(choose_fake, p_fake_global, p_real_global)
-                rand_anneal = jax.random.uniform(p_anneal, (N,))
-                anneal_pass = (chosen_idx == 0) | ((chosen_idx > 0) & (rand_anneal < p_accept))
-                threshold_pass = chosen_global_prob > cfg.rejection_threshold
-
-                valid_mask_single = (anneal_pass & threshold_pass).astype(jnp.float32)
+                is_real = (sampled_indices == 0)
+                is_active_fake = (sampled_indices == challenger_idx[:, None]) & (rand_vals < p_accept)
+                valid_mask_single = (is_real | is_active_fake).astype(jnp.float32)
                 valid_mask = jnp.broadcast_to(valid_mask_single[:, None], (N, M))
-                reject_ratio = jnp.mean((~threshold_pass).astype(jnp.float32))
 
-            # --- Flow Matching 拟合 ---
+                is_dummy = (sampled_indices > 0) & (sampled_indices != challenger_idx[:, None])
+                dummy_absorption_ratio = jnp.mean(is_dummy.astype(jnp.float32))
+
+            # --- Flow Matching 拟合逻辑保持不变 ---
             eps = jax.random.normal(p_eps, (N, M, act_dim))
             t_idx = jax.random.randint(p_t, (N, M, 1), 0, cfg.flow_steps)
             t = sch.t_current[t_idx]
@@ -302,11 +290,12 @@ class DGPOFMState:
                 err = jnp.sum((vel - (eps - a_target)) ** 2, axis=-1)
 
             loss = jnp.sum(err * valid_mask) / jnp.maximum(1.0, jnp.sum(valid_mask))
+
             return loss, {
                 "policy_loss": loss,
                 "q_guided/p_accept": p_accept,
-                "q_guided/real_win_ratio": jnp.mean((chosen_idx == 0).astype(jnp.float32)),
-                "q_guided/rejection_ratio": reject_ratio  # 👑 新指标：被硬底线无情截断的比例
+                "q_guided/real_win_ratio": jnp.mean((sampled_indices == 0).astype(jnp.float32)),
+                "q_guided/dummy_absorption_ratio": dummy_absorption_ratio  # 监控 K-1 个占位符吸走了多少火力
             }
 
         (p_loss, p_metrics), p_grads = jax.value_and_grad(policy_loss_fn, has_aux=True)(self.params.policy)
