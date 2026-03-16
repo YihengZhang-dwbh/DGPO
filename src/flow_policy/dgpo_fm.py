@@ -155,7 +155,7 @@ class DGPOFMState:
         prng_gen, prng_pol = jax.random.split(prng)
         cfg, sch = self.config, self.get_schedule()
 
-        # 1. 维度与数据平整化 (全部拉平到 N)
+        # 1. 维度对齐
         N = transitions.obs.shape[0] * transitions.obs.shape[1]
         obs_dim, act_dim, t_dim = self.env.observation_size, self.env.action_size, cfg.timestep_embed_dim
 
@@ -164,7 +164,7 @@ class DGPOFMState:
             (N, obs_dim))
         target_qs = transitions.action_info.target_qs.reshape((N, 1))
 
-        # 2. 进度与 p_accept (支持 cyclical 从 0 开始)
+        # 2. 进度与 p_accept
         total_up = (cfg.num_timesteps // (
                     cfg.iterations_per_env * cfg.num_envs)) * cfg.num_updates_per_batch * cfg.num_minibatches
         progress = jnp.minimum(1.0, self.steps / jnp.maximum(1.0, total_up))
@@ -173,7 +173,7 @@ class DGPOFMState:
             p_acc = cfg.p_fixed_val
         elif cfg.p_accept_mode == "linear":
             p_acc = cfg.p_min + progress * (cfg.p_max - cfg.p_min)
-        else:  # cyclical: cos(0)=1 => 1-1=0, 起点为 0
+        else:  # cyclical
             p_acc = cfg.p_min + 0.5 * (cfg.p_max - cfg.p_min) * (1.0 - jnp.cos(2.0 * jnp.pi * cfg.p_cycles * progress))
 
         # 3. 动作池生成 (K=1)
@@ -181,13 +181,13 @@ class DGPOFMState:
 
         def gen_step(x, t_tup):
             t_curr, t_next = t_tup
-            # 👑 修复：使用显式维度 t_dim 替代 -1
             t_emb = jnp.broadcast_to(self.embed_timestep(jnp.array([[t_curr]])), (N, K, t_dim))
             vel = networks.flow_mlp_fwd(jax.lax.stop_gradient(self.params.policy), obs_f[:, None, :], x,
                                         t_emb) * cfg.policy_mlp_output_scale
             return x + (t_next - t_curr) * vel, None
 
-        _, gen_acts = jax.lax.scan(gen_step, jax.random.normal(prng_gen, (N, K, act_dim)), (sch.t_current, sch.t_next))
+        # 👑 修复点：gen_acts 应该取 scan 的第一个返回值 (final carry)
+        gen_acts, _ = jax.lax.scan(gen_step, jax.random.normal(prng_gen, (N, K, act_dim)), (sch.t_current, sch.t_next))
         pool_acts = jnp.concatenate([transitions.action.reshape((N, 1, act_dim)), gen_acts], axis=1)
 
         # 4. Q 网络更新
@@ -211,7 +211,7 @@ class DGPOFMState:
         (new_v_p, new_v_opt, new_la), v_met = jax.lax.scan(v_step, (self.params.value, self.opt_state_value,
                                                                     self.log_cql_weight), None, length=cfg.loop_v)
 
-        # 5. 策略更新 (合并两种采样模式)
+        # 5. 策略更新
         probs, _ = self._compute_fresh_weights(new_v_p, obs_f, pool_acts, v_met["v/l"][-1])
 
         def p_loss_fn(p_p):
@@ -230,14 +230,19 @@ class DGPOFMState:
 
             mask = ((s_idx == 0) | ((s_idx > 0) & (rnd < p_acc))).astype(jnp.float32)
             eps = jax.random.normal(p_eps, (N, M, act_dim))
-            t = sch.t_current[jax.random.randint(p_t, (N, M, 1), 0, cfg.flow_steps)]
+            # 👑 修复：确保 t 的索引不会越界
+            t_idx = jax.random.randint(p_t, (N, M, 1), 0, cfg.flow_steps)
+            t = sch.t_current[t_idx]
             x_t = t * eps + (1.0 - t) * a_tar
-            vel = networks.flow_mlp_fwd(p_p, obs_f[:, None, :], x_t,
-                                        self.embed_timestep(t)) * cfg.policy_mlp_output_scale
+
+            # 使用 broadcast_to 显式对齐 obs
+            obs_b_p = jnp.broadcast_to(obs_f[:, None, :], (N, M, obs_dim))
+            vel = networks.flow_mlp_fwd(p_p, obs_b_p, x_t, self.embed_timestep(t)) * cfg.policy_mlp_output_scale
             err = jnp.sum((eps - ((x_t - t * vel) + vel)) ** 2 if cfg.output_mode == "u_but_supervise_as_eps" else (
                                                                                                                                vel - (
                                                                                                                                    eps - a_tar)) ** 2,
                           axis=-1)
+
             loss = jnp.sum(err * mask) / jnp.maximum(1.0, jnp.sum(mask))
             return loss, {"p/l": loss, "p/acc": p_acc, "p/rw": jnp.mean((s_idx == 0).astype(jnp.float32))}
 
