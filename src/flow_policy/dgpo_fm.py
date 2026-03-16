@@ -147,20 +147,21 @@ class DGPOFMState:
 
     def _step_minibatch(self, transitions: DGPOFMTransition, prng: Array) -> tuple[DGPOFMState, dict[str, Array]]:
         prng_gen, prng_policy = jax.random.split(prng, 2)
+
+        # 1. 算出原始 obs_norm (30, 1024, obs_dim)
         obs_norm = (
                                transitions.obs - self.obs_stats.mean) / self.obs_stats.std if self.config.normalize_observations else transitions.obs
 
-        # 👑 从 action_info 中提取被框架打乱切片好的静态 Target
-        target_qs_raw = transitions.action_info.target_qs
-
-        # 无论 batch_dims 是一维还是多维，我们统一拉平到 N
-        batch_dims = obs_norm.shape[:-1]
-        import math
-        N = math.prod(batch_dims)
+        # 👑 核心修复：把 obs_norm 也拉平到 N，和 target_qs 保持一致！
         obs_dim = self.env.observation_size
-        act_dim = self.env.action_size
+        obs_norm = obs_norm.reshape((-1, obs_dim))  # 变成 (30720, obs_dim)
 
+        # 2. 后面你已经写好的 target_qs 拉平逻辑
+        target_qs_raw = transitions.action_info.target_qs
+        N = obs_norm.shape[0]
         target_qs = target_qs_raw.reshape((N, 1))
+
+        # ... 剩下的代码不用动了
         flat_obs = obs_norm.reshape((N, obs_dim))
         flat_acts_real = transitions.action.reshape((N, 1, act_dim))
 
