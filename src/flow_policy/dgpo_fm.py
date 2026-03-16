@@ -181,23 +181,26 @@ class DGPOFMState:
 
         # 3. 动作池生成 (大池子: K可以放心设为 3, 7, 15 等)
         # 3. 动作池生成 (K=8，但我们让它坐火箭)
-        # 3. 动作池生成 (K 可以随便开，因为现在是单步光速生成)
-        K = cfg.num_generated_actions  # 比如 7 或 15
+        K = cfg.num_generated_actions
         obs_b_gen = jnp.broadcast_to(obs_flat[:, None, :], (N, K, obs_dim))
 
-        # 👑 极速单步生成 (One-Step Euler)
-        # t = 1.0 (纯噪声起点)
-        t_start = jnp.ones((N, K, 1))
-        t_embed_start = self.embed_timestep(t_start)
-        noise_x = jax.random.normal(prng_gen, (N, K, act_dim))
+        # 👑 性能黑客：单独定义一个只有 3 步（甚至 2 步）的粗糙时间表
+        # 这会让 K=8 的生成速度直接飙升 3 倍以上！
+        fast_flow_steps = 3
+        fast_full_t = jnp.linspace(1.0, 0.0, fast_flow_steps + 1)
+        fast_t_current, fast_t_next = fast_full_t[:-1], fast_full_t[1:]
 
-        # 直接预测初始速度
-        initial_vel = networks.flow_mlp_fwd(jax.lax.stop_gradient(self.params.policy), obs_b_gen, noise_x,
-                                            t_embed_start) * cfg.policy_mlp_output_scale
+        def gen_step(x, t_tup):
+            t_curr, t_next = t_tup
+            t_embed_raw = self.embed_timestep(jnp.array([t_curr])[..., None])
+            t_embed = jnp.broadcast_to(t_embed_raw[:, None, :], (N, K, t_dim))
+            vel = networks.flow_mlp_fwd(jax.lax.stop_gradient(self.params.policy), obs_b_gen, x,
+                                        t_embed) * cfg.policy_mlp_output_scale
+            return x + (t_next - t_curr) * vel, None
 
-        # dt = 1.0，直接一步跨越到终点 (x_0 = x_1 - 1.0 * vel)
-        gen_acts = noise_x - initial_vel
-
+        # 用快速时间表进行生成
+        gen_acts, _ = jax.lax.scan(gen_step, jax.random.normal(prng_gen, (N, K, act_dim)),
+                                   (fast_t_current, fast_t_next))
         pool_actions = jnp.concatenate([transitions.action.reshape((N, 1, act_dim)), gen_acts], axis=1)
 
         # 4. Q 网络更新 (Critic 对大池子进行全局打分)
@@ -236,10 +239,10 @@ class DGPOFMState:
             logits = jnp.log(probs + 1e-8)
 
             # 👑 普适化核心：在 K 个假动作中（索引 1 到 K），找出概率最大的那 1 个作为挑战者
-            # probs[:, 1:] 是所有假动作的概率，argmax 找到最大值的相对索引，+1 映射回真实索引
-            challenger_idx = jnp.argmax(probs[:, 1:], axis=-1) + 1  # 形状: (N,)
+            # # probs[:, 1:] 是所有假动作的概率，argmax 找到最大值的相对索引，+1 映射回真实索引
+            # challenger_idx = jnp.argmax(probs[:, 1:], axis=-1) + 1  # 形状: (N,)
             # 👑 你的神来之笔：在 1 到 K 的假动作中完全随机抽取 1 个作为合法挑战者
-            # challenger_idx = jax.random.randint(p_idx, (N,), minval=1, maxval=K + 1)
+            challenger_idx = jax.random.randint(p_idx, (N,), minval=1, maxval=K + 1)
 
             if cfg.independent_noise_sampling:
                 # 噪声在 K+1 个动作中自由抽签
