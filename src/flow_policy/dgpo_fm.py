@@ -155,26 +155,27 @@ class DGPOFMState:
         prng_gen, prng_pol = jax.random.split(prng)
         cfg, sch = self.config, self.get_schedule()
 
-        # 1. 维度对齐
+        # 1. 维度与数据对齐
         N = transitions.obs.shape[0] * transitions.obs.shape[1]
         obs_dim, act_dim, t_dim = self.env.observation_size, self.env.action_size, cfg.timestep_embed_dim
 
-        obs_f = ((
-                             transitions.obs - self.obs_stats.mean) / self.obs_stats.std if cfg.normalize_observations else transitions.obs).reshape(
+        obs_flat = ((
+                                transitions.obs - self.obs_stats.mean) / self.obs_stats.std if cfg.normalize_observations else transitions.obs).reshape(
             (N, obs_dim))
         target_qs = transitions.action_info.target_qs.reshape((N, 1))
 
-        # 2. 进度与 p_accept
-        total_up = (cfg.num_timesteps // (
+        # 2. p_accept 计算 (恢复人话变量名)
+        total_updates = (cfg.num_timesteps // (
                     cfg.iterations_per_env * cfg.num_envs)) * cfg.num_updates_per_batch * cfg.num_minibatches
-        progress = jnp.minimum(1.0, self.steps / jnp.maximum(1.0, total_up))
+        progress = jnp.minimum(1.0, self.steps / jnp.maximum(1.0, total_updates))
 
         if cfg.p_accept_mode == "fixed":
-            p_acc = cfg.p_fixed_val
+            p_accept = cfg.p_fixed_val
         elif cfg.p_accept_mode == "linear":
-            p_acc = cfg.p_min + progress * (cfg.p_max - cfg.p_min)
+            p_accept = cfg.p_min + progress * (cfg.p_max - cfg.p_min)
         else:  # cyclical
-            p_acc = cfg.p_min + 0.5 * (cfg.p_max - cfg.p_min) * (1.0 - jnp.cos(2.0 * jnp.pi * cfg.p_cycles * progress))
+            cycle_val = jnp.cos(2.0 * jnp.pi * cfg.p_cycles * progress)
+            p_accept = cfg.p_min + 0.5 * (cfg.p_max - cfg.p_min) * (1.0 - cycle_val)
 
         # 3. 动作池生成 (K=1)
         K = cfg.num_generated_actions
@@ -182,79 +183,102 @@ class DGPOFMState:
         def gen_step(x, t_tup):
             t_curr, t_next = t_tup
             t_emb = jnp.broadcast_to(self.embed_timestep(jnp.array([[t_curr]])), (N, K, t_dim))
-            vel = networks.flow_mlp_fwd(jax.lax.stop_gradient(self.params.policy), obs_f[:, None, :], x,
-                                        t_emb) * cfg.policy_mlp_output_scale
+            vel = networks.flow_mlp_fwd(jax.lax.stop_gradient(self.params.policy), obs_flat[:, None, :], x,
+                                        t_embed) * cfg.policy_mlp_output_scale
             return x + (t_next - t_curr) * vel, None
 
-        # 👑 修复点：gen_acts 应该取 scan 的第一个返回值 (final carry)
+        # 👑 修正：gen_acts 取第一个返回值
         gen_acts, _ = jax.lax.scan(gen_step, jax.random.normal(prng_gen, (N, K, act_dim)), (sch.t_current, sch.t_next))
-        pool_acts = jnp.concatenate([transitions.action.reshape((N, 1, act_dim)), gen_acts], axis=1)
+        pool_actions = jnp.concatenate([transitions.action.reshape((N, 1, act_dim)), gen_acts], axis=1)
 
-        # 4. Q 网络更新
-        def v_step(carry, _):
+        # 4. Q 网络多步更新 (恢复完整指标名)
+        def value_inner_step(carry, _):
             v_p, v_opt, log_a = carry
             alpha = jax.lax.stop_gradient(jnp.exp(log_a))
 
             def v_loss_fn(p):
-                total, pnlty = self._compute_value_loss(p, obs_f, transitions.action.reshape((N, act_dim)),
-                                                        transitions.truncation.reshape((N, 1)), target_qs, pool_acts,
-                                                        alpha)
-                return total, pnlty
+                total, penalty = self._compute_value_loss(p, obs_flat, transitions.action.reshape((N, act_dim)),
+                                                          transitions.truncation.reshape((N, 1)), target_qs,
+                                                          pool_actions, alpha)
+                return total, penalty
 
-            (l_val, pnlty_val), grads = jax.value_and_grad(v_loss_fn, has_aux=True)(v_p)
-            upd, next_opt = self.opt_value.update(grads, v_opt, v_p)
-            next_la = jnp.clip(log_a + cfg.cql_alpha_lr * (pnlty_val - cfg.cql_target_margin),
-                               jnp.log(cfg.cql_final_weight),
-                               jnp.log(cfg.cql_init_weight)) if cfg.cql_decay_mode == "auto" else log_a
-            return (optax.apply_updates(v_p, upd), next_opt, next_la), {"v/l": l_val, "v/p": pnlty_val, "v/a": alpha}
+            (v_loss_val, current_penalty), v_grads = jax.value_and_grad(v_loss_fn, has_aux=True)(v_p)
+            v_updates, next_v_opt = self.opt_value.update(v_grads, v_opt, v_p)
 
-        (new_v_p, new_v_opt, new_la), v_met = jax.lax.scan(v_step, (self.params.value, self.opt_state_value,
-                                                                    self.log_cql_weight), None, length=cfg.loop_v)
+            if cfg.cql_decay_mode == "auto":
+                alpha_grad = current_penalty - cfg.cql_target_margin
+                next_log_alpha = jnp.clip(log_a + cfg.cql_alpha_lr * alpha_grad, jnp.log(cfg.cql_final_weight),
+                                          jnp.log(cfg.cql_init_weight))
+            else:
+                next_log_alpha = log_a
 
-        # 5. 策略更新
-        probs, _ = self._compute_fresh_weights(new_v_p, obs_f, pool_acts, v_met["v/l"][-1])
+            return (optax.apply_updates(v_p, v_updates), next_v_opt, next_log_alpha), {
+                "v_loss/total": v_loss_val,
+                "v_loss/cql_penalty": current_penalty,
+                "v_loss/current_cql_weight": alpha
+            }
 
-        def p_loss_fn(p_p):
+        (new_v_params, new_v_opt_state, new_la), extra_v_metrics = jax.lax.scan(value_inner_step, (self.params.value,
+                                                                                                   self.opt_state_value,
+                                                                                                   self.log_cql_weight),
+                                                                                None, length=cfg.loop_v)
+
+        # 5. 策略更新 (恢复完整指标名)
+        probs, _ = self._compute_fresh_weights(new_v_params, obs_flat, pool_actions,
+                                               extra_v_metrics["v_loss/total"][-1])
+
+        def policy_loss_fn(p_params):
             M = cfg.num_epsilon_samples
-            p_idx, p_eps, p_t, p_a = jax.random.split(prng_pol, 4)
-            lgt = jnp.log(probs + 1e-8)
+            p_idx, p_eps, p_t, p_acc = jax.random.split(prng_pol, 4)
+            logits = jnp.log(probs + 1e-8)
 
             if cfg.independent_noise_sampling:
-                s_idx = jax.random.categorical(p_idx, jnp.broadcast_to(lgt[:, None, :], (N, M, K + 1)), axis=-1)
-                a_tar = jnp.take_along_axis(pool_acts[:, None, :, :], s_idx[..., None, None], axis=2).squeeze(2)
-                rnd = jax.random.uniform(p_a, (N, M))
+                sampled_indices = jax.random.categorical(p_idx, jnp.broadcast_to(logits[:, None, :], (N, M, K + 1)),
+                                                         axis=-1)
+                a_target = jnp.take_along_axis(pool_actions[:, None, :, :], sampled_indices[..., None, None],
+                                               axis=2).squeeze(2)
+                rand_vals = jax.random.uniform(p_acc, (N, M))
             else:
-                s_idx = jax.random.categorical(p_idx, lgt, axis=-1)[:, None]
-                a_tar = jnp.broadcast_to(pool_acts[jnp.arange(N), s_idx[:, 0]][:, None, :], (N, M, act_dim))
-                rnd = jnp.broadcast_to(jax.random.uniform(p_a, (N, 1)), (N, M))
+                sampled_indices = jax.random.categorical(p_idx, logits, axis=-1)[:, None]
+                a_target = jnp.broadcast_to(pool_actions[jnp.arange(N), sampled_indices[:, 0]][:, None, :],
+                                            (N, M, act_dim))
+                rand_vals = jnp.broadcast_to(jax.random.uniform(p_acc, (N, 1)), (N, M))
 
-            mask = ((s_idx == 0) | ((s_idx > 0) & (rnd < p_acc))).astype(jnp.float32)
+            valid_mask = ((sampled_indices == 0) | ((sampled_indices > 0) & (rand_vals < p_accept))).astype(jnp.float32)
+
             eps = jax.random.normal(p_eps, (N, M, act_dim))
-            # 👑 修复：确保 t 的索引不会越界
-            t_idx = jax.random.randint(p_t, (N, M, 1), 0, cfg.flow_steps)
-            t = sch.t_current[t_idx]
-            x_t = t * eps + (1.0 - t) * a_tar
+            t = sch.t_current[jax.random.randint(p_t, (N, M, 1), 0, cfg.flow_steps)]
+            x_t = t * eps + (1.0 - t) * a_target
 
-            # 使用 broadcast_to 显式对齐 obs
-            obs_b_p = jnp.broadcast_to(obs_f[:, None, :], (N, M, obs_dim))
-            vel = networks.flow_mlp_fwd(p_p, obs_b_p, x_t, self.embed_timestep(t)) * cfg.policy_mlp_output_scale
-            err = jnp.sum((eps - ((x_t - t * vel) + vel)) ** 2 if cfg.output_mode == "u_but_supervise_as_eps" else (
-                                                                                                                               vel - (
-                                                                                                                                   eps - a_tar)) ** 2,
-                          axis=-1)
+            vel = networks.flow_mlp_fwd(p_params, jnp.broadcast_to(obs_flat[:, None, :], (N, M, obs_dim)), x_t,
+                                        self.embed_timestep(t)) * cfg.policy_mlp_output_scale
+            if cfg.output_mode == "u_but_supervise_as_eps":
+                err = jnp.sum((eps - ((x_t - t * vel) + vel)) ** 2, axis=-1)
+            else:
+                err = jnp.sum((vel - (eps - a_target)) ** 2, axis=-1)
 
-            loss = jnp.sum(err * mask) / jnp.maximum(1.0, jnp.sum(mask))
-            return loss, {"p/l": loss, "p/acc": p_acc, "p/rw": jnp.mean((s_idx == 0).astype(jnp.float32))}
+            loss = jnp.sum(err * valid_mask) / jnp.maximum(1.0, jnp.sum(valid_mask))
+            return loss, {
+                "policy_loss": loss,
+                "q_guided/p_accept": p_accept,
+                "q_guided/real_win_ratio": jnp.mean((sampled_indices == 0).astype(jnp.float32))
+            }
 
-        (p_loss, p_met), p_grads = jax.value_and_grad(p_loss_fn, has_aux=True)(self.params.policy)
-        p_upd, new_p_opt = self.opt_policy.update(p_grads, self.opt_state_policy, self.params.policy)
+        (p_loss, p_metrics), p_grads = jax.value_and_grad(policy_loss_fn, has_aux=True)(self.params.policy)
+        p_updates, new_p_opt = self.opt_policy.update(p_grads, self.opt_state_policy, self.params.policy)
 
-        # 6. 状态组装
-        new_params = DGPOFMParams(optax.apply_updates(self.params.policy, p_upd), new_v_p)
-        new_state = jdc.replace(self, params=new_params, opt_state_policy=new_p_opt, opt_state_value=new_v_opt,
-                                log_cql_weight=new_la, steps=self.steps + 1)
+        # 6. 状态组装与返回
+        new_state = jdc.replace(self,
+                                params=DGPOFMParams(optax.apply_updates(self.params.policy, p_updates), new_v_params),
+                                opt_state_policy=new_p_opt,
+                                opt_state_value=new_v_opt,
+                                log_cql_weight=new_la,
+                                steps=self.steps + 1
+                                )
 
-        return new_state, {**{k: v[-1] for k, v in v_met.items()}, **p_met}
+        # 合并所有 metrics (取 scan 循环的最后一步结果)
+        final_metrics = {**{k: v[-1] for k, v in extra_v_metrics.items()}, **p_metrics}
+        return new_state, final_metrics
     
     def _compute_fresh_weights(self, value_params, obs_norm, pool_actions, final_v_loss) -> tuple[
         Array, dict[str, Array]]:
