@@ -25,6 +25,12 @@ class DGPOFMConfig:
     num_generated_actions: jdc.Static[int] = 1  # 👑 现在的 K 固定了，不会再有形状Bug
     num_epsilon_samples: jdc.Static[int] = 8
 
+    # 👑 新增：周期性退火控制
+    use_cyclical_p: jdc.Static[bool] = True  # 开关
+    p_cycles: jdc.Static[int] = 5  # 在整个训练过程中循环几次
+    p_min: float = 0.1  # 周期波谷 (最低接受率)
+    p_max: float = 1.0  # 周期波峰 (最高接受率)
+
     # 👑 新增：假噪声退火控制机制 (模拟退火流)
     start_decay: float = 0.33
     end_decay: float = 0.5
@@ -169,16 +175,26 @@ class DGPOFMState:
         flat_truncation = transitions.truncation.reshape((N, 1))
 
         # ==========================================
-        # 1. 进度条与 p_accept 退火逻辑
+        # 👑 周期性 p_accept 计算逻辑
         # ==========================================
         steps_per_iter = self.config.iterations_per_env * self.config.num_envs
         total_iterations = self.config.num_timesteps // steps_per_iter
         total_updates = total_iterations * self.config.num_updates_per_batch * self.config.num_minibatches
 
+        # 基础进度 (0.0 -> 1.0)
         global_progress = jnp.minimum(1.0, self.steps / jnp.maximum(1.0, total_updates))
-        scaled_progress = jnp.clip(
-            (global_progress - self.config.start_decay) / (self.config.end_decay - self.config.start_decay), 0.0, 1.0)
-        p_accept = 1.0 - scaled_progress
+
+        if self.config.use_cyclical_p:
+            # 余弦周期逻辑
+            # cos(0) = 1 (从 p_max 开始), cos(pi) = -1 (跌到 p_min)
+            cycle_val = jnp.cos(2.0 * jnp.pi * self.config.p_cycles * global_progress)
+            p_accept = self.config.p_min + 0.5 * (self.config.p_max - self.config.p_min) * (1.0 + cycle_val)
+        else:
+            # 原有的线性退火逻辑
+            scaled_progress = jnp.clip(
+                (global_progress - self.config.start_decay) / (self.config.end_decay - self.config.start_decay), 0.0,
+                1.0)
+            p_accept = 1.0 - (1.0 - self.config.fake_accept_p_final) * scaled_progress
 
         # ==========================================
         # 2. 生成 K 个假动作组成 Pool (N, K+1, act_dim)
