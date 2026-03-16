@@ -3,6 +3,7 @@ from __future__ import annotations
 from functools import partial
 from typing import Literal
 
+import dataclasses
 import jax
 import jax_dataclasses as jdc
 import mujoco_playground as mjp
@@ -94,8 +95,8 @@ class DGPOFMParams:
 
 @jdc.pytree_dataclass
 class DGPOFMActionInfo:
-    # 👑 新增：用于在打乱 minibatch 时携带冻结的 GAE Target
-    target_qs: Array = jnp.zeros(())
+    # 👑 使用 default_factory 绕过 Python 的默认值检查
+    target_qs: Array = dataclasses.field(default_factory=lambda: jnp.zeros(()))
 
 
 @jdc.pytree_dataclass
