@@ -28,7 +28,7 @@ class DGPOFMConfig:
     # 👑 新增：周期性退火控制
     use_cyclical_p: jdc.Static[bool] = True  # 开关
     p_cycles: jdc.Static[int] = 5  # 在整个训练过程中循环几次
-    p_min: float = 0.1  # 周期波谷 (最低接受率)
+    p_min: float = 0.0  # 周期波谷 (最低接受率)
     p_max: float = 1.0  # 周期波峰 (最高接受率)
 
     # 👑 新增：假噪声退火控制机制 (模拟退火流)
@@ -175,7 +175,7 @@ class DGPOFMState:
         flat_truncation = transitions.truncation.reshape((N, 1))
 
         # ==========================================
-        # 👑 周期性 p_accept 计算逻辑
+        # 👑 从 0 开始的周期性 p_accept (Warm-up 风格)
         # ==========================================
         steps_per_iter = self.config.iterations_per_env * self.config.num_envs
         total_iterations = self.config.num_timesteps // steps_per_iter
@@ -185,16 +185,15 @@ class DGPOFMState:
         global_progress = jnp.minimum(1.0, self.steps / jnp.maximum(1.0, total_updates))
 
         if self.config.use_cyclical_p:
-            # 余弦周期逻辑
-            # cos(0) = 1 (从 p_max 开始), cos(pi) = -1 (跌到 p_min)
+            # 👑 使用 1 - cos(...)，确保 global_progress=0 时，p_accept = p_min (0)
+            # 频率计算：2 * pi * cycles * progress
             cycle_val = jnp.cos(2.0 * jnp.pi * self.config.p_cycles * global_progress)
-            p_accept = self.config.p_min + 0.5 * (self.config.p_max - self.config.p_min) * (1.0 + cycle_val)
+
+            # 当 cos 为 1 时（起点），结果为 0；当 cos 为 -1 时（半周期），结果为 1
+            p_accept = self.config.p_min + 0.5 * (self.config.p_max - self.config.p_min) * (1.0 - cycle_val)
         else:
-            # 原有的线性退火逻辑
-            scaled_progress = jnp.clip(
-                (global_progress - self.config.start_decay) / (self.config.end_decay - self.config.start_decay), 0.0,
-                1.0)
-            p_accept = 1.0 - (1.0 - self.config.fake_accept_p_final) * scaled_progress
+            # 线性 Warm-up 逻辑 (如果你想选这个)
+            p_accept = jnp.clip(global_progress / self.config.fake_accept_decay_ratio, 0.0, 1.0)
 
         # ==========================================
         # 2. 生成 K 个假动作组成 Pool (N, K+1, act_dim)
