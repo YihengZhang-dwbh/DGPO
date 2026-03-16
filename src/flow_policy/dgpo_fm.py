@@ -415,8 +415,8 @@ class DGPOFMState:
         concat_inputs = jnp.concatenate([obs_norm, actions], axis=-1)
         q_pred, _ = networks.value_mlp_fwd_with_features(value_params, concat_inputs)
 
-        # 👑 唯一的致命修复：干掉最后一维，防止 (N,) 和 (N, 1) 相减变成 (N, N) 导致核爆
-        q_pred = q_pred.reshape(-1)
+        # 👑 终极防御：直接变形为 target_qs 的物理形状 (30, 1024)
+        q_pred = q_pred.reshape(target_qs.shape)
 
         v_error = (target_qs - q_pred) * (1 - truncation)
         mse_loss = jnp.mean(v_error ** 2)
@@ -427,14 +427,13 @@ class DGPOFMState:
         concat_pool = jnp.concatenate([obs_b, pool_actions], axis=-1)
         q_pool_fake, _ = networks.value_mlp_fwd_with_features(value_params, concat_pool)
 
-        # 👑 同样挤掉最后一维，保证 q_pool_fake 是干净的 (N, K+1)
+        # 👑 终极防御：直接变形为标准的 (N, K+1)
         q_pool_fake = q_pool_fake.reshape((N, K_plus_1))
 
         q_real_sg = jax.lax.stop_gradient(q_pool_fake[:, 0:1])
         q_fake = q_pool_fake[:, 1:]
 
         if self.config.use_hinge_cql:
-            # jnp.mean 完美地自动处理了 (N, K) 维度的平均，无须任何额外操作
             cql_penalty = jnp.mean(jax.nn.relu(q_fake - q_real_sg))
         else:
             cql_penalty = jnp.mean(q_fake - q_real_sg)
