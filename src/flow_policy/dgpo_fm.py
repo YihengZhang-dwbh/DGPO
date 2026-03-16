@@ -258,10 +258,8 @@ class DGPOFMState:
         prng_boot, prng_gen, prng_eval = jax.random.split(prng, 3)
 
         concat_inputs = jnp.concatenate([obs_norm, transitions.action], axis=-1)
-        # 第 1 处
         q_pred, h_s = networks.value_mlp_fwd_with_features(self.params.value, concat_inputs)
-        # 强制转为平铺的一维 (N,)，这样 GAE 绝对不会算错
-        q_pred = jax.lax.stop_gradient(q_pred.reshape(-1))
+        q_pred = jax.lax.stop_gradient(q_pred)
 
         bootstrap_obs = transitions.next_obs[-1:, :, :]
         if self.config.normalize_observations:
@@ -279,9 +277,8 @@ class DGPOFMState:
         schedule = self.get_schedule()
         bootstrap_act, _ = jax.lax.scan(boot_step_fn, boot_noise, (schedule.t_current, schedule.t_next))
         bootstrap_concat = jnp.concatenate([bootstrap_obs, bootstrap_act], axis=-1)
-        # 第 2 处
         bootstrap_q, _ = networks.value_mlp_fwd_with_features(self.params.value, bootstrap_concat)
-        bootstrap_q = jax.lax.stop_gradient(bootstrap_q.reshape(-1))
+        bootstrap_q = jax.lax.stop_gradient(bootstrap_q)
 
         gae_qs, _ = jax.lax.stop_gradient(
             rollouts.compute_gae(
@@ -315,9 +312,8 @@ class DGPOFMState:
         obs_pool_b = jnp.broadcast_to(flat_obs[:, None, :], (N, K + 1, obs_dim))
         concat_pool = jnp.concatenate([obs_pool_b, pool_actions], axis=-1)
 
-        # 第 3 处 (这里注意，我们要的是 (N, K+1)，所以 reshape 要保留 K+1)
         q_pool, _ = networks.value_mlp_fwd_with_features(self.params.value, concat_pool)
-        q_pool = jax.lax.stop_gradient(q_pool.reshape((N, K + 1)))
+        q_pool = jax.lax.stop_gradient(q_pool)
 
         alpha = self.config.resampling_alpha_min
         logits = (q_pool - jnp.max(q_pool, axis=-1, keepdims=True)) / alpha
@@ -415,36 +411,49 @@ class DGPOFMState:
             return policy_loss, {"policy_loss": policy_loss}
 
     def _compute_value_loss(self, value_params, obs_norm, actions, truncation, target_qs, pool_actions,
-                            current_cql_weight):
-        # 第 4 处：拟合 MSE 时的 q_pred
+                            current_cql_weight, current_K):  # 👑 注意参数加了 current_K
         concat_inputs = jnp.concatenate([obs_norm, actions], axis=-1)
-        # 第 4 处
         q_pred, _ = networks.value_mlp_fwd_with_features(value_params, concat_inputs)
-        q_pred = q_pred.reshape(-1)  # 强制对齐 target_qs 的一维形状
+
+        # 稳妥起见，顺手防御一下可能的 broadcast 错位
+        q_pred = q_pred.squeeze(-1) if q_pred.ndim > target_qs.ndim else q_pred
+
         v_error = (target_qs - q_pred) * (1 - truncation)
         mse_loss = jnp.mean(v_error ** 2)
 
-        # 第 5 处：计算惩罚时的 q_pool_fake
         N, K_plus_1, act_dim = pool_actions.shape
         flat_obs = obs_norm.reshape((N, obs_norm.shape[-1]))
         obs_b = jnp.broadcast_to(flat_obs[:, None, :], (N, K_plus_1, obs_norm.shape[-1]))
         concat_pool = jnp.concatenate([obs_b, pool_actions], axis=-1)
-
-        # 第 5 处
         q_pool_fake, _ = networks.value_mlp_fwd_with_features(value_params, concat_pool)
-        q_pool_fake = q_pool_fake.reshape((N, K_plus_1))  # 强制对齐 (N, K+1)
 
-        # 后续的切片逻辑就能完美运作了
-        q_real_sg = jax.lax.stop_gradient(q_pool_fake[:, 0:1])  # 取出后依然是 (N, 1)
-        q_fake = q_pool_fake[:, 1:]  # 取出后是 (N, K)
+        q_real_sg = jax.lax.stop_gradient(q_pool_fake[:, 0:1])
+        q_fake = q_pool_fake[:, 1:]
 
+        # 👑 === 核心修复区：动态 Mask 且正确计算 Batch 均值 ===
         if self.config.use_hinge_cql:
-            cql_penalty = jnp.mean(jax.nn.relu(q_fake - q_real_sg))
+            penalty_raw = jax.nn.relu(q_fake - q_real_sg)
         else:
-            cql_penalty = jnp.mean(q_fake - q_real_sg)
+            penalty_raw = q_fake - q_real_sg
+
+        # 1. 创建 Mask：只选当前解锁的假动作
+        K_max = q_fake.shape[1]
+        active_mask = jnp.arange(K_max) < current_K
+
+        # 2. 对齐维度并施加 Mask (防御 (N,K) 和 (N,K,1) 两种情况)
+        if penalty_raw.ndim == 3:
+            masked_penalty = penalty_raw * active_mask[None, :, None]
+        else:
+            masked_penalty = penalty_raw * active_mask[None, :]
+
+        # 3. 🚨 真正的无偏均值：总和 / (Batch_Size * 有效假动作数)
+        # 这就完美等价于你原版的 jnp.mean()，绝不会再发生上万倍的数值爆炸
+        valid_count = N * jnp.maximum(1.0, jnp.sum(active_mask))
+        cql_penalty = jnp.sum(masked_penalty) / valid_count
+        # =========================================================
 
         total_v_loss = (
-                                   mse_loss + current_cql_weight * cql_penalty) * self.config.value_loss_coeff * self.config.w_v_loss
+                               mse_loss + current_cql_weight * cql_penalty) * self.config.value_loss_coeff * self.config.w_v_loss
         return total_v_loss, cql_penalty
 
     def get_schedule(self) -> FlowSchedule:
