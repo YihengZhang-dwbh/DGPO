@@ -18,6 +18,7 @@ from . import math_utils, networks, rollouts
 @jdc.pytree_dataclass
 class DGPOFMConfig:
     # --- 全新 Q-Guided 生成控制核心 ---
+    independent_noise_sampling: jdc.Static[bool] = False  # 👑 新增：是否让 8 个噪声独立竞争
     resampling_alpha_k: float = 0.1
     resampling_alpha_min: float = 0.3
     use_dynamic_alpha: jdc.Static[bool] = False
@@ -364,28 +365,48 @@ class DGPOFMState:
         flat_obs = obs_norm.reshape((N, obs_norm.shape[-1]))
 
         if self.config.use_hard_resampling:
-            M = self.config.num_epsilon_samples
             prng_idx, prng_eps, prng_t, prng_accept = jax.random.split(prng, 4)
-
-            # 👑 1. 恢复昨天的高上限模式：只抛 1 次骰子，选出唯一的 Target Action
             logits = jnp.log(weights_pool + 1e-8)
-            sampled_indices = jax.random.categorical(prng_idx, logits, axis=-1)  # (N,)
-            sampled_actions = actions_pool[jnp.arange(N), sampled_indices]  # (N, act_dim)
 
-            # 👑 2. FPO 对齐：把这 1 个动作广播给 8 个噪声 (保证 Flow 学习的一致性)
-            a_target = jnp.broadcast_to(sampled_actions[:, None, :], (N, M, act_dim))
+            if self.config.independent_noise_sampling:
+                # ==========================================
+                # 👑 模式 A：独立采样 (8 个噪声分别竞争)
+                # ==========================================
+                # 将概率分布广播到 (N, M, K+1)
+                logits_b = jnp.broadcast_to(logits[:, None, :], (N, M, K_plus_1))
+                # 采样得到 (N, M) 的索引
+                sampled_indices = jax.random.categorical(prng_idx, logits_b, axis=-1)
 
-            # 👑 3. 组级退火拒绝 (Group-level Rejection)
-            rand_vals = jax.random.uniform(prng_accept, (N,))  # 每个 State 只抛 1 次审判骰子
-            is_real = (sampled_indices == 0)
-            is_fake_accepted = (sampled_indices > 0) & (rand_vals < p_accept)
+                # 取出对应的动作 (N, M, act_dim)
+                a_target = jnp.take_along_axis(
+                    actions_pool[:, None, :, :],
+                    sampled_indices[:, :, None, None],
+                    axis=2
+                ).squeeze(2)
 
-            # 这个 valid_mask 现在是 (N,) 维度的，代表这个 State 下的 8 个噪声是全要还是全扔
-            valid_mask = (is_real | is_fake_accepted).astype(jnp.float32)
-            # 广播到 (N, M) 以便和 error_sq 对齐
-            valid_mask_b = jnp.broadcast_to(valid_mask[:, None], (N, M))
+                # 退火拒绝逻辑 (逐个噪声判定)
+                rand_vals = jax.random.uniform(prng_accept, (N, M))
+                is_real = (sampled_indices == 0)
+                is_fake_accepted = (sampled_indices > 0) & (rand_vals < p_accept)
+                valid_mask = (is_real | is_fake_accepted).astype(jnp.float32)  # (N, M)
 
-            # 4. 常规的轨迹构造与前向传播
+            else:
+                # ==========================================
+                # 👑 模式 B：一发入魂 (代码 4 的稳定模式)
+                # ==========================================
+                sampled_indices = jax.random.categorical(prng_idx, logits, axis=-1)  # (N,)
+                sampled_actions = actions_pool[jnp.arange(N), sampled_indices]
+                a_target = jnp.broadcast_to(sampled_actions[:, None, :], (N, M, act_dim))
+
+                # 组级退火拒绝 (一个状态 8 个噪声共生死)
+                rand_vals = jax.random.uniform(prng_accept, (N,))
+                is_real = (sampled_indices == 0)
+                is_fake_accepted = (sampled_indices > 0) & (rand_vals < p_accept)
+
+                valid_mask_single = (is_real | is_fake_accepted).astype(jnp.float32)
+                valid_mask = jnp.broadcast_to(valid_mask_single[:, None], (N, M))
+
+            # --- 公共计算部分 ---
             eps = jax.random.normal(prng_eps, (N, M, act_dim))
             t_idx = jax.random.randint(prng_t, (N, M, 1), 0, self.config.flow_steps)
             t = self.get_schedule().t_current[t_idx]
@@ -402,14 +423,14 @@ class DGPOFMState:
             else:
                 error_sq = jnp.sum((vel_pred - (eps - a_target)) ** 2, axis=-1)
 
-            # 👑 5. 组级静音：要么 8 个一起训，要么 8 个一起丢！
-            masked_error = error_sq * valid_mask_b
-            policy_loss = jnp.sum(masked_error) / jnp.maximum(1.0, jnp.sum(valid_mask_b))
+            # 应用静音掩码
+            masked_error = error_sq * valid_mask
+            policy_loss = jnp.sum(masked_error) / jnp.maximum(1.0, jnp.sum(valid_mask))
 
             p_metrics = {
                 "policy_loss": policy_loss,
                 "q_guided/p_accept": p_accept,
-                "q_guided/valid_noise_ratio": jnp.mean(valid_mask),  # 注意这里用一维的算比例最准
+                "q_guided/valid_noise_ratio": jnp.mean(valid_mask),
                 "q_guided/real_win_ratio": jnp.mean(is_real.astype(jnp.float32))
             }
             return policy_loss, p_metrics
