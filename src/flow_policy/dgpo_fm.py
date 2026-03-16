@@ -94,7 +94,8 @@ class DGPOFMParams:
 
 @jdc.pytree_dataclass
 class DGPOFMActionInfo:
-    pass
+    # 👑 新增：用于在打乱 minibatch 时携带冻结的 GAE Target
+    target_qs: Array = jnp.zeros(())
 
 
 @jdc.pytree_dataclass
@@ -144,44 +145,68 @@ class DGPOFMState:
         )
 
     def _step_minibatch(self, transitions: DGPOFMTransition, prng: Array) -> tuple[DGPOFMState, dict[str, Array]]:
-        prng_targets, prng_policy = jax.random.split(prng, 2)
+        prng_gen, prng_policy = jax.random.split(prng, 2)
         obs_norm = (
                                transitions.obs - self.obs_stats.mean) / self.obs_stats.std if self.config.normalize_observations else transitions.obs
 
+        # 👑 直接获取已经被框架打乱切片好的静态 Target！
+        target_qs_raw = transitions.info.target_qs
+
+        # 无论 batch_dims 是一维还是多维，我们统一拉平到 N
+        batch_dims = obs_norm.shape[:-1]
+        import math
+        N = math.prod(batch_dims)
+        obs_dim = self.env.observation_size
+        act_dim = self.env.action_size
+
+        target_qs = target_qs_raw.reshape((N, 1))
+        flat_obs = obs_norm.reshape((N, obs_dim))
+        flat_acts_real = transitions.action.reshape((N, 1, act_dim))
+
         # ==========================================
-        # 👑 1. 绝对精准的全局进度时钟
+        # 1. 进度条与 p_accept 退火逻辑 (完美保留)
         # ==========================================
         steps_per_iter = self.config.iterations_per_env * self.config.num_envs
         total_iterations = self.config.num_timesteps // steps_per_iter
         total_updates = total_iterations * self.config.num_updates_per_batch * self.config.num_minibatches
 
-        # 计算当前的全局绝对进度 (0.0 到 1.0)
         global_progress = jnp.minimum(1.0, self.steps / jnp.maximum(1.0, total_updates))
-
-        # ==========================================
-        # 👑 2. 延迟退火逻辑 (Delayed Annealing)
-        # ==========================================
-        # 设定：前 40% 保持 p=1 (冲刺极高上限)，40%~80% 平滑降到 0，最后 20% 保持 p=0 (纯净防崩)
         start_decay = self.config.start_decay
         end_decay = self.config.end_decay
-
-        # 将进度映射到衰减区间：
-        # < 0.4 时，scaled_progress 为 0.0
-        # > 0.8 时，scaled_progress 为 1.0
         scaled_progress = jnp.clip((global_progress - start_decay) / (end_decay - start_decay), 0.0, 1.0)
-
-        # 算出最终的假噪声接受率
         p_accept = 1.0 - scaled_progress
 
-        pool_actions, pool_weights, target_qs, metrics = self._compute_targets(transitions, obs_norm, prng_targets)
+        # ==========================================
+        # 2. 生成 K 个假动作组成 Pool
+        # ==========================================
+        K = self.config.num_generated_actions
+        x_t = jax.random.normal(prng_gen, (N, K, act_dim))
+        obs_b = jnp.broadcast_to(flat_obs[:, None, :], (N, K, obs_dim))
+        schedule = self.get_schedule()
 
+        def gen_step_fn(x, t_tuple):
+            t_curr, t_next = t_tuple
+            t_embed_raw = self.embed_timestep(jnp.array([t_curr])[..., None])
+            t_embed = jnp.broadcast_to(t_embed_raw[:, None, :], (N, K, self.config.timestep_embed_dim))
+            p_params = jax.lax.stop_gradient(self.params.policy)
+            vel = networks.flow_mlp_fwd(p_params, obs_b, x, t_embed) * self.config.policy_mlp_output_scale
+            return x + (t_next - t_curr) * vel, None
+
+        generated_acts, _ = jax.lax.scan(gen_step_fn, x_t, (schedule.t_current, schedule.t_next))
+        pool_actions = jnp.concatenate([flat_acts_real, generated_acts], axis=1)  # (N, K+1, act_dim)
+
+        metrics = dict[str, Array]()
         q_update_steps = self.config.loop_v
 
+        # ==========================================
+        # 3. Q 网络多步更新循环 (CQL 保护)
+        # ==========================================
         def value_inner_step(carry, _):
             v_params, v_opt_state, current_log_alpha = carry
             current_alpha = jax.lax.stop_gradient(jnp.exp(current_log_alpha))
 
             def v_loss_fn(v_p):
+                # 这里的 target_qs 是极其稳定的冷冻常数
                 total_loss, penalty = self._compute_value_loss(
                     v_p, obs_norm, transitions.action, transitions.truncation, target_qs, pool_actions, current_alpha
                 )
@@ -204,21 +229,24 @@ class DGPOFMState:
                                                                        "v_loss/current_cql_weight": jnp.exp(
                                                                            next_log_alpha)}
 
-        (new_value_params, new_opt_state_value, new_log_alpha), extra_v_metrics = jax.lax.scan(value_inner_step,
-                                                                                               (self.params.value,
-                                                                                                self.opt_state_value,
-                                                                                                self.log_cql_weight),
-                                                                                               None,
-                                                                                               length=q_update_steps)
+        (new_value_params, new_opt_state_value, new_log_alpha), extra_v_metrics = jax.lax.scan(
+            value_inner_step, (self.params.value, self.opt_state_value, self.log_cql_weight), None,
+            length=q_update_steps)
+
         for k, v in extra_v_metrics.items(): metrics[k] = v[-1]
 
+        # ==========================================
+        # 4. 用更新好的 Q 网络计算最新鲜的权重
+        # ==========================================
         final_v_loss = extra_v_metrics["v_loss/total"][-1]
         fresh_pool_weights, q_metrics = self._compute_fresh_weights(new_value_params, obs_norm, pool_actions,
                                                                     final_v_loss)
         metrics.update(q_metrics)
 
+        # ==========================================
+        # 5. 策略网络更新 (FPO 降方差 + 组级退火拒绝)
+        # ==========================================
         def policy_loss_fn(p_params):
-            # 👑 传递 p_accept 给策略计算
             return self._compute_policy_loss(p_params, obs_norm, pool_actions, fresh_pool_weights, prng_policy,
                                              p_accept)
 
@@ -229,8 +257,12 @@ class DGPOFMState:
 
         new_params = DGPOFMParams(policy=new_policy_params, value=new_value_params)
         with jdc.copy_and_mutate(self) as state:
-            state.params, state.opt_state_policy, state.opt_state_value, state.log_cql_weight = new_params, new_opt_state_policy, new_opt_state_value, new_log_alpha
+            state.params = new_params
+            state.opt_state_policy = new_opt_state_policy
+            state.opt_state_value = new_opt_state_value
+            state.log_cql_weight = new_log_alpha
             state.steps += 1
+
         return state, metrics
 
     def _compute_fresh_weights(self, value_params, obs_norm, pool_actions, final_v_loss) -> tuple[
@@ -486,14 +518,73 @@ class DGPOFMState:
         if config.normalize_observations:
             with jdc.copy_and_mutate(state) as state:
                 state.obs_stats = state.obs_stats.update(transitions.obs)
-        del self
 
+        # =====================================================================
+        # 👑 绝对核心修复：在进入 minibatch 打乱前，一口气算完所有 GAE Target！
+        # =====================================================================
+        # 此时的 obs 还是完整的时序结构 (unroll_length, num_envs, obs_dim)
+        obs_norm = (
+                               transitions.obs - state.obs_stats.mean) / state.obs_stats.std if config.normalize_observations else transitions.obs
+        concat_inputs = jnp.concatenate([obs_norm, transitions.action], axis=-1)
+
+        # 1. 用当前的冷冻 Q 网络评估整条轨迹
+        q_pred, _ = networks.value_mlp_fwd_with_features(state.params.value, concat_inputs)
+        q_pred = jax.lax.stop_gradient(q_pred)
+
+        # 2. 计算 Bootstrap Value (最后一步的 Q 值)
+        bootstrap_obs = transitions.next_obs[-1:, :, :]
+        if config.normalize_observations:
+            bootstrap_obs = (bootstrap_obs - state.obs_stats.mean) / state.obs_stats.std
+
+        # 为 bootstrap_obs 快速生成动作
+        prng_boot = jax.random.fold_in(state.prng, state.steps)
+        B_env = bootstrap_obs.shape[1]
+
+        def boot_step_fn(x, t_tuple):
+            t_curr, t_next = t_tuple
+            t_embed_raw = state.embed_timestep(jnp.array([t_curr])[..., None])
+            t_embed = jnp.broadcast_to(t_embed_raw[:, None, :], (1, B_env, config.timestep_embed_dim))
+            vel = networks.flow_mlp_fwd(state.params.policy, bootstrap_obs, x, t_embed) * config.policy_mlp_output_scale
+            return x + (t_next - t_curr) * vel, None
+
+        boot_noise = jax.random.normal(prng_boot, (1, B_env, state.env.action_size))
+        schedule = state.get_schedule()
+        bootstrap_act, _ = jax.lax.scan(boot_step_fn, boot_noise, (schedule.t_current, schedule.t_next))
+
+        bootstrap_concat = jnp.concatenate([bootstrap_obs, bootstrap_act], axis=-1)
+        bootstrap_q, _ = networks.value_mlp_fwd_with_features(state.params.value, bootstrap_concat)
+        bootstrap_q = jax.lax.stop_gradient(bootstrap_q)
+
+        # 3. 计算出绝对静态的 GAE Target！
+        target_qs, _ = jax.lax.stop_gradient(
+            rollouts.compute_gae(
+                truncation=transitions.truncation,
+                discount=transitions.discount * config.discounting,
+                rewards=transitions.reward * config.reward_scaling,
+                values=q_pred,
+                bootstrap_value=bootstrap_q,
+                gae_lambda=config.gae_lambda,
+            )
+        )
+
+        # 👑 4. 移花接木：把算好的 target_qs 塞回 info，让 prepare_minibatches 帮我们自动打乱对齐
+        with jdc.copy_and_mutate(transitions.info) as new_info:
+            new_info.target_qs = target_qs
+        with jdc.copy_and_mutate(transitions) as new_transitions:
+            new_transitions.info = new_info
+
+        del self  # 释放旧引用
+
+        # =====================================================================
+        # 开始毫无后顾之忧的 Minibatch 循环
+        # =====================================================================
         def step_batch(state: DGPOFMState, _):
             step_prng = jax.random.fold_in(state.prng, state.steps)
             state, metrics = jax.lax.scan(
                 partial(DGPOFMState._step_minibatch, prng=jax.random.fold_in(step_prng, 0)),
                 init=state,
-                xs=transitions.prepare_minibatches(step_prng, config.num_minibatches, config.batch_size),
+                # 注意这里传入的是带上了 target_qs 的 new_transitions
+                xs=new_transitions.prepare_minibatches(step_prng, config.num_minibatches, config.batch_size),
             )
             return state, metrics
 
