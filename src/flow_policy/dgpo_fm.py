@@ -162,8 +162,8 @@ class DGPOFMState:
         # 👑 2. 延迟退火逻辑 (Delayed Annealing)
         # ==========================================
         # 设定：前 40% 保持 p=1 (冲刺极高上限)，40%~80% 平滑降到 0，最后 20% 保持 p=0 (纯净防崩)
-        start_decay = 0.4
-        end_decay = 0.8
+        start_decay = self.config.start_decay
+        end_decay = self.config.end_decay
 
         # 将进度映射到衰减区间：
         # < 0.4 时，scaled_progress 为 0.0
