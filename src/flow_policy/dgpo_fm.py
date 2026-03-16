@@ -569,13 +569,13 @@ class DGPOFMState:
         )
 
         # =====================================================================
-        # 👑 绕过形状检查的 PyTree 替换
+        # 👑 使用 jdc.replace 替代对象自带的 .replace()
         # =====================================================================
-        # 1. 强制直接覆盖 target_qs，不管它原来是什么形状
-        new_action_info = transitions.action_info.replace(target_qs=target_qs)
+        # 1. 直接用装饰器库提供的静态方法来替换属性，这不受类定义的限制
+        new_action_info = jdc.replace(transitions.action_info, target_qs=target_qs)
 
-        # 2. 整体替换 transitions 里的 action_info
-        new_transitions = transitions.replace(action_info=new_action_info)
+        # 2. 同样的方法替换 transitions 里的字段
+        new_transitions = jdc.replace(transitions, action_info=new_action_info)
 
         del self  # 释放旧引用
 
