@@ -180,8 +180,15 @@ class DGPOFMState:
             p_accept = cfg.p_min + 0.5 * (cfg.p_max - cfg.p_min) * (1.0 - cycle_val)
 
         # 3. 动作池生成 (大池子: K可以放心设为 3, 7, 15 等)
+        # 3. 动作池生成 (K=8，但我们让它坐火箭)
         K = cfg.num_generated_actions
         obs_b_gen = jnp.broadcast_to(obs_flat[:, None, :], (N, K, obs_dim))
+
+        # 👑 性能黑客：单独定义一个只有 3 步（甚至 2 步）的粗糙时间表
+        # 这会让 K=8 的生成速度直接飙升 3 倍以上！
+        fast_flow_steps = 3
+        fast_full_t = jnp.linspace(1.0, 0.0, fast_flow_steps + 1)
+        fast_t_current, fast_t_next = fast_full_t[:-1], fast_full_t[1:]
 
         def gen_step(x, t_tup):
             t_curr, t_next = t_tup
@@ -191,7 +198,9 @@ class DGPOFMState:
                                         t_embed) * cfg.policy_mlp_output_scale
             return x + (t_next - t_curr) * vel, None
 
-        gen_acts, _ = jax.lax.scan(gen_step, jax.random.normal(prng_gen, (N, K, act_dim)), (sch.t_current, sch.t_next))
+        # 用快速时间表进行生成
+        gen_acts, _ = jax.lax.scan(gen_step, jax.random.normal(prng_gen, (N, K, act_dim)),
+                                   (fast_t_current, fast_t_next))
         pool_actions = jnp.concatenate([transitions.action.reshape((N, 1, act_dim)), gen_acts], axis=1)
 
         # 4. Q 网络更新 (Critic 对大池子进行全局打分)
@@ -311,7 +320,7 @@ class DGPOFMState:
                                 )
         final_metrics = {**{k: v[-1] for k, v in extra_v_metrics.items()}, **p_metrics}
         return new_state, final_metrics
-    
+
     def _compute_fresh_weights(self, value_params, obs_norm, pool_actions, final_v_loss) -> tuple[
         Array, dict[str, Array]]:
         N, K_plus_1, act_dim = pool_actions.shape
