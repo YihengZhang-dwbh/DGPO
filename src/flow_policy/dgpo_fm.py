@@ -150,8 +150,8 @@ class DGPOFMState:
         obs_norm = (
                                transitions.obs - self.obs_stats.mean) / self.obs_stats.std if self.config.normalize_observations else transitions.obs
 
-        # 👑 直接获取已经被框架打乱切片好的静态 Target！
-        target_qs_raw = transitions.info.target_qs
+        # 👑 从 action_info 中提取被框架打乱切片好的静态 Target
+        target_qs_raw = transitions.action_info.target_qs
 
         # 无论 batch_dims 是一维还是多维，我们统一拉平到 N
         batch_dims = obs_norm.shape[:-1]
@@ -568,11 +568,11 @@ class DGPOFMState:
             )
         )
 
-        # 👑 4. 移花接木：把算好的 target_qs 塞回 info，让 prepare_minibatches 帮我们自动打乱对齐
-        with jdc.copy_and_mutate(transitions.info) as new_info:
-            new_info.target_qs = target_qs
+        # 👑 移花接木：把算好的 target_qs 塞进 action_info 字段
+        with jdc.copy_and_mutate(transitions.action_info) as new_action_info:
+            new_action_info.target_qs = target_qs
         with jdc.copy_and_mutate(transitions) as new_transitions:
-            new_transitions.info = new_info
+            new_transitions.action_info = new_action_info
 
         del self  # 释放旧引用
 
