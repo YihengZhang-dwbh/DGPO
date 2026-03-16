@@ -164,7 +164,7 @@ class DGPOFMState:
             (N, obs_dim))
         target_qs = transitions.action_info.target_qs.reshape((N, 1))
 
-        # 2. p_accept 计算 (恢复人话变量名)
+        # 2. p_accept 计算 (Cyclical/Linear/Fixed)
         total_updates = (cfg.num_timesteps // (
                     cfg.iterations_per_env * cfg.num_envs)) * cfg.num_updates_per_batch * cfg.num_minibatches
         progress = jnp.minimum(1.0, self.steps / jnp.maximum(1.0, total_updates))
@@ -173,7 +173,7 @@ class DGPOFMState:
             p_accept = cfg.p_fixed_val
         elif cfg.p_accept_mode == "linear":
             p_accept = cfg.p_min + progress * (cfg.p_max - cfg.p_min)
-        else:  # cyclical
+        else:  # cyclical: start from 0
             cycle_val = jnp.cos(2.0 * jnp.pi * cfg.p_cycles * progress)
             p_accept = cfg.p_min + 0.5 * (cfg.p_max - cfg.p_min) * (1.0 - cycle_val)
 
@@ -182,16 +182,17 @@ class DGPOFMState:
 
         def gen_step(x, t_tup):
             t_curr, t_next = t_tup
-            t_emb = jnp.broadcast_to(self.embed_timestep(jnp.array([[t_curr]])), (N, K, t_dim))
+            # 👑 修正拼写错误：统一使用 t_embed
+            t_embed = jnp.broadcast_to(self.embed_timestep(jnp.array([[t_curr]])), (N, K, t_dim))
             vel = networks.flow_mlp_fwd(jax.lax.stop_gradient(self.params.policy), obs_flat[:, None, :], x,
                                         t_embed) * cfg.policy_mlp_output_scale
             return x + (t_next - t_curr) * vel, None
 
-        # 👑 修正：gen_acts 取第一个返回值
+        # gen_acts 取第一个返回值 (final carry)
         gen_acts, _ = jax.lax.scan(gen_step, jax.random.normal(prng_gen, (N, K, act_dim)), (sch.t_current, sch.t_next))
         pool_actions = jnp.concatenate([transitions.action.reshape((N, 1, act_dim)), gen_acts], axis=1)
 
-        # 4. Q 网络多步更新 (恢复完整指标名)
+        # 4. Q 网络多步更新
         def value_inner_step(carry, _):
             v_p, v_opt, log_a = carry
             alpha = jax.lax.stop_gradient(jnp.exp(log_a))
@@ -223,7 +224,7 @@ class DGPOFMState:
                                                                                                    self.log_cql_weight),
                                                                                 None, length=cfg.loop_v)
 
-        # 5. 策略更新 (恢复完整指标名)
+        # 5. 策略更新 (含 Independent/Group 采样)
         probs, _ = self._compute_fresh_weights(new_v_params, obs_flat, pool_actions,
                                                extra_v_metrics["v_loss/total"][-1])
 
@@ -239,7 +240,7 @@ class DGPOFMState:
                                                axis=2).squeeze(2)
                 rand_vals = jax.random.uniform(p_acc, (N, M))
             else:
-                sampled_indices = jax.random.categorical(p_idx, logits, axis=-1)[:, None]
+                sampled_indices = jax.random.categorical(p_idx, logits, axis=-1)[:, None]  # (N, 1)
                 a_target = jnp.broadcast_to(pool_actions[jnp.arange(N), sampled_indices[:, 0]][:, None, :],
                                             (N, M, act_dim))
                 rand_vals = jnp.broadcast_to(jax.random.uniform(p_acc, (N, 1)), (N, M))
@@ -247,17 +248,22 @@ class DGPOFMState:
             valid_mask = ((sampled_indices == 0) | ((sampled_indices > 0) & (rand_vals < p_accept))).astype(jnp.float32)
 
             eps = jax.random.normal(p_eps, (N, M, act_dim))
-            t = sch.t_current[jax.random.randint(p_t, (N, M, 1), 0, cfg.flow_steps)]
+            t_idx = jax.random.randint(p_t, (N, M, 1), 0, cfg.flow_steps)
+            t = sch.t_current[t_idx]
             x_t = t * eps + (1.0 - t) * a_target
 
+            # 这里的 t_embed 已经和 gen_step 对齐名称
+            t_embed = self.embed_timestep(t)
             vel = networks.flow_mlp_fwd(p_params, jnp.broadcast_to(obs_flat[:, None, :], (N, M, obs_dim)), x_t,
-                                        self.embed_timestep(t)) * cfg.policy_mlp_output_scale
+                                        t_embed) * cfg.policy_mlp_output_scale
+
             if cfg.output_mode == "u_but_supervise_as_eps":
                 err = jnp.sum((eps - ((x_t - t * vel) + vel)) ** 2, axis=-1)
             else:
                 err = jnp.sum((vel - (eps - a_target)) ** 2, axis=-1)
 
-            loss = jnp.sum(err * valid_mask) / jnp.maximum(1.0, jnp.sum(valid_mask))
+            loss = jnp.sum(err * mask) / jnp.maximum(1.0, jnp.sum(mask)) if cfg.use_hard_resampling else jnp.mean(
+                err)  # 兜底逻辑
             return loss, {
                 "policy_loss": loss,
                 "q_guided/p_accept": p_accept,
@@ -267,7 +273,7 @@ class DGPOFMState:
         (p_loss, p_metrics), p_grads = jax.value_and_grad(policy_loss_fn, has_aux=True)(self.params.policy)
         p_updates, new_p_opt = self.opt_policy.update(p_grads, self.opt_state_policy, self.params.policy)
 
-        # 6. 状态组装与返回
+        # 6. 状态组装
         new_state = jdc.replace(self,
                                 params=DGPOFMParams(optax.apply_updates(self.params.policy, p_updates), new_v_params),
                                 opt_state_policy=new_p_opt,
@@ -276,7 +282,6 @@ class DGPOFMState:
                                 steps=self.steps + 1
                                 )
 
-        # 合并所有 metrics (取 scan 循环的最后一步结果)
         final_metrics = {**{k: v[-1] for k, v in extra_v_metrics.items()}, **p_metrics}
         return new_state, final_metrics
     
