@@ -331,38 +331,34 @@ class DGPOFMState:
         flat_obs = obs_norm.reshape((N, obs_norm.shape[-1]))
 
         if self.config.use_hard_resampling:
-            # 👑 分配 4 个独立的随机数生成器
+            M = self.config.num_epsilon_samples
             prng_idx, prng_eps, prng_t, prng_accept = jax.random.split(prng, 4)
 
-            # 1. 独立 M 次采样：让 8 个噪声去认领赢家
+            # 👑 1. 恢复昨天的高上限模式：只抛 1 次骰子，选出唯一的 Target Action
             logits = jnp.log(weights_pool + 1e-8)
-            logits_b = jnp.broadcast_to(logits[:, None, :], (N, M, K_plus_1))
-            # sampled_indices 是 (N, M)，值为 0 则是真动作，>0 则是假动作
-            sampled_indices = jax.random.categorical(prng_idx, logits_b, axis=-1)
+            sampled_indices = jax.random.categorical(prng_idx, logits, axis=-1)  # (N,)
+            sampled_actions = actions_pool[jnp.arange(N), sampled_indices]  # (N, act_dim)
 
-            # 取出这 M 个被选中的动作 (N, M, act_dim)
-            sampled_actions = jnp.take_along_axis(
-                actions_pool[:, None, :, :],
-                sampled_indices[:, :, None, None],
-                axis=2
-            ).squeeze(2)
+            # 👑 2. FPO 对齐：把这 1 个动作广播给 8 个噪声 (保证 Flow 学习的一致性)
+            a_target = jnp.broadcast_to(sampled_actions[:, None, :], (N, M, act_dim))
 
-            # 👑 2. 退火拒绝掩码机制 (模拟退火核心)
-            rand_vals = jax.random.uniform(prng_accept, (N, M))
+            # 👑 3. 组级退火拒绝 (Group-level Rejection)
+            rand_vals = jax.random.uniform(prng_accept, (N,))  # 每个 State 只抛 1 次审判骰子
             is_real = (sampled_indices == 0)
-            # 如果是假动作，只有当骰子小于 p_accept 时才被接受
             is_fake_accepted = (sampled_indices > 0) & (rand_vals < p_accept)
 
-            # 合并掩码，得到最终有效参与训练的标志 (N, M)
+            # 这个 valid_mask 现在是 (N,) 维度的，代表这个 State 下的 8 个噪声是全要还是全扔
             valid_mask = (is_real | is_fake_accepted).astype(jnp.float32)
+            # 广播到 (N, M) 以便和 error_sq 对齐
+            valid_mask_b = jnp.broadcast_to(valid_mask[:, None], (N, M))
 
-            # 3. ODE 轨迹构造
+            # 4. 常规的轨迹构造与前向传播
             eps = jax.random.normal(prng_eps, (N, M, act_dim))
             t_idx = jax.random.randint(prng_t, (N, M, 1), 0, self.config.flow_steps)
             t = self.get_schedule().t_current[t_idx]
 
             obs_b = jnp.broadcast_to(flat_obs[:, None, :], (N, M, flat_obs.shape[-1]))
-            x_t = t * eps + (1.0 - t) * sampled_actions
+            x_t = t * eps + (1.0 - t) * a_target
             t_embed = self.embed_timestep(t)
 
             vel_pred = networks.flow_mlp_fwd(policy_params, obs_b, x_t, t_embed) * self.config.policy_mlp_output_scale
@@ -371,19 +367,16 @@ class DGPOFMState:
                 x1_pred = (x_t - t * vel_pred) + vel_pred
                 error_sq = jnp.sum((eps - x1_pred) ** 2, axis=-1)
             else:
-                error_sq = jnp.sum((vel_pred - (eps - sampled_actions)) ** 2, axis=-1)
+                error_sq = jnp.sum((vel_pred - (eps - a_target)) ** 2, axis=-1)
 
-            # 👑 4. 应用静音掩码：直接屏蔽掉“被拒接的假噪声”的误差反馈
-            masked_error = error_sq * valid_mask
+            # 👑 5. 组级静音：要么 8 个一起训，要么 8 个一起丢！
+            masked_error = error_sq * valid_mask_b
+            policy_loss = jnp.sum(masked_error) / jnp.maximum(1.0, jnp.sum(valid_mask_b))
 
-            # 保证分母最小为 1，防止除以 0 导致 Nan
-            policy_loss = jnp.sum(masked_error) / jnp.maximum(1.0, jnp.sum(valid_mask))
-
-            # 追加监控指标：可以看到实时退火状态和真实采样利用率
             p_metrics = {
                 "policy_loss": policy_loss,
                 "q_guided/p_accept": p_accept,
-                "q_guided/valid_noise_ratio": jnp.mean(valid_mask),
+                "q_guided/valid_noise_ratio": jnp.mean(valid_mask),  # 注意这里用一维的算比例最准
                 "q_guided/real_win_ratio": jnp.mean(is_real.astype(jnp.float32))
             }
             return policy_loss, p_metrics
