@@ -24,6 +24,8 @@ class DGPOFMConfig:
     num_epsilon_samples: jdc.Static[int] = 8
 
     # 👑 新增：假噪声退火控制机制 (模拟退火流)
+    start_decay: float = 0.33
+    end_decay: float = 0.5
     fake_accept_p_init: float = 1.0  # 训练初期的假噪声接受率
     fake_accept_p_final: float = 0.1  # 训练后期的假噪声接受率
     fake_accept_decay_ratio: float = 0.8  # 在 80% 进度时衰减到 final 值
@@ -147,24 +149,29 @@ class DGPOFMState:
                                transitions.obs - self.obs_stats.mean) / self.obs_stats.std if self.config.normalize_observations else transitions.obs
 
         # ==========================================
-        # 👑 计算假噪声的退火接受概率 (P_accept)
+        # 👑 1. 绝对精准的全局进度时钟
         # ==========================================
-        # 👑 重新对齐进度条逻辑
-        # 每一个完整的 Iteration 对应的 steps 增量是 num_minibatches * num_updates_per_batch
-        updates_per_iteration = self.config.num_minibatches * self.config.num_updates_per_batch
+        steps_per_iter = self.config.iterations_per_env * self.config.num_envs
+        total_iterations = self.config.num_timesteps // steps_per_iter
+        total_updates = total_iterations * self.config.num_updates_per_batch * self.config.num_minibatches
 
-        # 总的更新步数
-        total_steps_per_env = self.config.num_timesteps // self.config.num_envs
-        total_iterations = total_steps_per_env // self.config.unroll_length
-        total_expected_updates = total_iterations * updates_per_iteration
+        # 计算当前的全局绝对进度 (0.0 到 1.0)
+        global_progress = jnp.minimum(1.0, self.steps / jnp.maximum(1.0, total_updates))
 
-        # 算出进度 (0.0 ~ 1.0)
-        # decay_ratio 建议设为 0.8，即前 80% 的更新步数里进行退火
-        progress = jnp.minimum(1.0, self.steps / (total_expected_updates * self.config.fake_accept_decay_ratio))
+        # ==========================================
+        # 👑 2. 延迟退火逻辑 (Delayed Annealing)
+        # ==========================================
+        # 设定：前 40% 保持 p=1 (冲刺极高上限)，40%~80% 平滑降到 0，最后 20% 保持 p=0 (纯净防崩)
+        start_decay = 0.4
+        end_decay = 0.8
 
-        p_accept = self.config.fake_accept_p_init - progress * (
-                    self.config.fake_accept_p_init - self.config.fake_accept_p_final)
-        p_accept = jnp.maximum(self.config.fake_accept_p_final, p_accept)
+        # 将进度映射到衰减区间：
+        # < 0.4 时，scaled_progress 为 0.0
+        # > 0.8 时，scaled_progress 为 1.0
+        scaled_progress = jnp.clip((global_progress - start_decay) / (end_decay - start_decay), 0.0, 1.0)
+
+        # 算出最终的假噪声接受率
+        p_accept = 1.0 - scaled_progress
 
         pool_actions, pool_weights, target_qs, metrics = self._compute_targets(transitions, obs_norm, prng_targets)
 
