@@ -258,8 +258,9 @@ class DGPOFMState:
         prng_boot, prng_gen, prng_eval = jax.random.split(prng, 3)
 
         concat_inputs = jnp.concatenate([obs_norm, transitions.action], axis=-1)
+        # 第 1 处：GAE 计算前的 q_pred
         q_pred, h_s = networks.value_mlp_fwd_with_features(self.params.value, concat_inputs)
-        q_pred = jax.lax.stop_gradient(q_pred)
+        q_pred = jax.lax.stop_gradient(q_pred.squeeze(-1))  # 👑 加 .squeeze(-1)
 
         bootstrap_obs = transitions.next_obs[-1:, :, :]
         if self.config.normalize_observations:
@@ -277,8 +278,9 @@ class DGPOFMState:
         schedule = self.get_schedule()
         bootstrap_act, _ = jax.lax.scan(boot_step_fn, boot_noise, (schedule.t_current, schedule.t_next))
         bootstrap_concat = jnp.concatenate([bootstrap_obs, bootstrap_act], axis=-1)
+        # 第 2 处：GAE 计算前的 bootstrap_q
         bootstrap_q, _ = networks.value_mlp_fwd_with_features(self.params.value, bootstrap_concat)
-        bootstrap_q = jax.lax.stop_gradient(bootstrap_q)
+        bootstrap_q = jax.lax.stop_gradient(bootstrap_q.squeeze(-1))  # 👑 加 .squeeze(-1)
 
         gae_qs, _ = jax.lax.stop_gradient(
             rollouts.compute_gae(
@@ -312,8 +314,9 @@ class DGPOFMState:
         obs_pool_b = jnp.broadcast_to(flat_obs[:, None, :], (N, K + 1, obs_dim))
         concat_pool = jnp.concatenate([obs_pool_b, pool_actions], axis=-1)
 
+        # 第 3 处：给假动作打分后的 q_pool
         q_pool, _ = networks.value_mlp_fwd_with_features(self.params.value, concat_pool)
-        q_pool = jax.lax.stop_gradient(q_pool)
+        q_pool = jax.lax.stop_gradient(q_pool.squeeze(-1))  # 👑 加 .squeeze(-1)
 
         alpha = self.config.resampling_alpha_min
         logits = (q_pool - jnp.max(q_pool, axis=-1, keepdims=True)) / alpha
@@ -412,19 +415,25 @@ class DGPOFMState:
 
     def _compute_value_loss(self, value_params, obs_norm, actions, truncation, target_qs, pool_actions,
                             current_cql_weight):
+        # 第 4 处：拟合 MSE 时的 q_pred
         concat_inputs = jnp.concatenate([obs_norm, actions], axis=-1)
         q_pred, _ = networks.value_mlp_fwd_with_features(value_params, concat_inputs)
+        q_pred = q_pred.squeeze(-1)  # 👑 加 .squeeze(-1)，确保和 target_qs 形状完美对齐
         v_error = (target_qs - q_pred) * (1 - truncation)
         mse_loss = jnp.mean(v_error ** 2)
 
+        # 第 5 处：计算惩罚时的 q_pool_fake
         N, K_plus_1, act_dim = pool_actions.shape
         flat_obs = obs_norm.reshape((N, obs_norm.shape[-1]))
         obs_b = jnp.broadcast_to(flat_obs[:, None, :], (N, K_plus_1, obs_norm.shape[-1]))
         concat_pool = jnp.concatenate([obs_b, pool_actions], axis=-1)
-        q_pool_fake, _ = networks.value_mlp_fwd_with_features(value_params, concat_pool)
 
-        q_real_sg = jax.lax.stop_gradient(q_pool_fake[:, 0:1])
-        q_fake = q_pool_fake[:, 1:]
+        q_pool_fake, _ = networks.value_mlp_fwd_with_features(value_params, concat_pool)
+        q_pool_fake = q_pool_fake.squeeze(-1)  # 👑 加 .squeeze(-1)，使其变为标准的 (N, K+1)
+
+        # 后续的切片逻辑就能完美运作了
+        q_real_sg = jax.lax.stop_gradient(q_pool_fake[:, 0:1])  # 取出后依然是 (N, 1)
+        q_fake = q_pool_fake[:, 1:]  # 取出后是 (N, K)
 
         if self.config.use_hinge_cql:
             cql_penalty = jnp.mean(jax.nn.relu(q_fake - q_real_sg))
