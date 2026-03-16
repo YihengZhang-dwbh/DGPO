@@ -25,7 +25,7 @@ class DGPOFMConfig:
 
     # 👑 新增：假噪声退火控制机制 (模拟退火流)
     fake_accept_p_init: float = 1.0  # 训练初期的假噪声接受率
-    fake_accept_p_final: float = 0.0  # 训练后期的假噪声接受率
+    fake_accept_p_final: float = 0.1  # 训练后期的假噪声接受率
     fake_accept_decay_ratio: float = 0.8  # 在 80% 进度时衰减到 final 值
 
     use_hard_resampling: jdc.Static[bool] = True
@@ -149,11 +149,19 @@ class DGPOFMState:
         # ==========================================
         # 👑 计算假噪声的退火接受概率 (P_accept)
         # ==========================================
-        steps_per_iter = self.config.iterations_per_env * self.config.num_envs
-        total_iterations = self.config.num_timesteps // steps_per_iter
-        decay_steps = total_iterations * self.config.fake_accept_decay_ratio
+        # 👑 重新对齐进度条逻辑
+        # 每一个完整的 Iteration 对应的 steps 增量是 num_minibatches * num_updates_per_batch
+        updates_per_iteration = self.config.num_minibatches * self.config.num_updates_per_batch
 
-        progress = jnp.minimum(1.0, self.steps / jnp.maximum(1.0, decay_steps))
+        # 总的更新步数
+        total_steps_per_env = self.config.num_timesteps // self.config.num_envs
+        total_iterations = total_steps_per_env // self.config.unroll_length
+        total_expected_updates = total_iterations * updates_per_iteration
+
+        # 算出进度 (0.0 ~ 1.0)
+        # decay_ratio 建议设为 0.8，即前 80% 的更新步数里进行退火
+        progress = jnp.minimum(1.0, self.steps / (total_expected_updates * self.config.fake_accept_decay_ratio))
+
         p_accept = self.config.fake_accept_p_init - progress * (
                     self.config.fake_accept_p_init - self.config.fake_accept_p_final)
         p_accept = jnp.maximum(self.config.fake_accept_p_final, p_accept)
