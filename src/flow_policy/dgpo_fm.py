@@ -411,12 +411,12 @@ class DGPOFMState:
             return policy_loss, {"policy_loss": policy_loss}
 
     def _compute_value_loss(self, value_params, obs_norm, actions, truncation, target_qs, pool_actions,
-                            current_cql_weight, current_K):  # 👑 注意参数加了 current_K
+                            current_cql_weight):
         concat_inputs = jnp.concatenate([obs_norm, actions], axis=-1)
         q_pred, _ = networks.value_mlp_fwd_with_features(value_params, concat_inputs)
 
-        # 稳妥起见，顺手防御一下可能的 broadcast 错位
-        q_pred = q_pred.squeeze(-1) if q_pred.ndim > target_qs.ndim else q_pred
+        # 👑 唯一的致命修复：干掉最后一维，防止 (N,) 和 (N, 1) 相减变成 (N, N) 导致核爆
+        q_pred = q_pred.reshape(-1)
 
         v_error = (target_qs - q_pred) * (1 - truncation)
         mse_loss = jnp.mean(v_error ** 2)
@@ -427,30 +427,17 @@ class DGPOFMState:
         concat_pool = jnp.concatenate([obs_b, pool_actions], axis=-1)
         q_pool_fake, _ = networks.value_mlp_fwd_with_features(value_params, concat_pool)
 
+        # 👑 同样挤掉最后一维，保证 q_pool_fake 是干净的 (N, K+1)
+        q_pool_fake = q_pool_fake.reshape((N, K_plus_1))
+
         q_real_sg = jax.lax.stop_gradient(q_pool_fake[:, 0:1])
         q_fake = q_pool_fake[:, 1:]
 
-        # 👑 === 核心修复区：动态 Mask 且正确计算 Batch 均值 ===
         if self.config.use_hinge_cql:
-            penalty_raw = jax.nn.relu(q_fake - q_real_sg)
+            # jnp.mean 完美地自动处理了 (N, K) 维度的平均，无须任何额外操作
+            cql_penalty = jnp.mean(jax.nn.relu(q_fake - q_real_sg))
         else:
-            penalty_raw = q_fake - q_real_sg
-
-        # 1. 创建 Mask：只选当前解锁的假动作
-        K_max = q_fake.shape[1]
-        active_mask = jnp.arange(K_max) < current_K
-
-        # 2. 对齐维度并施加 Mask (防御 (N,K) 和 (N,K,1) 两种情况)
-        if penalty_raw.ndim == 3:
-            masked_penalty = penalty_raw * active_mask[None, :, None]
-        else:
-            masked_penalty = penalty_raw * active_mask[None, :]
-
-        # 3. 🚨 真正的无偏均值：总和 / (Batch_Size * 有效假动作数)
-        # 这就完美等价于你原版的 jnp.mean()，绝不会再发生上万倍的数值爆炸
-        valid_count = N * jnp.maximum(1.0, jnp.sum(active_mask))
-        cql_penalty = jnp.sum(masked_penalty) / valid_count
-        # =========================================================
+            cql_penalty = jnp.mean(q_fake - q_real_sg)
 
         total_v_loss = (
                                mse_loss + current_cql_weight * cql_penalty) * self.config.value_loss_coeff * self.config.w_v_loss
