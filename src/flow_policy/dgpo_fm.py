@@ -568,11 +568,14 @@ class DGPOFMState:
             )
         )
 
-        # 👑 移花接木：把算好的 target_qs 塞进 action_info 字段
-        with jdc.copy_and_mutate(transitions.action_info) as new_action_info:
-            new_action_info.target_qs = target_qs
-        with jdc.copy_and_mutate(transitions) as new_transitions:
-            new_transitions.action_info = new_action_info
+        # =====================================================================
+        # 👑 绕过形状检查的 PyTree 替换
+        # =====================================================================
+        # 1. 强制直接覆盖 target_qs，不管它原来是什么形状
+        new_action_info = transitions.action_info.replace(target_qs=target_qs)
+
+        # 2. 整体替换 transitions 里的 action_info
+        new_transitions = transitions.replace(action_info=new_action_info)
 
         del self  # 释放旧引用
 
