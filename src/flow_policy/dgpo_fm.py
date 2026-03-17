@@ -320,12 +320,6 @@ class DGPOFMState:
                                                          jnp.concatenate([obs_pool_b, pool_actions], axis=-1))
         q_pool = jax.lax.stop_gradient(q_pool)
 
-        if self.config.use_dynamic_alpha:
-            rmse = jnp.abs(final_v_loss + 1e-8)
-            alpha = jnp.maximum(self.config.resampling_alpha_k * rmse, self.config.resampling_alpha_min)
-        else:
-            alpha = self.config.resampling_alpha_min
-
         # q_pool 的形状是 (N, 3)，包含了真动作、Max假动作、Min假动作的得分
 
         # 👑 1. 核心开关：全局宏观方差 vs 局部状态级方差
