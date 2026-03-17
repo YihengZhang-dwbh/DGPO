@@ -19,11 +19,11 @@ from . import math_utils, networks, rollouts
 class DGPOFMConfig:
     # --- 全新 Q-Guided 生成控制核心 ---
     independent_noise_sampling: jdc.Static[bool] = True
-    action_max: jdc.Static[bool] = True
-    use_global_variance: jdc.Static[bool] = True
-    temp_func_type: jdc.Static[Literal["log", "cbrt", "std"]] = "log"
-    resampling_alpha_k: float = 0.1
-    resampling_alpha_min: float = 1
+    action_max: jdc.Static[bool] = False
+    use_global_variance: jdc.Static[bool] = False
+    temp_func_type: jdc.Static[Literal["log", "cbrt", "std"]] = "std"
+    resampling_alpha_k: float = 0.3
+    resampling_alpha_min: float = 0.0001
     f_x_forward: jdc.Static[bool] = True
     num_generated_actions: jdc.Static[int] = 2
     num_epsilon_samples: jdc.Static[int] = 8
