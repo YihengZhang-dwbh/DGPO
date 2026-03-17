@@ -18,12 +18,15 @@ from . import math_utils, networks, rollouts
 @jdc.pytree_dataclass
 class DGPOFMConfig:
     # --- 全新 Q-Guided 生成控制核心 ---
-    independent_noise_sampling: jdc.Static[bool] = True  # 👑 新增：是否让 8 个噪声独立竞争
+    independent_noise_sampling: jdc.Static[bool] = False  # 👑 新增：是否让 8 个噪声独立竞争
     resampling_alpha_k: float = 0.1
     resampling_alpha_min: float = 1
     use_dynamic_alpha: jdc.Static[bool] = False
     num_generated_actions: jdc.Static[int] = 2  # 👑 现在的 K 固定了，不会再有形状Bug
     num_epsilon_samples: jdc.Static[int] = 8
+
+    rejection_threshold: float = 0.05  # 👑 新增：如果最终选中的动作，其全局概率低于 5%，则废弃该噪声
+
 
     # --- 👑 接受率 p_accept 控制 ---
     p_accept_mode: jdc.Static[Literal["fixed", "linear", "cyclical"]] = "fixed"
@@ -45,8 +48,8 @@ class DGPOFMConfig:
 
     use_hinge_cql: jdc.Static[bool] = True
     cql_decay_mode: jdc.Static[Literal["none", "linear", "cosine", "exponential", "inverse", "auto"]] = "auto"
-    cql_init_weight: float = 0.0
-    cql_final_weight: float = 0.0
+    cql_init_weight: float = 0
+    cql_final_weight: float = 0
     cql_decay_ratio: float = 0.5
 
     cql_target_margin: float = 5
@@ -238,8 +241,6 @@ class DGPOFMState:
             # 👑 普适化核心：在 K 个假动作中（索引 1 到 K），找出概率最大的那 1 个作为挑战者
             # probs[:, 1:] 是所有假动作的概率，argmax 找到最大值的相对索引，+1 映射回真实索引
             challenger_idx = jnp.argmax(probs[:, 1:], axis=-1) + 1  # 形状: (N,)
-            # # 👑 你的神来之笔：在 1 到 K 的假动作中完全随机抽取 1 个作为合法挑战者
-            # challenger_idx = jax.random.randint(p_idx, (N,), minval=1, maxval=K + 1)
 
             if cfg.independent_noise_sampling:
                 # 噪声在 K+1 个动作中自由抽签
