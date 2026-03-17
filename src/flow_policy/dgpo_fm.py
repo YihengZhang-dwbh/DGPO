@@ -20,7 +20,7 @@ class DGPOFMConfig:
     # --- 全新 Q-Guided 生成控制核心 ---
     independent_noise_sampling: jdc.Static[bool] = True  # 👑 新增：是否让 8 个噪声独立竞争
     resampling_alpha_k: float = 0.1
-    resampling_alpha_min: float = 1
+    resampling_alpha_min: float = 1.0
     use_dynamic_alpha: jdc.Static[bool] = False
     num_generated_actions: jdc.Static[int] = 2  # 👑 现在的 K 固定了，不会再有形状Bug
     num_epsilon_samples: jdc.Static[int] = 8
@@ -30,7 +30,7 @@ class DGPOFMConfig:
 
     # --- 👑 接受率 p_accept 控制 ---
     p_accept_mode: jdc.Static[Literal["fixed", "linear", "cyclical"]] = "fixed"
-    p_fixed_val: float = 1  # fixed 模式下的固定值
+    p_fixed_val: float = 1.0  # fixed 模式下的固定值
     p_min: float = 0.0  # 最小值 (用于 linear/cyclical)
     p_max: float = 1.0  # 最大值 (用于 linear/cyclical)
     p_cycles: jdc.Static[int] = 5  # cyclical 模式的循环次数
@@ -52,7 +52,7 @@ class DGPOFMConfig:
     cql_final_weight: float = 0.0
     cql_decay_ratio: float = 0.5
 
-    cql_target_margin: float = 5
+    cql_target_margin: float = 5.0
     cql_alpha_lr: float = 3e-4
     cql_alpha_kp: float = 0.05
     cql_clip_alpha: jdc.Static[bool] = False
@@ -186,7 +186,7 @@ class DGPOFMState:
 
         # 👑 性能黑客：单独定义一个只有 3 步（甚至 2 步）的粗糙时间表
         # 这会让 K=8 的生成速度直接飙升 3 倍以上！
-        fast_flow_steps = 1
+        fast_flow_steps = 3
         fast_full_t = jnp.linspace(1.0, 0.0, fast_flow_steps + 1)
         fast_t_current, fast_t_next = fast_full_t[:-1], fast_full_t[1:]
 
