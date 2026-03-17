@@ -19,10 +19,13 @@ from . import math_utils, networks, rollouts
 class DGPOFMConfig:
     # --- 全新 Q-Guided 生成控制核心 ---
     independent_noise_sampling: jdc.Static[bool] = True
+    action_max: jdc.Static[bool] = True
+    noise_sampling: jdc.Static[bool] = True
     use_global_variance: jdc.Static[bool] = True
     temp_func_type: jdc.Static[Literal["log", "cbrt", "std"]] = "log"
     resampling_alpha_k: float = 0.1
     resampling_alpha_min: float = 1
+    f_x_forward: jdc.Static[bool] = True
     num_generated_actions: jdc.Static[int] = 2
     num_epsilon_samples: jdc.Static[int] = 8
 
@@ -133,7 +136,7 @@ class DGPOFMState:
         obs_dim, act_dim, t_dim = self.env.observation_size, self.env.action_size, cfg.timestep_embed_dim
 
         obs_flat = ((
-                                transitions.obs - self.obs_stats.mean) / self.obs_stats.std if cfg.normalize_observations else transitions.obs).reshape(
+                            transitions.obs - self.obs_stats.mean) / self.obs_stats.std if cfg.normalize_observations else transitions.obs).reshape(
             (N, obs_dim))
         target_qs = transitions.action_info.target_qs.reshape((N, 1))
 
@@ -184,7 +187,10 @@ class DGPOFMState:
             p_idx, p_eps, p_t, p_acc = jax.random.split(prng_pol, 4)
             logits = jnp.log(probs + 1e-8)
 
-            challenger_idx = jnp.argmax(probs[:, 1:], axis=-1) + 1
+            if cfg.action_max:
+                challenger_idx = jnp.argmax(probs[:, 1:], axis=-1) + 1
+            else:
+                challenger_idx = jax.random.randint(p_idx, (N,), minval=1, maxval=K + 1)
 
             if cfg.independent_noise_sampling:
                 sampled_indices = jax.random.categorical(p_idx, jnp.broadcast_to(logits[:, None, :], (N, M, K + 1)),
@@ -201,15 +207,22 @@ class DGPOFMState:
                 dummy_absorption_ratio = jnp.mean(is_dummy.astype(jnp.float32))
 
             else:
-                sampled_indices = jax.random.categorical(p_idx, logits, axis=-1)[:, None]
+                # 一发入魂模式
+                sampled_indices = jax.random.categorical(p_idx, logits, axis=-1)[:, None]  # (N, 1)
                 a_target = jnp.broadcast_to(pool_actions[jnp.arange(N), sampled_indices[:, 0]][:, None, :],
                                             (N, M, act_dim))
-                rand_vals = jnp.broadcast_to(jax.random.uniform(p_acc, (N, 1)), (N, M))
 
-                is_real = (sampled_indices == 0)
-                is_active_fake = (sampled_indices == challenger_idx[:, None]) & (rand_vals < p_accept)
+                # 👑 修复 1：只生成 (N, 1) 的随机数，不要提前广播！
+                rand_vals = jax.random.uniform(p_acc, (N, 1))
+
+                is_real = (sampled_indices == 0)  # (N, 1)
+                is_active_fake = (sampled_indices == challenger_idx[:, None]) & (rand_vals < p_accept)  # (N, 1)
+
+                # 此时 valid_mask_single 的形状是纯正的 (N, 1)
                 valid_mask_single = (is_real | is_active_fake).astype(jnp.float32)
-                valid_mask = jnp.broadcast_to(valid_mask_single[:, None], (N, M))
+
+                # 👑 修复 2：直接广播为 (N, M)，绝不能加 [:, None] 强行升维了！
+                valid_mask = jnp.broadcast_to(valid_mask_single, (N, M))
 
                 is_dummy = (sampled_indices > 0) & (sampled_indices != challenger_idx[:, None])
                 dummy_absorption_ratio = jnp.mean(is_dummy.astype(jnp.float32))
@@ -273,7 +286,10 @@ class DGPOFMState:
             f_x = jnp.sqrt(x_var + 1e-8)
 
         # 👑 修复 2：正确的反比例温度映射！(方差越大 -> 温度越低 -> 越贪婪)
-        alpha = jnp.maximum(self.config.resampling_alpha_min, self.config.resampling_alpha_k * f_x)
+        if self.config.f_x_forward:
+            alpha = jnp.maximum(self.config.resampling_alpha_min, self.config.resampling_alpha_k * f_x)
+        else:
+            alpha = self.config.resampling_alpha_min / (1 + self.config.resampling_alpha_k * f_x)
 
         logits = (q_pool - jnp.max(q_pool, axis=-1, keepdims=True)) / alpha
         pool_probs = jax.nn.softmax(logits, axis=-1)
@@ -345,7 +361,7 @@ class DGPOFMState:
                 state.obs_stats = state.obs_stats.update(transitions.obs)
 
         obs_norm = (
-                               transitions.obs - state.obs_stats.mean) / state.obs_stats.std if config.normalize_observations else transitions.obs
+                           transitions.obs - state.obs_stats.mean) / state.obs_stats.std if config.normalize_observations else transitions.obs
 
         concat_inputs = jnp.concatenate([obs_norm, transitions.action], axis=-1)
         q_pred, _ = networks.value_mlp_fwd_with_features(state.params.value, concat_inputs)
