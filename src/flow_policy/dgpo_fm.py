@@ -18,7 +18,7 @@ from . import math_utils, networks, rollouts
 @jdc.pytree_dataclass
 class DGPOFMConfig:
     # --- 全新 Q-Guided 生成控制核心 ---
-    independent_noise_sampling: jdc.Static[bool] = False  # 👑 新增：是否让 8 个噪声独立竞争
+    independent_noise_sampling: jdc.Static[bool] = True  # 👑 新增：是否让 8 个噪声独立竞争
     resampling_alpha_k: float = 0.1
     resampling_alpha_min: float = 1
     use_dynamic_alpha: jdc.Static[bool] = False
