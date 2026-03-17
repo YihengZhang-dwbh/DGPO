@@ -22,7 +22,7 @@ class DGPOFMConfig:
     resampling_alpha_k: float = 0
     resampling_alpha_min: float = 1
     use_dynamic_alpha: jdc.Static[bool] = False
-    num_generated_actions: jdc.Static[int] = 1  # 👑 现在的 K 固定了，不会再有形状Bug
+    num_generated_actions: jdc.Static[int] = 2  # 👑 现在的 K 固定了，不会再有形状Bug
     num_epsilon_samples: jdc.Static[int] = 8
 
     # --- 👑 接受率 p_accept 控制 ---
