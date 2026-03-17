@@ -228,8 +228,8 @@ class DGPOFMState:
                                                                                 None, length=cfg.loop_v)
 
         # 5. 策略更新 👑 (核心：解耦评估与 1v1 目标采样)
-        probs, _ = self._compute_fresh_weights(new_v_params, obs_flat, pool_actions,
-                                               extra_v_metrics["v_loss/total"][-1])
+        probs, fresh_metrics = self._compute_fresh_weights(new_v_params, obs_flat, pool_actions,
+                                                           extra_v_metrics["v_loss/total"][-1])
 
         # 此时你可以放心地把 K 开到 4 或者 8
         def policy_loss_fn(p_params):
@@ -308,7 +308,9 @@ class DGPOFMState:
                                 opt_state_policy=new_p_opt, opt_state_value=new_v_opt_state, log_cql_weight=new_la,
                                 steps=self.steps + 1
                                 )
-        final_metrics = {**{k: v[-1] for k, v in extra_v_metrics.items()}, **p_metrics}
+        
+        # 在 _step_minibatch 的最后一行，把 fresh_metrics 塞进去：
+        final_metrics = {**{k: v[-1] for k, v in extra_v_metrics.items()}, **p_metrics, **fresh_metrics}
         return new_state, final_metrics
 
     def _compute_fresh_weights(self, value_params, obs_norm, pool_actions, final_v_loss) -> tuple[
@@ -394,7 +396,7 @@ class DGPOFMState:
         bootstrap_q, _ = networks.value_mlp_fwd_with_features(self.params.value, bootstrap_concat)
         bootstrap_q = jax.lax.stop_gradient(bootstrap_q)
 
-        gae_qs, _ = jax.lax.stop_gradient(
+        _, target_qs = jax.lax.stop_gradient(
             rollouts.compute_gae(
                 truncation=transitions.truncation,
                 discount=transitions.discount * self.config.discounting,
@@ -643,7 +645,7 @@ class DGPOFMState:
                                                               jnp.concatenate([bootstrap_obs, bootstrap_act], axis=-1))
 
         # 3. 计算绝对静态的 GAE Target
-        target_qs, _ = jax.lax.stop_gradient(
+        _, target_qs = jax.lax.stop_gradient(
             rollouts.compute_gae(
                 truncation=transitions.truncation,
                 discount=transitions.discount * config.discounting,
