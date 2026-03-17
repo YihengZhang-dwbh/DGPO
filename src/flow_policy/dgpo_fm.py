@@ -186,7 +186,7 @@ class DGPOFMState:
 
         # 👑 性能黑客：单独定义一个只有 3 步（甚至 2 步）的粗糙时间表
         # 这会让 K=8 的生成速度直接飙升 3 倍以上！
-        fast_flow_steps = 2
+        fast_flow_steps = 1
         fast_full_t = jnp.linspace(1.0, 0.0, fast_flow_steps + 1)
         fast_t_current, fast_t_next = fast_full_t[:-1], fast_full_t[1:]
 
