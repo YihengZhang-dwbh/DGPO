@@ -327,6 +327,17 @@ class DGPOFMState:
         else:
             alpha = self.config.resampling_alpha_min
 
+        # q_pool 的形状是 (N, 3)，包含了真动作、Max假动作、Min假动作的得分
+
+        # 👑 1. 计算当前这批 Q 值的全局标准差 (感知环境 Scale)
+        # 加 1e-8 防御方差为 0 的除零崩溃
+        q_std = jax.lax.stop_gradient(jnp.std(q_pool) + 1e-8)
+
+        # 👑 2. 动态计算 alpha
+        # resampling_alpha_k 可以设为 1.0 (代表 1 倍标准差)，resampling_alpha_min 设为 0.1 作为保底
+        alpha = jnp.maximum(self.config.resampling_alpha_min, q_std * self.config.resampling_alpha_k)
+
+        # 3. 正常计算 Softmax
         logits = (q_pool - jnp.max(q_pool, axis=-1, keepdims=True)) / alpha
         pool_probs = jax.nn.softmax(logits, axis=-1)
 
