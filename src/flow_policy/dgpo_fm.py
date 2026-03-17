@@ -273,7 +273,7 @@ class DGPOFMState:
             f_x = jnp.sqrt(x_var + 1e-8)
 
         # 👑 修复 2：正确的反比例温度映射！(方差越大 -> 温度越低 -> 越贪婪)
-        alpha = jnp.minimum(self.config.resampling_alpha_min, self.config.resampling_alpha_k * f_x)
+        alpha = jnp.maximum(self.config.resampling_alpha_min, self.config.resampling_alpha_k * f_x)
 
         logits = (q_pool - jnp.max(q_pool, axis=-1, keepdims=True)) / alpha
         pool_probs = jax.nn.softmax(logits, axis=-1)
