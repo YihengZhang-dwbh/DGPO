@@ -19,13 +19,12 @@ from . import math_utils, networks, rollouts
 class DGPOFMConfig:
     # --- 全新 Q-Guided 生成控制核心 ---
     independent_noise_sampling: jdc.Static[bool] = False  # 👑 新增：是否让 8 个噪声独立竞争
+    use_global_variance: jdc.Static[bool] = False
+    temp_func_type: jdc.Static[Literal["log", "cbrt", "std"]] = "log"
     resampling_alpha_k: float = 0.1
     resampling_alpha_min: float = 0.3
-    use_dynamic_alpha: jdc.Static[bool] = False
     num_generated_actions: jdc.Static[int] = 1  # 👑 现在的 K 固定了，不会再有形状Bug
     num_epsilon_samples: jdc.Static[int] = 8
-
-    rejection_threshold: float = 0.05  # 👑 新增：如果最终选中的动作，其全局概率低于 5%，则废弃该噪声
 
 
     # --- 👑 接受率 p_accept 控制 ---
@@ -329,22 +328,32 @@ class DGPOFMState:
 
         # q_pool 的形状是 (N, 3)，包含了真动作、Max假动作、Min假动作的得分
 
-        # 👑 1. 计算当前这批 Q 值的全局标准差 (感知环境 Scale)
-        # 加 1e-8 防御方差为 0 的除零崩溃
-        # 加上 axis=-1，算出来的 q_std 形状就会从标量变成 (N, 1)
-        # 👑 1. 计算 Q 值的方差 (Variance), 形状为 (N, 1)
-        # 加 1e-8 防止方差为 0 时计算梯度或开根号出现 NaN
-        q_var = jax.lax.stop_gradient(jnp.var(q_pool, axis=-1, keepdims=True) + 1e-8)
+        # 👑 1. 核心开关：全局宏观方差 vs 局部状态级方差
+        if self.config.use_global_variance:
+            # 全局方差：把整个 q_pool 当作一个整体，算出一个纯标量 (Scalar)
+            # 它代表当前整个 Batch 在宏观环境下的 Q 值跨度
+            x_var = jax.lax.stop_gradient(jnp.var(q_pool))
+        else:
+            # 局部方差：沿着动作维度 (axis=-1) 计算，形状变为 (N, 1)
+            # 它为当前 Batch 里的每一个独立状态 (State) 量身定制方差
+            x_var = jax.lax.stop_gradient(jnp.var(q_pool, axis=-1, keepdims=True))
 
-        # 👑 2. 你的魔法：开更高次根 (比如 3 次根，也就是 1/3 次方)
-        # 这里的 root_degree 可以放在 config 里，比如 self.config.variance_root_degree = 3.0
-        root_degree = 3.0
-        q_root = jnp.power(q_var, 1.0 / root_degree)
+        # 👑 2. 你的核心映射函数 f(x)
+        # config.temp_func_type 可以是 "log", "cbrt", 或者 "sqrt"
+        if self.config.temp_func_type == "log":
+            # 终极防爆盾：f(x) = ln(1+x)
+            f_x = jnp.log1p(x_var)
+        elif self.config.temp_func_type == "cbrt":
+            # 次线性退火：f(x) = x^(1/3)
+            f_x = jnp.power(x_var + 1e-8, 1.0 / 3.0)
+        else:
+            # 尺度对齐 (标准差)：f(x) = x^(1/2)
+            f_x = jnp.sqrt(x_var + 1e-8)
 
-        # 👑 3. 算出次线性的动态 alpha
-        alpha = jnp.maximum(self.config.resampling_alpha_min, q_root * self.config.resampling_alpha_k)
+        # 👑 3. 算出动态 alpha (这里的 x_var 无论是标量还是 (N, 1) 向量，JAX 都会自动完美广播)
+        alpha = jnp.maximum(self.config.resampling_alpha_min, f_x * self.config.resampling_alpha_k)
 
-        # 4. 计算 Softmax (自动完成前期平滑、后期克制的完美退火)
+        # 👑 4. 计算最终的 Softmax 概率
         logits = (q_pool - jnp.max(q_pool, axis=-1, keepdims=True)) / alpha
         pool_probs = jax.nn.softmax(logits, axis=-1)
 
