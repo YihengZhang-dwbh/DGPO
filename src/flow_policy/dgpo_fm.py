@@ -48,8 +48,8 @@ class DGPOFMConfig:
 
     use_hinge_cql: jdc.Static[bool] = True
     cql_decay_mode: jdc.Static[Literal["none", "linear", "cosine", "exponential", "inverse", "auto"]] = "auto"
-    cql_init_weight: float = 0
-    cql_final_weight: float = 0
+    cql_init_weight: float = 0.0
+    cql_final_weight: float = 0.0
     cql_decay_ratio: float = 0.5
 
     cql_target_margin: float = 5
@@ -241,6 +241,8 @@ class DGPOFMState:
             # 👑 普适化核心：在 K 个假动作中（索引 1 到 K），找出概率最大的那 1 个作为挑战者
             # probs[:, 1:] 是所有假动作的概率，argmax 找到最大值的相对索引，+1 映射回真实索引
             challenger_idx = jnp.argmax(probs[:, 1:], axis=-1) + 1  # 形状: (N,)
+            # # 👑 你的神来之笔：在 1 到 K 的假动作中完全随机抽取 1 个作为合法挑战者
+            # challenger_idx = jax.random.randint(p_idx, (N,), minval=1, maxval=K + 1)
 
             if cfg.independent_noise_sampling:
                 # 噪声在 K+1 个动作中自由抽签
