@@ -19,7 +19,6 @@ from . import math_utils, networks, rollouts
 class DGPOFMConfig:
     # --- 全新 Q-Guided 生成控制核心 ---
     independent_noise_sampling: jdc.Static[bool] = True
-    action_max: jdc.Static[bool] = False
     use_global_variance: jdc.Static[bool] = False
     temp_func_type: jdc.Static[Literal["log", "cbrt", "std"]] = "std"
     resampling_alpha_k: float = 0.3
@@ -180,11 +179,6 @@ class DGPOFMState:
             M = cfg.num_epsilon_samples
             p_idx, p_eps, p_t, p_acc = jax.random.split(prng_pol, 4)
             logits = jnp.log(probs + 1e-8)
-
-            if cfg.action_max:
-                challenger_idx = jnp.argmax(probs[:, 1:], axis=-1) + 1
-            else:
-                challenger_idx = jax.random.randint(p_idx, (N,), minval=1, maxval=K + 1)
 
             # 👑 1/K 无偏密度修正核心 (抛弃硬截断吸收池)
             # ==========================================
