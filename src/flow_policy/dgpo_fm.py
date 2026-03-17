@@ -28,9 +28,6 @@ class DGPOFMConfig:
     num_generated_actions: jdc.Static[int] = 2
     num_epsilon_samples: jdc.Static[int] = 8
 
-    # --- 接受率 p_accept 控制 (固定模式) ---
-    p_accept: float = 1.0
-
     use_hard_resampling: jdc.Static[bool] = True
 
     w_v_loss: float = 1.0
@@ -139,8 +136,6 @@ class DGPOFMState:
             (N, obs_dim))
         target_qs = transitions.action_info.target_qs.reshape((N, 1))
 
-        p_accept = cfg.p_accept
-
         K = cfg.num_generated_actions
         obs_b_gen = jnp.broadcast_to(obs_flat[:, None, :], (N, K, obs_dim))
 
@@ -191,7 +186,13 @@ class DGPOFMState:
             else:
                 challenger_idx = jax.random.randint(p_idx, (N,), minval=1, maxval=K + 1)
 
+            # 👑 1/K 无偏密度修正核心 (抛弃硬截断吸收池)
+            # ==========================================
+            K = cfg.num_generated_actions
+            accept_threshold = 1.0 / K  # 核心数学配平系数
+
             if cfg.independent_noise_sampling:
+                # 模式 A: 8个噪声各自抽签
                 sampled_indices = jax.random.categorical(p_idx, jnp.broadcast_to(logits[:, None, :], (N, M, K + 1)),
                                                          axis=-1)
                 a_target = jnp.take_along_axis(pool_actions[:, None, :, :], sampled_indices[..., None, None],
@@ -199,32 +200,38 @@ class DGPOFMState:
                 rand_vals = jax.random.uniform(p_acc, (N, M))
 
                 is_real = (sampled_indices == 0)
-                is_active_fake = (sampled_indices == challenger_idx[:, None]) & (rand_vals < p_accept)
-                valid_mask = (is_real | is_active_fake).astype(jnp.float32)
+                is_fake = (sampled_indices > 0)
 
-                is_dummy = (sampled_indices > 0) & (sampled_indices != challenger_idx[:, None])
-                dummy_absorption_ratio = jnp.mean(is_dummy.astype(jnp.float32))
+                # 👑 假动作面临 1/K 的命运审判
+                is_fake_accepted = is_fake & (rand_vals < accept_threshold)
+                valid_mask = (is_real | is_fake_accepted).astype(jnp.float32)
 
             else:
-                # 一发入魂模式
+                # 模式 B: 一发入魂模式
                 sampled_indices = jax.random.categorical(p_idx, logits, axis=-1)[:, None]  # (N, 1)
                 a_target = jnp.broadcast_to(pool_actions[jnp.arange(N), sampled_indices[:, 0]][:, None, :],
                                             (N, M, act_dim))
 
-                # 👑 修复 1：只生成 (N, 1) 的随机数，不要提前广播！
+                # 只生成 (N, 1) 的随机数
                 rand_vals = jax.random.uniform(p_acc, (N, 1))
 
                 is_real = (sampled_indices == 0)  # (N, 1)
-                is_active_fake = (sampled_indices == challenger_idx[:, None]) & (rand_vals < p_accept)  # (N, 1)
+                is_fake = (sampled_indices > 0)  # (N, 1)
+
+                # 👑 假动作面临 1/K 的命运审判
+                is_fake_accepted = is_fake & (rand_vals < accept_threshold)  # (N, 1)
 
                 # 此时 valid_mask_single 的形状是纯正的 (N, 1)
-                valid_mask_single = (is_real | is_active_fake).astype(jnp.float32)
+                valid_mask_single = (is_real | is_fake_accepted).astype(jnp.float32)
 
-                # 👑 修复 2：直接广播为 (N, M)，绝不能加 [:, None] 强行升维了！
+                # 广播为 (N, M)
                 valid_mask = jnp.broadcast_to(valid_mask_single, (N, M))
 
-                is_dummy = (sampled_indices > 0) & (sampled_indices != challenger_idx[:, None])
-                dummy_absorption_ratio = jnp.mean(is_dummy.astype(jnp.float32))
+            # ==========================================
+            # 📈 统一计算全新漏斗监控指标
+            # ==========================================
+            total_fake_winners = jnp.maximum(1.0, jnp.sum(is_fake.astype(jnp.float32)))
+            actual_fake_accept_rate = jnp.sum(is_fake_accepted.astype(jnp.float32)) / total_fake_wi
 
             eps = jax.random.normal(p_eps, (N, M, act_dim))
             t_idx = jax.random.randint(p_t, (N, M, 1), 0, cfg.flow_steps)
@@ -244,9 +251,14 @@ class DGPOFMState:
 
             return loss, {
                 "policy_loss": loss,
-                "q_guided/p_accept": p_accept,
-                "q_guided/real_win_ratio": jnp.mean((sampled_indices == 0).astype(jnp.float32)),
-                "q_guided/dummy_absorption_ratio": dummy_absorption_ratio
+                # Softmax 阶段的胜率博弈
+                "q_guided/real_win_ratio": jnp.mean(is_real.astype(jnp.float32)),
+                "q_guided/fake_win_ratio": jnp.mean(is_fake.astype(jnp.float32)),
+                # 无偏估计的数学铁证 (应该死死钉在 1/K 附近)
+                "q_guided/fake_accept_ratio": actual_fake_accept_rate,
+                # 系统有效吞吐量
+                "q_guided/overall_valid_ratio": jnp.mean(valid_mask),
+                "q_guided/accept_threshold": jnp.array(accept_threshold, dtype=jnp.float32)
             }
 
         (p_loss, p_metrics), p_grads = jax.value_and_grad(policy_loss_fn, has_aux=True)(self.params.policy)
