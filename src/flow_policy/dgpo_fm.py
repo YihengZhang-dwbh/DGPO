@@ -396,7 +396,7 @@ class DGPOFMState:
         bootstrap_q, _ = networks.value_mlp_fwd_with_features(self.params.value, bootstrap_concat)
         bootstrap_q = jax.lax.stop_gradient(bootstrap_q)
 
-        target_qs, _ = jax.lax.stop_gradient(
+        gae_qs, _ = jax.lax.stop_gradient(
             rollouts.compute_gae(
                 truncation=transitions.truncation,
                 discount=transitions.discount * self.config.discounting,
