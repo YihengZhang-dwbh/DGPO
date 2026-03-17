@@ -61,6 +61,11 @@ class DGPOFMConfig:
 
     def __post_init__(self) -> None:
         assert self.timestep_embed_dim % 2 == 0
+        
+    # 👑 务必把这个加回来，主脚本算 Epoch 进度全靠它！
+    @property
+    def iterations_per_env(self) -> int:
+        return (self.num_minibatches * self.batch_size * self.unroll_length) // self.num_envs
 
 
 @jdc.pytree_dataclass
@@ -118,8 +123,9 @@ class DGPOFMState:
             prng=prng2, steps=jnp.zeros((), dtype=jnp.int32),
         )
 
-    def _step_minibatch(self, transitions: DGPOFMTransition, prng: Array) -> tuple[DGPOFMState, dict[str, Array]]:
-        prng_gen, prng_pol = jax.random.split(prng)
+    def _step_minibatch(self, transitions: DGPOFMTransition) -> tuple[DGPOFMState, dict[str, Array]]:
+        # 从 self 中拆分出本步所需的 key 以及留给未来的 key
+        prng_gen, prng_pol, next_prng = jax.random.split(self.prng, 3)
         cfg, sch = self.config, self.get_schedule()
 
         N = transitions.obs.shape[0] * transitions.obs.shape[1]
@@ -242,13 +248,15 @@ class DGPOFMState:
         (p_loss, p_metrics), p_grads = jax.value_and_grad(policy_loss_fn, has_aux=True)(self.params.policy)
         p_updates, new_p_opt = self.opt_policy.update(p_grads, self.opt_state_policy, self.params.policy)
 
-        new_state = jdc.replace(self,
-                                params=DGPOFMParams(optax.apply_updates(self.params.policy, p_updates), new_v_params),
-                                opt_state_policy=new_p_opt, opt_state_value=new_v_opt_state,
-                                steps=self.steps + 1
-                                )
-
         final_metrics = {**{k: v[-1] for k, v in extra_v_metrics.items()}, **p_metrics, **fresh_metrics}
+        # 在最后返回 state 时更新 prng
+        new_state = jdc.replace(self,
+                                params=...,
+                                opt_state_policy=new_p_opt,
+                                opt_state_value=new_v_opt_state,
+                                steps=self.steps + 1,
+                                prng=next_prng  # 👈 必须更新 state 中的 prng
+                                )
         return new_state, final_metrics
 
     def _compute_fresh_weights(self, value_params, obs_norm, pool_actions) -> tuple[Array, dict[str, Array]]:
@@ -386,7 +394,7 @@ class DGPOFMState:
         def step_batch(state: DGPOFMState, _):
             step_prng = jax.random.fold_in(state.prng, state.steps)
             state, metrics = jax.lax.scan(
-                partial(DGPOFMState._step_minibatch, prng=jax.random.fold_in(step_prng, 0)),
+                DGPOFMState._step_minibatch,  # 直接传类方法，JAX 自动将 state 作为第一个 carry 传入
                 init=state,
                 xs=new_transitions.prepare_minibatches(step_prng, config.num_minibatches, config.batch_size),
             )
