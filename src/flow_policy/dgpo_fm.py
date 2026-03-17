@@ -331,13 +331,13 @@ class DGPOFMState:
 
         # 👑 1. 计算当前这批 Q 值的全局标准差 (感知环境 Scale)
         # 加 1e-8 防御方差为 0 的除零崩溃
-        q_std = jax.lax.stop_gradient(jnp.std(q_pool) + 1e-8)
+        # 加上 axis=-1，算出来的 q_std 形状就会从标量变成 (N, 1)
+        q_std = jax.lax.stop_gradient(jnp.std(q_pool, axis=-1, keepdims=True) + 1e-8)
 
-        # 👑 2. 动态计算 alpha
-        # resampling_alpha_k 可以设为 1.0 (代表 1 倍标准差)，resampling_alpha_min 设为 0.1 作为保底
+        # 算出来的动态 alpha 也会自然变成 (N, 1) 的向量
         alpha = jnp.maximum(self.config.resampling_alpha_min, q_std * self.config.resampling_alpha_k)
 
-        # 3. 正常计算 Softmax
+        # 广播相除时完美对齐 (N, 3) 的 q_pool
         logits = (q_pool - jnp.max(q_pool, axis=-1, keepdims=True)) / alpha
         pool_probs = jax.nn.softmax(logits, axis=-1)
 
