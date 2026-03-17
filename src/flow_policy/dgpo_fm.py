@@ -19,15 +19,15 @@ from . import math_utils, networks, rollouts
 class DGPOFMConfig:
     # --- 全新 Q-Guided 生成控制核心 ---
     independent_noise_sampling: jdc.Static[bool] = True
-    use_global_variance: jdc.Static[bool] = False
+    use_global_variance: jdc.Static[bool] = True
     temp_func_type: jdc.Static[Literal["log", "cbrt", "std"]] = "log"
     resampling_alpha_k: float = 0.1
-    resampling_alpha_min: float = 1.0
+    resampling_alpha_min: float = 1
     num_generated_actions: jdc.Static[int] = 2
     num_epsilon_samples: jdc.Static[int] = 8
 
     # --- 接受率 p_accept 控制 (固定模式) ---
-    p_accept: float = 1.0  # 直接用单一变量控制固定接受率
+    p_accept: float = 1.0
 
     use_hard_resampling: jdc.Static[bool] = True
 
@@ -61,8 +61,8 @@ class DGPOFMConfig:
 
     def __post_init__(self) -> None:
         assert self.timestep_embed_dim % 2 == 0
-        
-    # 👑 务必把这个加回来，主脚本算 Epoch 进度全靠它！
+
+    # 👑 保留：主脚本算 Epoch 需要用到
     @property
     def iterations_per_env(self) -> int:
         return (self.num_minibatches * self.batch_size * self.unroll_length) // self.num_envs
@@ -123,8 +123,9 @@ class DGPOFMState:
             prng=prng2, steps=jnp.zeros((), dtype=jnp.int32),
         )
 
+    # 👑 修复 1：移除外挂 prng 参数，直接从 self 中取
     def _step_minibatch(self, transitions: DGPOFMTransition) -> tuple[DGPOFMState, dict[str, Array]]:
-        # 从 self 中拆分出本步所需的 key 以及留给未来的 key
+        # 👑 从自身状态裂变出新的 key
         prng_gen, prng_pol, next_prng = jax.random.split(self.prng, 3)
         cfg, sch = self.config, self.get_schedule()
 
@@ -136,7 +137,6 @@ class DGPOFMState:
             (N, obs_dim))
         target_qs = transitions.action_info.target_qs.reshape((N, 1))
 
-        # 👑 直接使用配置中的固定 accept 值
         p_accept = cfg.p_accept
 
         K = cfg.num_generated_actions
@@ -201,26 +201,18 @@ class DGPOFMState:
                 dummy_absorption_ratio = jnp.mean(is_dummy.astype(jnp.float32))
 
             else:
-                # 一发入魂模式
-                sampled_indices = jax.random.categorical(p_idx, logits, axis=-1)[:, None]  # (N, 1)
+                sampled_indices = jax.random.categorical(p_idx, logits, axis=-1)[:, None]
                 a_target = jnp.broadcast_to(pool_actions[jnp.arange(N), sampled_indices[:, 0]][:, None, :],
                                             (N, M, act_dim))
+                rand_vals = jnp.broadcast_to(jax.random.uniform(p_acc, (N, 1)), (N, M))
 
-                # 👑 修复 1：只生成 (N, 1) 的随机数，不要提前广播！
-                rand_vals = jax.random.uniform(p_acc, (N, 1))
-
-                is_real = (sampled_indices == 0)  # (N, 1)
-                is_active_fake = (sampled_indices == challenger_idx[:, None]) & (rand_vals < p_accept)  # (N, 1)
-
-                # 此时 valid_mask_single 的形状是纯正的 (N, 1)
+                is_real = (sampled_indices == 0)
+                is_active_fake = (sampled_indices == challenger_idx[:, None]) & (rand_vals < p_accept)
                 valid_mask_single = (is_real | is_active_fake).astype(jnp.float32)
-
-                # 👑 修复 2：直接广播为 (N, M)，绝不能加 [:, None] 强行升维了！
-                valid_mask = jnp.broadcast_to(valid_mask_single, (N, M))
+                valid_mask = jnp.broadcast_to(valid_mask_single[:, None], (N, M))
 
                 is_dummy = (sampled_indices > 0) & (sampled_indices != challenger_idx[:, None])
                 dummy_absorption_ratio = jnp.mean(is_dummy.astype(jnp.float32))
-
 
             eps = jax.random.normal(p_eps, (N, M, act_dim))
             t_idx = jax.random.randint(p_t, (N, M, 1), 0, cfg.flow_steps)
@@ -248,15 +240,16 @@ class DGPOFMState:
         (p_loss, p_metrics), p_grads = jax.value_and_grad(policy_loss_fn, has_aux=True)(self.params.policy)
         p_updates, new_p_opt = self.opt_policy.update(p_grads, self.opt_state_policy, self.params.policy)
 
-        final_metrics = {**{k: v[-1] for k, v in extra_v_metrics.items()}, **p_metrics, **fresh_metrics}
-        # 在最后返回 state 时更新 prng
+        # 👑 去掉了坑人的省略号，正确放入各更新后的参数，并且放入 next_prng
         new_state = jdc.replace(self,
-                                params=...,
+                                params=DGPOFMParams(optax.apply_updates(self.params.policy, p_updates), new_v_params),
                                 opt_state_policy=new_p_opt,
                                 opt_state_value=new_v_opt_state,
                                 steps=self.steps + 1,
-                                prng=next_prng  # 👈 必须更新 state 中的 prng
+                                prng=next_prng
                                 )
+
+        final_metrics = {**{k: v[-1] for k, v in extra_v_metrics.items()}, **p_metrics, **fresh_metrics}
         return new_state, final_metrics
 
     def _compute_fresh_weights(self, value_params, obs_norm, pool_actions) -> tuple[Array, dict[str, Array]]:
@@ -272,7 +265,6 @@ class DGPOFMState:
         else:
             x_var = jax.lax.stop_gradient(jnp.var(q_pool, axis=-1, keepdims=True))
 
-        # ⚠️ 这里依然保留着你原本可能导致性能崩盘的“正比映射”逻辑！
         if self.config.temp_func_type == "log":
             f_x = jnp.log1p(x_var)
         elif self.config.temp_func_type == "cbrt":
@@ -280,7 +272,8 @@ class DGPOFMState:
         else:
             f_x = jnp.sqrt(x_var + 1e-8)
 
-        alpha = jnp.maximum(self.config.resampling_alpha_min, f_x * self.config.resampling_alpha_k)
+        # 👑 修复 2：正确的反比例温度映射！(方差越大 -> 温度越低 -> 越贪婪)
+        alpha = jnp.minimum(self.config.resampling_alpha_min, self.config.resampling_alpha_k * f_x)
 
         logits = (q_pool - jnp.max(q_pool, axis=-1, keepdims=True)) / alpha
         pool_probs = jax.nn.softmax(logits, axis=-1)
@@ -362,6 +355,7 @@ class DGPOFMState:
         if config.normalize_observations:
             bootstrap_obs = (bootstrap_obs - state.obs_stats.mean) / state.obs_stats.std
 
+        # training_step 初始化时不用折叠 prng，直接交给后续的方法
         prng_boot = jax.random.fold_in(state.prng, state.steps)
 
         def boot_step_fn(x, t_tuple):
@@ -391,10 +385,11 @@ class DGPOFMState:
         new_action_info = jdc.replace(transitions.action_info, target_qs=target_qs)
         new_transitions = jdc.replace(transitions, action_info=new_action_info)
 
+        # 👑 修复 3：不再使用 partial 绑定固定的 prng
         def step_batch(state: DGPOFMState, _):
             step_prng = jax.random.fold_in(state.prng, state.steps)
             state, metrics = jax.lax.scan(
-                DGPOFMState._step_minibatch,  # 直接传类方法，JAX 自动将 state 作为第一个 carry 传入
+                DGPOFMState._step_minibatch,  # JAX scan 会自动把 state 当作 carry 传入
                 init=state,
                 xs=new_transitions.prepare_minibatches(step_prng, config.num_minibatches, config.batch_size),
             )
