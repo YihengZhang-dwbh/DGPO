@@ -353,7 +353,14 @@ class DGPOFMState:
 
         return jax.lax.stop_gradient(pool_probs), {"q_guided/q_real_mean": jnp.mean(q_pool[:, 0]),
                                                    "q_guided/prob_real_mean": jnp.mean(pool_probs[:, 0]),
-                                                   "q_guided/alpha_mean": jnp.mean(alpha)}
+                                                   "q_guided/alpha_mean": jnp.mean(alpha),
+                                                   "q_guided/alpha_mean": jnp.mean(alpha),
+                                                   "q_guided/alpha_max": jnp.max(alpha),
+                                                   "q_guided/alpha_min": jnp.min(alpha),
+                                                   # 2. 底层物理量监控
+                                                   "q_guided/q_var_mean": jnp.mean(x_var),  # Q 值的原始方差 (看环境是否膨胀)
+                                                   "q_guided/f_x_mean": jnp.mean(f_x),  # 经过对数或三次根映射后的平滑值
+                                                   }
 
     def _compute_targets(self, transitions: DGPOFMTransition, obs_norm: Array, prng: Array) -> tuple[
         Array, Array, Array, dict[str, Array]]:
