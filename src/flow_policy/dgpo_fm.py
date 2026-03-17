@@ -225,7 +225,7 @@ class DGPOFMState:
             # 📈 统一计算全新漏斗监控指标
             # ==========================================
             total_fake_winners = jnp.maximum(1.0, jnp.sum(is_fake.astype(jnp.float32)))
-            actual_fake_accept_rate = jnp.sum(is_fake_accepted.astype(jnp.float32)) / total_fake_wi
+            actual_fake_accept_rate = jnp.sum(is_fake_accepted.astype(jnp.float32)) / total_fake_winners
 
             eps = jax.random.normal(p_eps, (N, M, act_dim))
             t_idx = jax.random.randint(p_t, (N, M, 1), 0, cfg.flow_steps)
