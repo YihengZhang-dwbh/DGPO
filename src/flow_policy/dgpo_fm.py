@@ -21,7 +21,7 @@ class DGPOFMConfig:
     independent_noise_sampling: jdc.Static[bool] = True
     use_global_variance: jdc.Static[bool] = False
     temp_func_type: jdc.Static[Literal["log", "cbrt", "std"]] = "std"
-    td_scale: float = 20.0
+    base_tolerance: float = 1.0
     resampling_alpha_k: float = 0.3
     resampling_alpha_min: float = 0.0001
     f_x_forward: jdc.Static[bool] = True
@@ -224,11 +224,23 @@ class DGPOFMState:
                 # 广播为 (N, M)
                 valid_mask = jnp.broadcast_to(valid_mask_single, (N, M))
 
-            td_scale = self.config.td_scale
-            trust_weight = jnp.exp(-td_error_abs / td_scale)
+            # ==========================================
+            # 👑 治本绝杀：环境原生尺度下的线性信任权重
+            # ==========================================
+            # 1. 把 TD 误差除以 reward_scaling，剥离人为放大的伪装，还原为真实的物理误差！
+            normalized_td_error = td_error_abs / cfg.reward_scaling
 
-            # 👑 把信任权重乘到掩码上！
-            # 如果 Critic 在这里幻觉了，trust_weight 会变成 0.01，直接把这个数据的梯度抹杀！
+            # 2. 设定原生环境下的真实容忍度 (比如原生 Reward 下，允许 5.0 分的 Q 值误差)
+            base_tolerance = self.config.base_tolerance
+
+            # 3. 计算线性比例 (误差 0 -> 权重 1.0；误差 >= 5.0 -> 权重 0.0)
+            raw_trust = 1.0 - (normalized_td_error / base_tolerance)
+
+            # 4. 强制保底 5% 的试错清醒度，并用 clip 锁死上下限
+            min_trust_weight = 0.01
+            trust_weight = jnp.clip(raw_trust, min_trust_weight, 1.0)
+
+            # 把带保底的信任权重乘到掩码上
             final_valid_mask = valid_mask * trust_weight
 
             # ==========================================
