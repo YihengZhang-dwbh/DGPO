@@ -295,7 +295,6 @@ class DGPOFMState:
         return new_state, final_metrics
 
     def _compute_fresh_weights(self, value_params, obs_norm, pool_actions) -> tuple[Array, dict[str, Array]]:
-
         N, K_plus_1, act_dim = pool_actions.shape
         flat_obs = obs_norm.reshape((N, self.env.observation_size))
         obs_pool_b = jnp.broadcast_to(flat_obs[:, None, :], (N, K_plus_1, flat_obs.shape[-1]))
@@ -303,16 +302,8 @@ class DGPOFMState:
                                                          jnp.concatenate([obs_pool_b, pool_actions], axis=-1))
         q_pool = jax.lax.stop_gradient(q_pool)
 
-        # ==========================================
-        # 👑 绝对维度的防线 + 绝对数值的安全锁
-        # ==========================================
-        # 强制把两者都塑造成纯正的 (N, 1)，从物理上切断任何非正常广播的可能！
-        q_real = q_pool[:, 0].reshape(-1, 1)
-        target_qs_safe = target_qs.reshape(-1, 1)
-
-        # 计算误差，并用 nan_to_num 洗掉哪怕一丝丝的 NaN，再用 clip 斩断 inf 爆炸！
-        raw_error = target_qs_safe - q_real
-        td_error_abs = jnp.clip(jnp.nan_to_num(jnp.abs(raw_error)), 0.0, 10000.0)
+        # 🗑️ 之前的 target_qs_safe, q_real, td_error_abs 全部被删除了！
+        # 现在的它只负责纯粹的内部竞争博弈！
 
         if self.config.use_global_variance:
             x_var = jax.lax.stop_gradient(jnp.var(q_pool))
@@ -328,7 +319,6 @@ class DGPOFMState:
         elif self.config.temp_func_type == "fixed":
             f_x = 1.0
 
-        # 👑 修复 2：正确的反比例温度映射！(方差越大 -> 温度越低 -> 越贪婪)
         if self.config.f_x_forward:
             alpha = jnp.maximum(self.config.resampling_alpha_min, self.config.resampling_alpha_k * f_x)
         else:
@@ -337,8 +327,8 @@ class DGPOFMState:
         logits = (q_pool - jnp.max(q_pool, axis=-1, keepdims=True)) / alpha
         pool_probs = jax.nn.softmax(logits, axis=-1)
 
-        # 返回的时候，把 td_error_abs 带出来
-        return jax.lax.stop_gradient(pool_probs), td_error_abs, {
+        # 连带返回的指标里也只留 Q 值相关的
+        return jax.lax.stop_gradient(pool_probs), {
             "q_guided/q_real_mean": jnp.mean(q_pool[:, 0]),
             "q_guided/prob_real_mean": jnp.mean(pool_probs[:, 0]),
             "q_guided/alpha_mean": jnp.mean(alpha),
