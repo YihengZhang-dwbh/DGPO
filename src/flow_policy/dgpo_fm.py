@@ -25,7 +25,7 @@ class DGPOFMConfig:
     resampling_alpha_k: float = 0.3
     resampling_alpha_min: float = 0.0001
     f_x_forward: jdc.Static[bool] = True
-    num_generated_actions: jdc.Static[int] = 2
+    num_generated_actions: jdc.Static[int] = 3
     num_epsilon_samples: jdc.Static[int] = 8
 
     use_hard_resampling: jdc.Static[bool] = True
