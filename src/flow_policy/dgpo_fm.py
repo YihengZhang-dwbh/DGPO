@@ -20,7 +20,7 @@ class DGPOFMConfig:
     # --- 全新 Q-Guided 生成控制核心 ---
     independent_noise_sampling: jdc.Static[bool] = True
     use_global_variance: jdc.Static[bool] = False
-    temp_func_type: jdc.Static[Literal["log", "cbrt", "std"]] = "std"
+    temp_func_type: jdc.Static[Literal["log", "cbrt", "std", "none"]] = "std"
     base_tolerance: float = 1.0
     resampling_alpha_k: float = 0.3
     resampling_alpha_min: float = 0.0001
@@ -319,8 +319,10 @@ class DGPOFMState:
             f_x = jnp.log1p(x_var)
         elif self.config.temp_func_type == "cbrt":
             f_x = jnp.power(x_var + 1e-8, 1.0 / 3.0)
-        else:
+        elif self.config.temp_func_type == "std":
             f_x = jnp.sqrt(x_var + 1e-8)
+        elif self.config.temp_func_type == "none":
+            f_x = 1.0
 
         # 👑 修复 2：正确的反比例温度映射！(方差越大 -> 温度越低 -> 越贪婪)
         if self.config.f_x_forward:
