@@ -173,7 +173,11 @@ class DGPOFMState:
             None, length=cfg.loop_v
         )
 
-        probs, fresh_metrics = self._compute_fresh_weights(new_v_params, obs_flat, pool_actions)
+        # 👑 修改前：
+        # probs, fresh_metrics = self._compute_fresh_weights(new_v_params, obs_flat, pool_actions)
+
+        # 👑 修改后：把 target_qs 传进去，这是算 TD Error 底噪的必需品！
+        probs, fresh_metrics = self._compute_fresh_weights(new_v_params, obs_flat, pool_actions, target_qs)
 
         def policy_loss_fn(p_params):
             M = cfg.num_epsilon_samples
@@ -270,7 +274,7 @@ class DGPOFMState:
         final_metrics = {**{k: v[-1] for k, v in extra_v_metrics.items()}, **p_metrics, **fresh_metrics}
         return new_state, final_metrics
 
-    def _compute_fresh_weights(self, value_params, obs_norm, pool_actions) -> tuple[Array, dict[str, Array]]:
+    def _compute_fresh_weights(self, value_params, obs_norm, pool_actions, target_qs) -> tuple[Array, dict[str, Array]]:
         N, K_plus_1, act_dim = pool_actions.shape
         flat_obs = obs_norm.reshape((N, self.env.observation_size))
         obs_pool_b = jnp.broadcast_to(flat_obs[:, None, :], (N, K_plus_1, flat_obs.shape[-1]))
@@ -278,6 +282,25 @@ class DGPOFMState:
                                                          jnp.concatenate([obs_pool_b, pool_actions], axis=-1))
         q_pool = jax.lax.stop_gradient(q_pool)
 
+        # ==========================================
+        # 👑 治本核心：计算宏观底噪屏蔽墙 (Magnitude/Error Gating)
+        # ==========================================
+        q_real = q_pool[:, 0:1] # 真动作的预测 Q 值
+        td_error_abs = jnp.abs(target_qs - q_real) # 绝对 TD 误差
+
+        # 设定底噪比例：假设绝对 Q 值的 2%，或者绝对 TD 误差的 10% 都是不可信的噪声
+        noise_floor_ratio = 0.02
+        td_penalty_ratio = 0.10
+
+        # 算出宏观噪音温度墙 (取 Q值规模 与 TD误差 带来的噪音最大值)
+        macro_noise_alpha = jnp.maximum(
+            jnp.abs(q_real) * noise_floor_ratio,
+            td_error_abs * td_penalty_ratio
+        )
+
+        # ==========================================
+        # 原有逻辑：计算微观状态级方差
+        # ==========================================
         if self.config.use_global_variance:
             x_var = jax.lax.stop_gradient(jnp.var(q_pool))
         else:
@@ -290,11 +313,17 @@ class DGPOFMState:
         else:
             f_x = jnp.sqrt(x_var + 1e-8)
 
-        # 👑 修复 2：正确的反比例温度映射！(方差越大 -> 温度越低 -> 越贪婪)
+        # 算出基础 Alpha
         if self.config.f_x_forward:
-            alpha = jnp.maximum(self.config.resampling_alpha_min, self.config.resampling_alpha_k * f_x)
+            base_alpha = jnp.maximum(self.config.resampling_alpha_min, self.config.resampling_alpha_k * f_x)
         else:
-            alpha = self.config.resampling_alpha_min / (1 + self.config.resampling_alpha_k * f_x)
+            base_alpha = self.config.resampling_alpha_min / (1 + self.config.resampling_alpha_k * f_x)
+
+        # ==========================================
+        # 👑 终极融合：微观方差与宏观底噪取最大值！
+        # ==========================================
+        # 如果底层噪音已经很大了，决不允许微观 alpha 小于底噪水平，防止 Softmax 放大幻觉！
+        alpha = jnp.maximum(base_alpha, macro_noise_alpha)
 
         logits = (q_pool - jnp.max(q_pool, axis=-1, keepdims=True)) / alpha
         pool_probs = jax.nn.softmax(logits, axis=-1)
@@ -307,6 +336,8 @@ class DGPOFMState:
             "q_guided/alpha_min": jnp.min(alpha),
             "q_guided/q_var_mean": jnp.mean(x_var),
             "q_guided/f_x_mean": jnp.mean(f_x),
+            # 👑 加一个监控指标，看看这堵墙什么时候发挥作用
+            "q_guided/macro_noise_floor_mean": jnp.mean(macro_noise_alpha)
         }
 
     def _compute_value_loss(self, value_params, obs_norm, actions, truncation, target_qs):
