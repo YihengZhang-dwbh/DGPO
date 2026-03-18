@@ -21,6 +21,7 @@ class DGPOFMConfig:
     independent_noise_sampling: jdc.Static[bool] = True
     use_global_variance: jdc.Static[bool] = False
     temp_func_type: jdc.Static[Literal["log", "cbrt", "std"]] = "std"
+    td_scale: float = 20.0
     resampling_alpha_k: float = 0.3
     resampling_alpha_min: float = 0.0001
     f_x_forward: jdc.Static[bool] = True
@@ -223,7 +224,7 @@ class DGPOFMState:
                 # 广播为 (N, M)
                 valid_mask = jnp.broadcast_to(valid_mask_single, (N, M))
 
-            td_scale = 20.0
+            td_scale = self.config.td_scale
             trust_weight = jnp.exp(-td_error_abs / td_scale)
 
             # 👑 把信任权重乘到掩码上！
