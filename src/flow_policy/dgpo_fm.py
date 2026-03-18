@@ -237,7 +237,7 @@ class DGPOFMState:
             raw_global_trust = 1.0 - (final_v_loss / v_loss_ceiling)
 
             # 强制保底 1% 的存活率
-            global_trust_prob = jnp.clip(raw_global_trust, 0.00, 1.0)
+            global_trust_prob = jnp.clip(raw_global_trust, 0.0001, 1.0)
 
             # 所有人面临相同的命运审判！(N, 1) 的随机数与同一个标量概率比较
             trust_rand = jax.random.uniform(p_trust, (N, 1))
