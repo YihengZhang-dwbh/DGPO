@@ -233,7 +233,7 @@ class DGPOFMState:
             trust_weight = jnp.maximum(min_trust_weight, raw_trust)
 
             # 把带保底的信任权重乘到掩码上
-            final_valid_mask = valid_mask * trust_weight
+            final_valid_mask = valid_mask #* trust_weight
 
             # ==========================================
             # 📈 统一计算全新漏斗监控指标
@@ -255,7 +255,7 @@ class DGPOFMState:
             else:
                 err = jnp.sum((vel - (eps - a_target)) ** 2, axis=-1)
 
-            loss = jnp.sum(err * final_valid_mask)
+            loss = jnp.mean(err * final_valid_mask)
 
             return loss, {
                 "policy_loss": loss,
@@ -291,8 +291,8 @@ class DGPOFMState:
                                                          jnp.concatenate([obs_pool_b, pool_actions], axis=-1))
         q_pool = jax.lax.stop_gradient(q_pool)
 
-        # 👑 算出每个状态的绝对 TD 误差
-        td_error_abs = jnp.abs(target_qs - q_pool[:, 0:1])
+        # 👑 换成正确的降维索引，保证形状是 (N, 1)！
+        td_error_abs = jnp.abs(target_qs - q_pool[:, 0])
 
         if self.config.use_global_variance:
             x_var = jax.lax.stop_gradient(jnp.var(q_pool))
