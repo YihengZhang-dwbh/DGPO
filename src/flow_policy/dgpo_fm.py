@@ -228,7 +228,7 @@ class DGPOFMState:
             raw_trust = jnp.exp(-td_error_abs / td_scale)
 
             # 👑 你的神级补丁：强制保底！绝对不允许 Actor 完全罢工！
-            # 哪怕 Critic 满嘴跑火车，Actor 也必须保留 10% 的清醒去试错，打破回音壁
+            # 哪怕 Critic 满嘴跑火车，Actor 也必须保留 5% 的清醒去试错，打破回音壁
             min_trust_weight = 0.05
             trust_weight = jnp.maximum(min_trust_weight, raw_trust)
 
@@ -255,7 +255,7 @@ class DGPOFMState:
             else:
                 err = jnp.sum((vel - (eps - a_target)) ** 2, axis=-1)
 
-            loss = jnp.sum(err * final_valid_mask) / jnp.maximum(1.0, jnp.sum(final_valid_mask))
+            loss = jnp.sum(err * final_valid_mask)
 
             return loss, {
                 "policy_loss": loss,
