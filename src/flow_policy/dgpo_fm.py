@@ -151,8 +151,14 @@ class DGPOFMState:
                                         t_embed) * cfg.policy_mlp_output_scale
             return x + (t_next - t_curr) * vel, None
 
+        # 原代码：
         gen_acts, _ = jax.lax.scan(gen_step, jax.random.normal(prng_gen, (N, K, act_dim)),
                                    (fast_t_current, fast_t_next))
+
+        # 👑 加上这行：绝对不允许假动作超越物理边界去诱骗 Critic！
+        gen_acts = jnp.clip(gen_acts, -1.0, 1.0)
+
+        # 然后再拼接
         pool_actions = jnp.concatenate([transitions.action.reshape((N, 1, act_dim)), gen_acts], axis=1)
 
         def value_inner_step(carry, _):
@@ -313,7 +319,7 @@ class DGPOFMState:
 
         # 3. 施加邻域惩罚！(比如惩罚系数定为 10.0)
         # 距离锚点越远的动作，其 Q 值被打压得越狠
-        neighborhood_penalty_coef = 10.0
+        neighborhood_penalty_coef = 0.
         q_pool_anchored = q_pool - neighborhood_penalty_coef * action_dist_sq
 
         # ⚠️ 后续的所有方差和 Softmax 计算，全部换成被锚定优化后的 q_pool_anchored！
@@ -394,6 +400,8 @@ class DGPOFMState:
         noise_path = jax.random.normal(prng_noise, (self.config.flow_steps, *batch_dims, self.env.action_size))
         x0, _ = jax.lax.scan(euler_step, jax.random.normal(prng_sample, (*batch_dims, self.env.action_size)),
                              (self.get_schedule(), noise_path))
+        # 👑 这是与环境交互的最后一道闸门！
+        x0 = jnp.clip(x0, -1.0, 1.0)
 
         if not deterministic:
             x0 = x0 + jax.random.normal(prng_feather, (*batch_dims, self.env.action_size)) * self.config.feather_std
@@ -428,9 +436,15 @@ class DGPOFMState:
             vel = networks.flow_mlp_fwd(state.params.policy, bootstrap_obs, x, t_embed) * config.policy_mlp_output_scale
             return x + (t_next - t_curr) * vel, None
 
+        # 原代码：
         boot_noise = jax.random.normal(prng_boot, (1, bootstrap_obs.shape[1], state.env.action_size))
         bootstrap_act, _ = jax.lax.scan(boot_step_fn, boot_noise,
                                         (state.get_schedule().t_current, state.get_schedule().t_next))
+
+        # 👑 加上这行：绝对不允许 GAE 的 Target 顺着非法动作爆炸！
+        bootstrap_act = jnp.clip(bootstrap_act, -1.0, 1.0)
+
+        # 然后再算 bootstrap_q (如果你用了伪 V(s) 估算，那就把这行加在算 boot_act_cloud 之后)
         bootstrap_q, _ = networks.value_mlp_fwd_with_features(state.params.value,
                                                               jnp.concatenate([bootstrap_obs, bootstrap_act], axis=-1))
 
