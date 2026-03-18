@@ -294,7 +294,7 @@ class DGPOFMState:
         final_metrics = {**{k: v[-1] for k, v in extra_v_metrics.items()}, **p_metrics, **fresh_metrics}
         return new_state, final_metrics
 
-    def _compute_fresh_weights(self, value_params, obs_norm, pool_actions, target_qs) -> tuple[Array, dict[str, Array]]:
+    def _compute_fresh_weights(self, value_params, obs_norm, pool_actions) -> tuple[Array, dict[str, Array]]:
 
         N, K_plus_1, act_dim = pool_actions.shape
         flat_obs = obs_norm.reshape((N, self.env.observation_size))
