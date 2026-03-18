@@ -223,11 +223,16 @@ class DGPOFMState:
                 # 广播为 (N, M)
                 valid_mask = jnp.broadcast_to(valid_mask_single, (N, M))
 
-            td_scale = 20.0
-            trust_weight = jnp.exp(-td_error_abs / td_scale)
+            # 👑 治本绝杀：用 TD 误差计算信任权重
+            td_scale = 10.0
+            raw_trust = jnp.exp(-td_error_abs / td_scale)
 
-            # 👑 把信任权重乘到掩码上！
-            # 如果 Critic 在这里幻觉了，trust_weight 会变成 0.01，直接把这个数据的梯度抹杀！
+            # 👑 你的神级补丁：强制保底！绝对不允许 Actor 完全罢工！
+            # 哪怕 Critic 满嘴跑火车，Actor 也必须保留 10% 的清醒去试错，打破回音壁
+            min_trust_weight = 0.05
+            trust_weight = jnp.maximum(min_trust_weight, raw_trust)
+
+            # 把带保底的信任权重乘到掩码上
             final_valid_mask = valid_mask * trust_weight
 
             # ==========================================
