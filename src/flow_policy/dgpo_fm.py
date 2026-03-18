@@ -225,64 +225,64 @@ class DGPOFMState:
                 # 广播为 (N, M)
                 valid_mask = jnp.broadcast_to(valid_mask_single, (N, M))
 
-                # ==========================================
-                # 👑 治本绝杀：环境原生尺度下的线性信任概率 & 硬重采样
-                # ==========================================
-                # 1. 把 TD 误差除以 reward_scaling，还原真实物理误差
-                normalized_td_error = td_error_abs / cfg.reward_scaling
+            # ==========================================
+            # 👑 治本绝杀：环境原生尺度下的线性信任概率 & 硬重采样
+            # ==========================================
+            # 1. 把 TD 误差除以 reward_scaling，还原真实物理误差
+            normalized_td_error = td_error_abs / cfg.reward_scaling
 
-                # 2. 设定原生环境下的真实容忍度
-                base_tolerance = cfg.base_tolerance
+            # 2. 设定原生环境下的真实容忍度
+            base_tolerance = cfg.base_tolerance
 
-                # 3. 计算线性理论概率 (0.0 -> 1.0; >= 5.0 -> 0.0)
-                raw_trust = 1.0 - (normalized_td_error / base_tolerance)
+            # 3. 计算线性理论概率 (0.0 -> 1.0; >= 5.0 -> 0.0)
+            raw_trust = 1.0 - (normalized_td_error / base_tolerance)
 
-                # 4. 强制保底 1% 的存活概率 (既然是概率抽签，0.01 意味着 100 次至少留 1 次去探索)
-                min_trust_weight = 0.01
-                trust_prob = jnp.clip(raw_trust, min_trust_weight, 1.0)  # 形状是 (N, 1)
+            # 4. 强制保底 1% 的存活概率 (既然是概率抽签，0.01 意味着 100 次至少留 1 次去探索)
+            min_trust_weight = 0.01
+            trust_prob = jnp.clip(raw_trust, min_trust_weight, 1.0)  # 形状是 (N, 1)
 
-                # 👑 5. 纯正物理重采样：掷骰子！
-                # (注意：要在外层把 p_trust 从 prng_pol 里 split 出来！)
-                trust_rand = jax.random.uniform(p_trust, (N, 1))
+            # 👑 5. 纯正物理重采样：掷骰子！
+            # (注意：要在外层把 p_trust 从 prng_pol 里 split 出来！)
+            trust_rand = jax.random.uniform(p_trust, (N, 1))
 
-                # 只有随机数小于理论概率时，面具才是 1.0，否则是 0.0
-                trust_hard_mask = (trust_rand < trust_prob).astype(jnp.float32)
+            # 只有随机数小于理论概率时，面具才是 1.0，否则是 0.0
+            trust_hard_mask = (trust_rand < trust_prob).astype(jnp.float32)
 
-                # 把这把“信任屠刀”和你的 1/K 抽签结果合并
-                final_valid_mask = valid_mask * trust_hard_mask
+            # 把这把“信任屠刀”和你的 1/K 抽签结果合并
+            final_valid_mask = valid_mask * trust_hard_mask
 
-                # ==========================================
-                # 📈 统一计算全新漏斗监控指标 (一行都没扔！)
-                # ==========================================
-                total_fake_winners = jnp.maximum(1.0, jnp.sum(is_fake.astype(jnp.float32)))
-                actual_fake_accept_rate = jnp.sum(is_fake_accepted.astype(jnp.float32)) / total_fake_winners
+            # ==========================================
+            # 📈 统一计算全新漏斗监控指标 (一行都没扔！)
+            # ==========================================
+            total_fake_winners = jnp.maximum(1.0, jnp.sum(is_fake.astype(jnp.float32)))
+            actual_fake_accept_rate = jnp.sum(is_fake_accepted.astype(jnp.float32)) / total_fake_winners
 
-                eps = jax.random.normal(p_eps, (N, M, act_dim))
-                t_idx = jax.random.randint(p_t, (N, M, 1), 0, cfg.flow_steps)
-                t = sch.t_current[t_idx]
-                x_t = t * eps + (1.0 - t) * a_target
+            eps = jax.random.normal(p_eps, (N, M, act_dim))
+            t_idx = jax.random.randint(p_t, (N, M, 1), 0, cfg.flow_steps)
+            t = sch.t_current[t_idx]
+            x_t = t * eps + (1.0 - t) * a_target
 
-                obs_b_p = jnp.broadcast_to(obs_flat[:, None, :], (N, M, obs_dim))
-                t_embed = self.embed_timestep(t)
-                vel = networks.flow_mlp_fwd(p_params, obs_b_p, x_t, t_embed) * cfg.policy_mlp_output_scale
+            obs_b_p = jnp.broadcast_to(obs_flat[:, None, :], (N, M, obs_dim))
+            t_embed = self.embed_timestep(t)
+            vel = networks.flow_mlp_fwd(p_params, obs_b_p, x_t, t_embed) * cfg.policy_mlp_output_scale
 
-                if cfg.output_mode == "u_but_supervise_as_eps":
-                    err = jnp.sum((eps - ((x_t - t * vel) + vel)) ** 2, axis=-1)
-                else:
-                    err = jnp.sum((vel - (eps - a_target)) ** 2, axis=-1)
+            if cfg.output_mode == "u_but_supervise_as_eps":
+                err = jnp.sum((eps - ((x_t - t * vel) + vel)) ** 2, axis=-1)
+            else:
+                err = jnp.sum((vel - (eps - a_target)) ** 2, axis=-1)
 
-                # 👑 全局均值期望：吸收池完美生效！
-                loss = jnp.mean(err * final_valid_mask)
+            # 👑 全局均值期望：吸收池完美生效！
+            loss = jnp.mean(err * final_valid_mask)
 
-                return loss, {
-                    "policy_loss": loss,
-                    "q_guided/real_win_ratio": jnp.mean(is_real.astype(jnp.float32)),
-                    "q_guided/fake_win_ratio": jnp.mean(is_fake.astype(jnp.float32)),
-                    "q_guided/fake_accept_ratio": actual_fake_accept_rate,
-                    "q_guided/overall_valid_ratio": jnp.mean(valid_mask),  # 原始通过率
-                    "q_guided/trust_prob_mean": jnp.mean(trust_prob),  # 👑 监控：理论上系统有多信任 Critic
-                    "q_guided/final_effective_ratio": jnp.mean(final_valid_mask),  # 👑 监控：经过双重屠刀后，最终存活了多少数据
-                }
+            return loss, {
+                "policy_loss": loss,
+                "q_guided/real_win_ratio": jnp.mean(is_real.astype(jnp.float32)),
+                "q_guided/fake_win_ratio": jnp.mean(is_fake.astype(jnp.float32)),
+                "q_guided/fake_accept_ratio": actual_fake_accept_rate,
+                "q_guided/overall_valid_ratio": jnp.mean(valid_mask),  # 原始通过率
+                "q_guided/trust_prob_mean": jnp.mean(trust_prob),  # 👑 监控：理论上系统有多信任 Critic
+                "q_guided/final_effective_ratio": jnp.mean(final_valid_mask),  # 👑 监控：经过双重屠刀后，最终存活了多少数据
+            }
 
         (p_loss, p_metrics), p_grads = jax.value_and_grad(policy_loss_fn, has_aux=True)(self.params.policy)
         p_updates, new_p_opt = self.opt_policy.update(p_grads, self.opt_state_policy, self.params.policy)
