@@ -286,8 +286,16 @@ class DGPOFMState:
                                                          jnp.concatenate([obs_pool_b, pool_actions], axis=-1))
         q_pool = jax.lax.stop_gradient(q_pool)
 
-        # 👑 算出每个状态的绝对 TD 误差
-        td_error_abs = jnp.abs(target_qs - q_pool[:, 0])
+        # ==========================================
+        # 👑 绝对维度的防线 + 绝对数值的安全锁
+        # ==========================================
+        # 强制把两者都塑造成纯正的 (N, 1)，从物理上切断任何非正常广播的可能！
+        q_real = q_pool[:, 0].reshape(-1, 1)
+        target_qs_safe = target_qs.reshape(-1, 1)
+
+        # 计算误差，并用 nan_to_num 洗掉哪怕一丝丝的 NaN，再用 clip 斩断 inf 爆炸！
+        raw_error = target_qs_safe - q_real
+        td_error_abs = jnp.clip(jnp.nan_to_num(jnp.abs(raw_error)), 0.0, 10000.0)
 
         if self.config.use_global_variance:
             x_var = jax.lax.stop_gradient(jnp.var(q_pool))
