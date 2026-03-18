@@ -308,8 +308,8 @@ class DGPOFMState:
         # 1. 提取真实动作作为绝对安全的“锚点” (Anchor)
         anchor_actions = pool_actions[:, 0:1, :]  # 形状 (N, 1, act_dim)
 
-        # 2. 计算所有动作到锚点的欧氏距离平方
-        action_dist_sq = jnp.sum((pool_actions - anchor_actions) ** 2, axis=-1, keepdims=True)
+        # 2. 计算所有动作到锚点的欧氏距离平方 (🗑️ 删掉了多余的 keepdims=True！)
+        action_dist_sq = jnp.sum((pool_actions - anchor_actions) ** 2, axis=-1)
 
         # 3. 施加邻域惩罚！(比如惩罚系数定为 10.0)
         # 距离锚点越远的动作，其 Q 值被打压得越狠
