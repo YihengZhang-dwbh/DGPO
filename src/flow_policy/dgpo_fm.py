@@ -397,9 +397,7 @@ class DGPOFMState:
         obs_norm = (
                            transitions.obs - state.obs_stats.mean) / state.obs_stats.std if config.normalize_observations else transitions.obs
 
-        concat_inputs = jnp.concatenate([obs_norm, transitions.action], axis=-1)
-        q_pred, _ = networks.value_mlp_fwd_with_features(state.params.value, concat_inputs)
-        q_pred = jax.lax.stop_gradient(q_pred)
+
 
         bootstrap_obs = transitions.next_obs[-1:, :, :]
         if config.normalize_observations:
@@ -418,16 +416,53 @@ class DGPOFMState:
         boot_noise = jax.random.normal(prng_boot, (1, bootstrap_obs.shape[1], state.env.action_size))
         bootstrap_act, _ = jax.lax.scan(boot_step_fn, boot_noise,
                                         (state.get_schedule().t_current, state.get_schedule().t_next))
-        bootstrap_q, _ = networks.value_mlp_fwd_with_features(state.params.value,
-                                                              jnp.concatenate([bootstrap_obs, bootstrap_act], axis=-1))
 
+        # ==========================================
+        # 👑 极客路线 2：自举估算 V(s) (Action Cloud 均值法)
+        # ==========================================
+        # 准备随机数种子
+        prng_v1, prng_v2 = jax.random.split(jax.random.fold_in(state.prng, state.steps + 99), 2)
+
+        # 我们采样 K_v 个动作来求期望 (4 个足够抹平断崖了)
+        K_v = 4
+
+        # 1. 估算当前状态的 V(s)
+        # 把原始状态扩维 (K_v, T, B, obs_dim)
+        obs_expanded = jnp.broadcast_to(obs_norm[None, ...], (K_v, *obs_norm.shape))
+
+        # 在真实执行的动作周围，加上高斯扰动云，模拟策略的随机探索区域
+        noise_scale = 0.1
+        act_cloud = transitions.action[None, ...] + jax.random.normal(prng_v1,
+                                                                      (K_v, *transitions.action.shape)) * noise_scale
+        act_cloud = jnp.clip(act_cloud, -1.0, 1.0)  # 保证物理合法
+
+        # 批量输入 Critic 算分
+        q_cloud, _ = networks.value_mlp_fwd_with_features(state.params.value,
+                                                          jnp.concatenate([obs_expanded, act_cloud], axis=-1))
+
+        # 👑 你的数学核心：沿着动作维度求均值，强行抹平 Q 的断崖，生成极其平滑的伪 V(s)！
+        v_pred = jax.lax.stop_gradient(jnp.mean(q_cloud, axis=0))
+
+        # 2. 估算最后一步的 bootstrap_v (V(s'))
+        # 同样的配方，给 bootstrap_act 加上扰动云求均值
+        boot_obs_expanded = jnp.broadcast_to(bootstrap_obs[None, ...], (K_v, *bootstrap_obs.shape))
+        boot_act_cloud = bootstrap_act[None, ...] + jax.random.normal(prng_v2,
+                                                                      (K_v, *bootstrap_act.shape)) * noise_scale
+        boot_act_cloud = jnp.clip(boot_act_cloud, -1.0, 1.0)
+
+        boot_q_cloud, _ = networks.value_mlp_fwd_with_features(state.params.value,
+                                                               jnp.concatenate([boot_obs_expanded, boot_act_cloud],
+                                                                               axis=-1))
+        bootstrap_v = jax.lax.stop_gradient(jnp.mean(boot_q_cloud, axis=0))
+
+        # 3. 终极 GAE：传入你亲手锻造的平滑 V(s)
         target_qs, _ = jax.lax.stop_gradient(
             rollouts.compute_gae(
                 truncation=transitions.truncation,
                 discount=transitions.discount * config.discounting,
                 rewards=transitions.reward * config.reward_scaling,
-                values=q_pred,
-                bootstrap_value=jax.lax.stop_gradient(bootstrap_q),
+                values=v_pred,  # 👑 放入纯正的伪 V(s)
+                bootstrap_value=bootstrap_v,  # 👑 放入纯正的伪 V(s')
                 gae_lambda=config.gae_lambda,
             )
         )
