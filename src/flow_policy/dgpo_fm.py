@@ -174,12 +174,13 @@ class DGPOFMState:
             None, length=cfg.loop_v
         )
 
-        # 在 _step_minibatch 里接收它：
-        probs, td_error_abs, fresh_metrics = self._compute_fresh_weights(new_v_params, obs_flat, pool_actions,
-                                                                         target_qs)
+        # 👑 抓取 Critic 最新鲜的全局健康度指标！
+        final_v_loss = extra_v_metrics["v_loss/total"][-1]
+
+        # _compute_fresh_weights 里再也不需要传 target_qs 去算局部误差了
+        probs, fresh_metrics = self._compute_fresh_weights(new_v_params, obs_flat, pool_actions)
 
         def policy_loss_fn(p_params):
-            # 👑 裂变出 p_trust 用于信任度抽签
             M = cfg.num_epsilon_samples
             p_idx, p_eps, p_t, p_acc, p_trust = jax.random.split(prng_pol, 5)
             logits = jnp.log(probs + 1e-8)
@@ -226,29 +227,23 @@ class DGPOFMState:
                 valid_mask = jnp.broadcast_to(valid_mask_single, (N, M))
 
             # ==========================================
-            # 👑 治本绝杀：环境原生尺度下的线性信任概率 & 硬重采样
+            # 👑 终极进化：宏观健康度熔断 (Global Critic-Health Gating)
             # ==========================================
-            # 1. 把 TD 误差除以 reward_scaling，还原真实物理误差
-            normalized_td_error = td_error_abs / cfg.reward_scaling
+            # 设定一个全局 v_loss 的“健康天花板” (需要根据你 TensorBoard 里的正常 v_loss 曲线来定)
+            # 比如：正常的 Huber v_loss 大约在 20.0 左右，超过 100.0 就说明 Critic 疯了
+            v_loss_ceiling = 1000.0
 
-            # 2. 设定原生环境下的真实容忍度
-            base_tolerance = cfg.base_tolerance
+            # 计算全局统一的信任概率 (v_loss 为 0 时概率为 1.0，达到天花板时跌到谷底)
+            raw_global_trust = 1.0 - (final_v_loss / v_loss_ceiling)
 
-            # 3. 计算线性理论概率 (0.0 -> 1.0; >= 5.0 -> 0.0)
-            raw_trust = 1.0 - (normalized_td_error / base_tolerance)
+            # 强制保底 1% 的存活率
+            global_trust_prob = jnp.clip(raw_global_trust, 0.01, 1.0)
 
-            # 4. 强制保底 1% 的存活概率 (既然是概率抽签，0.01 意味着 100 次至少留 1 次去探索)
-            min_trust_weight = 0.01
-            trust_prob = jnp.clip(raw_trust, min_trust_weight, 1.0)  # 形状是 (N, 1)
-
-            # 👑 5. 纯正物理重采样：掷骰子！
-            # (注意：要在外层把 p_trust 从 prng_pol 里 split 出来！)
+            # 所有人面临相同的命运审判！(N, 1) 的随机数与同一个标量概率比较
             trust_rand = jax.random.uniform(p_trust, (N, 1))
+            trust_hard_mask = (trust_rand < global_trust_prob).astype(jnp.float32)
 
-            # 只有随机数小于理论概率时，面具才是 1.0，否则是 0.0
-            trust_hard_mask = (trust_rand < trust_prob).astype(jnp.float32)
-
-            # 把这把“信任屠刀”和你的 1/K 抽签结果合并
+            # 屠刀落下：大盘越稳，存活的人越多；大盘越崩，全军覆没
             final_valid_mask = valid_mask * trust_hard_mask
 
             # ==========================================
@@ -280,8 +275,8 @@ class DGPOFMState:
                 "q_guided/fake_win_ratio": jnp.mean(is_fake.astype(jnp.float32)),
                 "q_guided/fake_accept_ratio": actual_fake_accept_rate,
                 "q_guided/overall_valid_ratio": jnp.mean(valid_mask),  # 原始通过率
-                "q_guided/trust_prob_mean": jnp.mean(trust_prob),  # 👑 监控：理论上系统有多信任 Critic
-                "q_guided/final_effective_ratio": jnp.mean(final_valid_mask),  # 👑 监控：经过双重屠刀后，最终存活了多少数据
+                "q_guided/global_trust_prob": global_trust_prob, # 👑 极其重要的宏观经济指标！
+                "q_guided/final_effective_ratio": jnp.mean(final_valid_mask),
             }
 
         (p_loss, p_metrics), p_grads = jax.value_and_grad(policy_loss_fn, has_aux=True)(self.params.policy)
