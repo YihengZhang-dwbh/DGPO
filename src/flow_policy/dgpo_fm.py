@@ -614,7 +614,7 @@ class DGPOFMState:
             v_z = (final_v_loss - hat_v) / v_std
 
             # 👑 别再写 0.1 了，把这里改成引用 config 里的变量！
-            r_trust = jnp.clip(jnp.exp(-jnp.maximum(-r_z - cfg.tolerance_r, 0.0) / 0.5), 0.01, 1.0)
+            r_trust = jnp.clip(jnp.exp(-jnp.maximum(-r_z + cfg.tolerance_r, 0.0) / 0.5), 0.01, 1.0)
             v_trust = jnp.clip(jnp.exp(-jnp.maximum(v_z - cfg.tolerance_v, 0.0) / 0.5), 0.01, 1.0)
 
             trust_mask = (jax.random.uniform(p_trust, (N, M)) < jnp.where(is_real, r_trust, v_trust)).astype(
