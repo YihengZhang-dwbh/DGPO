@@ -99,8 +99,10 @@ class DGPOFMState:
     opt_state_value: optax.OptState
     prng: Array
     steps: Array
-    # 👑 动态接受率的 EMA 跟踪器
+
     ema_reward: jnp.ndarray = dataclasses.field(default_factory=lambda: jnp.zeros(()))
+    # 👑 新增：维护 Reward 的平方，用来算动态标准差
+    ema_reward_sq: jnp.ndarray = dataclasses.field(default_factory=lambda: jnp.zeros(()))
     ema_v_loss: jnp.ndarray = dataclasses.field(default_factory=lambda: jnp.zeros(()))
     ema_v_loss_sq: jnp.ndarray = dataclasses.field(default_factory=lambda: jnp.zeros(()))
 
@@ -209,11 +211,23 @@ class DGPOFMState:
                 is_fake_accepted = is_fake & (rand_vals < accept_threshold)
                 valid_mask = jnp.broadcast_to((is_real | is_fake_accepted).astype(jnp.float32), (N, M))
 
-            safe_ema_reward = jnp.where(self.steps == 0, mb_mean_reward, self.ema_reward)
             safe_ema_v_loss = jnp.where(self.steps == 0, final_v_loss, self.ema_v_loss)
             safe_ema_v_loss_sq = jnp.where(self.steps == 0, jnp.square(final_v_loss), self.ema_v_loss_sq)
 
-            is_breakthrough = mb_mean_reward > (safe_ema_reward + 1e-4)
+            # ==========================================
+            # 👑 轨 1：全自动量纲适应的突破通道 (特权通道)
+            # ==========================================
+            safe_ema_reward = jnp.where(self.steps == 0, mb_mean_reward, self.ema_reward)
+            safe_ema_reward_sq = jnp.where(self.steps == 0, jnp.square(mb_mean_reward), self.ema_reward_sq)
+
+            # 计算 Reward 的动态标准差
+            reward_var = jnp.maximum(safe_ema_reward_sq - jnp.square(safe_ema_reward), 0.0)
+            reward_std = jnp.sqrt(reward_var) + 1e-5
+
+            # 真正的突破定义：不仅要大于均值，还要超出历史波动的一定比例（比如 0.5 个标准差）
+            # 这样就能完美过滤掉平时原地的微小震荡！
+            is_breakthrough = mb_mean_reward > (safe_ema_reward + 0.5 * reward_std)
+
             v_loss_var = jnp.maximum(safe_ema_v_loss_sq - jnp.square(safe_ema_v_loss), 0.0)
             v_loss_std = jnp.sqrt(v_loss_var) + 1e-5
             z_score = (final_v_loss - safe_ema_v_loss) / v_loss_std
@@ -280,7 +294,17 @@ class DGPOFMState:
             ema_decay * self.ema_v_loss_sq + (1.0 - ema_decay) * jnp.square(final_v_loss)
         )
 
+        # ... 前面的 ema_reward 和 ema_v_loss 更新 ...
+
+        new_ema_reward_sq = jnp.where(
+            self.steps == 0,
+            jnp.square(mb_mean_reward),
+            ema_decay * self.ema_reward_sq + (1.0 - ema_decay) * jnp.square(mb_mean_reward)
+        )
+
         final_metrics["ema/reward"] = new_ema_reward
+        final_metrics["ema/reward_std"] = jnp.sqrt(
+            jnp.maximum(new_ema_reward_sq - jnp.square(new_ema_reward), 0.0))  # 顺手记录到面板里！
         final_metrics["ema/v_loss"] = new_ema_v_loss
         final_metrics["ema/v_loss_sq"] = new_ema_v_loss_sq
 
@@ -292,6 +316,7 @@ class DGPOFMState:
             steps=self.steps + 1,
             prng=next_prng,
             ema_reward=new_ema_reward,
+            ema_reward_sq=new_ema_reward_sq,  # 👑 别忘了塞进 State！
             ema_v_loss=new_ema_v_loss,
             ema_v_loss_sq=new_ema_v_loss_sq
         )
