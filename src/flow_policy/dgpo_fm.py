@@ -579,7 +579,7 @@ class DGPOFMState:
                                         t_embed) * cfg.policy_mlp_output_scale
             return x + (t_n - t_c) * vel, None
 
-        gen_acts, _ = jax.lax.scan(gen_step, jax.random.normal(prng_gen, (N, cfg.num_generated_actions, act_dim)), ...)
+        gen_acts, _ = jax.lax.scan(gen_step, jax.random.normal(prng_gen, (N, cfg.num_generated_actions, act_dim)), (fast_t_curr, fast_t_next))
 
         # 3. 👑 拼接动作池 (全是原像 Pre-images)
         # 现在两者形状都是 (30720, ..., 6)，可以安全拼接了
