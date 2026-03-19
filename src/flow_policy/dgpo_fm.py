@@ -411,27 +411,20 @@ class DGPOFMState:
                 "q_guided/v_loss_z_score": v_z,
             }
 
+        # --- 4. 梯度更新 ---
         (p_loss, p_metrics), p_grads = jax.value_and_grad(policy_loss_fn, has_aux=True)(self.params.policy)
         p_updates, new_p_opt = self.opt_policy.update(p_grads, self.opt_state_policy, self.params.policy)
 
-        final_metrics = {**{k: v[-1] for k, v in extra_v_metrics.items()}, **p_metrics, **fresh_metrics}
+        # 👑 Actor 专属的 Metrics
+        final_metrics = {**p_metrics, **fresh_metrics}
 
-        ema_decay = self.config.beta_v
-        new_ema_v_loss = ema_decay * self.ema_v_loss + (1.0 - ema_decay) * final_v_loss
-        new_ema_v_loss_sq = ema_decay * self.ema_v_loss_sq + (1.0 - ema_decay) * jnp.square(final_v_loss)
-
-        final_metrics["ema/v_loss"] = new_ema_v_loss
-        final_metrics["ema/v_loss_sq"] = new_ema_v_loss_sq
-
+        # 👑 只更新 Actor 的参数、优化器状态和步数
         new_state = jdc.replace(
             self,
-            params=DGPOFMParams(optax.apply_updates(self.params.policy, p_updates), new_v_params),
+            params=jdc.replace(self.params, policy=optax.apply_updates(self.params.policy, p_updates)),
             opt_state_policy=new_p_opt,
-            opt_state_value=new_v_opt_state,
-            steps=self.steps + 1,
-            prng=next_prng,
-            ema_v_loss=new_ema_v_loss,
-            ema_v_loss_sq=new_ema_v_loss_sq
+            steps=self.steps + 1,  # 同步内层步数
+            prng=next_prng
         )
 
         return new_state, final_metrics
