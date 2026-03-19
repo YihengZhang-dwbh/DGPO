@@ -128,7 +128,6 @@ class DGPOFMState:
 
     # 👑 修复 1：移除外挂 prng 参数，直接从 self 中取
     def _step_minibatch(self, transitions: DGPOFMTransition) -> tuple[DGPOFMState, dict[str, Array]]:
-        # 👑 从自身状态裂变出新的 key
         prng_gen, prng_pol, next_prng = jax.random.split(self.prng, 3)
         cfg, sch = self.config, self.get_schedule()
 
@@ -136,7 +135,7 @@ class DGPOFMState:
         obs_dim, act_dim, t_dim = self.env.observation_size, self.env.action_size, cfg.timestep_embed_dim
 
         obs_flat = ((
-                            transitions.obs - self.obs_stats.mean) / self.obs_stats.std if cfg.normalize_observations else transitions.obs).reshape(
+                                transitions.obs - self.obs_stats.mean) / self.obs_stats.std if cfg.normalize_observations else transitions.obs).reshape(
             (N, obs_dim))
         target_qs = transitions.action_info.target_qs.reshape((N, 1))
 
@@ -157,10 +156,7 @@ class DGPOFMState:
 
         gen_acts, _ = jax.lax.scan(gen_step, jax.random.normal(prng_gen, (N, K, act_dim)),
                                    (fast_t_current, fast_t_next))
-
-        # 👑 源头物理防线：生成完立刻上缓冲带！Actor 绝对看不见 1.1 以外的数字！
         gen_acts = jnp.clip(gen_acts, -1.1, 1.1)
-
         pool_actions = jnp.concatenate([transitions.action.reshape((N, 1, act_dim)), gen_acts], axis=1)
 
         def value_inner_step(carry, _):
@@ -173,116 +169,63 @@ class DGPOFMState:
 
             (v_loss_val, _), v_grads = jax.value_and_grad(v_loss_fn, has_aux=True)(v_p)
             v_updates, next_v_opt = self.opt_value.update(v_grads, v_opt, v_p)
-
             return (optax.apply_updates(v_p, v_updates), next_v_opt), {"v_loss/total": v_loss_val}
 
         (new_v_params, new_v_opt_state), extra_v_metrics = jax.lax.scan(
-            value_inner_step,
-            (self.params.value, self.opt_state_value),
-            None, length=cfg.loop_v
+            value_inner_step, (self.params.value, self.opt_state_value), None, length=cfg.loop_v
         )
 
-        # 👑 抓取 Critic 最新鲜的全局健康度指标！
+        # 👑 修复1：使用正确的 Key 提取 Critic Loss
         final_v_loss = extra_v_metrics["v_loss/total"][-1]
-
-        # _compute_fresh_weights 里再也不需要传 target_qs 去算局部误差了
         probs, fresh_metrics = self._compute_fresh_weights(new_v_params, obs_flat, pool_actions)
 
-        # ==========================================
-        # 👇 👑 极速修复：在 policy_loss_fn 外面提前算好这俩标量！
-        # ==========================================
+        # 👑 修复2：在闭包外提前计算好 mb_mean_reward
         mb_mean_reward = jnp.mean(transitions.reward)
-
-        # ⚠️ 注意：这里要把 final_v_loss 也提前准备好！
-        # 如果你前面刚更新完 Critic，应该能从 Critic 的 metrics 里拿到 v_loss
-        # 比如：final_v_loss = extra_v_metrics["value_loss"][-1]
-        # (请根据你代码里实际存放 Critic Loss 的变量名来写)
-        final_v_loss = extra_v_metrics["value_loss"][-1]
 
         def policy_loss_fn(p_params):
             M = cfg.num_epsilon_samples
             p_idx, p_eps, p_t, p_acc, p_trust = jax.random.split(prng_pol, 5)
             logits = jnp.log(probs + 1e-8)
 
-            # 👑 1/K 无偏密度修正核心 (抛弃硬截断吸收池)
-            # ==========================================
-            K = cfg.num_generated_actions
-            accept_threshold = 1.0 / K  # 核心数学配平系数
+            accept_threshold = 1.0 / K
 
             if cfg.independent_noise_sampling:
-                # 模式 A: 8个噪声各自抽签
                 sampled_indices = jax.random.categorical(p_idx, jnp.broadcast_to(logits[:, None, :], (N, M, K + 1)),
                                                          axis=-1)
                 a_target = jnp.take_along_axis(pool_actions[:, None, :, :], sampled_indices[..., None, None],
                                                axis=2).squeeze(2)
                 rand_vals = jax.random.uniform(p_acc, (N, M))
-
                 is_real = (sampled_indices == 0)
                 is_fake = (sampled_indices > 0)
-
-                # 👑 假动作面临 1/K 的命运审判
                 is_fake_accepted = is_fake & (rand_vals < accept_threshold)
                 valid_mask = (is_real | is_fake_accepted).astype(jnp.float32)
-
             else:
-                # 模式 B: 一发入魂模式
-                sampled_indices = jax.random.categorical(p_idx, logits, axis=-1)[:, None]  # (N, 1)
+                sampled_indices = jax.random.categorical(p_idx, logits, axis=-1)[:, None]
                 a_target = jnp.broadcast_to(pool_actions[jnp.arange(N), sampled_indices[:, 0]][:, None, :],
                                             (N, M, act_dim))
-
-                # 只生成 (N, 1) 的随机数
                 rand_vals = jax.random.uniform(p_acc, (N, 1))
+                is_real = (sampled_indices == 0)
+                is_fake = (sampled_indices > 0)
+                is_fake_accepted = is_fake & (rand_vals < accept_threshold)
+                valid_mask = jnp.broadcast_to((is_real | is_fake_accepted).astype(jnp.float32), (N, M))
 
-                is_real = (sampled_indices == 0)  # (N, 1)
-                is_fake = (sampled_indices > 0)  # (N, 1)
-
-                # 👑 假动作面临 1/K 的命运审判
-                is_fake_accepted = is_fake & (rand_vals < accept_threshold)  # (N, 1)
-
-                # 此时 valid_mask_single 的形状是纯正的 (N, 1)
-                valid_mask_single = (is_real | is_fake_accepted).astype(jnp.float32)
-
-                # 广播为 (N, M)
-                valid_mask = jnp.broadcast_to(valid_mask_single, (N, M))
-
-            # ==========================================
-            # 👑 终极进化：基于 EMA 与 Z-Score 的双轨制动态熔断
-            # ==========================================
-            # 为了防止 step=0 时 EMA 全部是 0 导致的数值爆炸，我们加一个冷启动保护
             safe_ema_reward = jnp.where(self.steps == 0, mb_mean_reward, self.ema_reward)
             safe_ema_v_loss = jnp.where(self.steps == 0, final_v_loss, self.ema_v_loss)
             safe_ema_v_loss_sq = jnp.where(self.steps == 0, jnp.square(final_v_loss), self.ema_v_loss_sq)
 
-            # 轨 1：特权通道 (突破性 Reward)
-            # 只要当前平均奖励超过了历史 EMA（加一个极小的 1e-4 防止前期震荡），直接判定为突破！
             is_breakthrough = mb_mean_reward > (safe_ema_reward + 1e-4)
-
-            # 轨 2：常规通道 (基于 v_loss Z-Score 的动态衰减)
-            # ⚠️ 极客防线：计算方差时，必须用 jnp.maximum 兜底！
             v_loss_var = jnp.maximum(safe_ema_v_loss_sq - jnp.square(safe_ema_v_loss), 0.0)
-            v_loss_std = jnp.sqrt(v_loss_var) + 1e-5  # 加 epsilon 防止除以 0
-
-            # 计算当前 v_loss 偏离了历史均值几个标准差 (Z-Score)
+            v_loss_std = jnp.sqrt(v_loss_var) + 1e-5
             z_score = (final_v_loss - safe_ema_v_loss) / v_loss_std
 
-            # 我们给 Critic 一定的宽容度：在 1 个标准差以内，完全信任 (z_score < 1.0 时为 0)
-            # 超过 1 个标准差的部分，使用指数衰减，比硬线性的 clip 更平滑优雅
             z_trust_prob = jnp.exp(-jnp.maximum(z_score - 1.0, 0.0) / 1.5)
-            z_trust_prob = jnp.clip(z_trust_prob, 0.01, 1.0)  # 保底 1% 的存活率
-
-            # 👑 双轨合并：如果是突破性探索，无视 v_loss 的抗议，强行 100% 绿灯放行！否则走常规通道。
+            z_trust_prob = jnp.clip(z_trust_prob, 0.01, 1.0)
             global_trust_prob = jnp.where(is_breakthrough, 1.0, z_trust_prob)
 
-            # 所有人面临相同的命运审判 (🗑️ 删掉了多余的重复代码！)
             trust_rand = jax.random.uniform(p_trust, (N, 1))
             trust_hard_mask = (trust_rand < global_trust_prob).astype(jnp.float32)
-
-            # 屠刀落下：大盘越稳，存活的人越多；大盘越崩，全军覆没
             final_valid_mask = valid_mask * trust_hard_mask
 
-            # ==========================================
-            # 📈 统一计算全新漏斗监控指标
-            # ==========================================
             total_fake_winners = jnp.maximum(1.0, jnp.sum(is_fake.astype(jnp.float32)))
             actual_fake_accept_rate = jnp.sum(is_fake_accepted.astype(jnp.float32)) / total_fake_winners
 
@@ -300,7 +243,6 @@ class DGPOFMState:
             else:
                 err = jnp.sum((vel - (eps - a_target)) ** 2, axis=-1)
 
-            # 👑 全局均值期望：吸收池完美生效！
             loss = jnp.mean(err * final_valid_mask)
 
             return loss, {
@@ -308,11 +250,9 @@ class DGPOFMState:
                 "q_guided/real_win_ratio": jnp.mean(is_real.astype(jnp.float32)),
                 "q_guided/fake_win_ratio": jnp.mean(is_fake.astype(jnp.float32)),
                 "q_guided/fake_accept_ratio": actual_fake_accept_rate,
-                "q_guided/overall_valid_ratio": jnp.mean(valid_mask),  # 原始通过率
+                "q_guided/overall_valid_ratio": jnp.mean(valid_mask),
                 "q_guided/global_trust_prob": global_trust_prob,
                 "q_guided/final_effective_ratio": jnp.mean(final_valid_mask),
-
-                # 🚨 必须补充的灵魂指标！
                 "q_guided/ema_is_breakthrough": is_breakthrough.astype(jnp.float32),
                 "q_guided/ema_v_loss_z_score": z_score,
                 "q_guided/ema_v_loss_std": v_loss_std,
@@ -321,38 +261,24 @@ class DGPOFMState:
         (p_loss, p_metrics), p_grads = jax.value_and_grad(policy_loss_fn, has_aux=True)(self.params.policy)
         p_updates, new_p_opt = self.opt_policy.update(p_grads, self.opt_state_policy, self.params.policy)
 
-        # 👑 1. 先把所有 metrics 缝合起来，这样才能提取到当步真实的 v_loss
         final_metrics = {**{k: v[-1] for k, v in extra_v_metrics.items()}, **p_metrics, **fresh_metrics}
 
-        # 👑 2. 提取当前真实指标 (兼容两种常见的 loss 命名习惯)
-        current_v_loss = final_metrics.get("value_loss", final_metrics.get("v_loss", 0.0))
-        mb_mean_reward = jnp.mean(transitions.reward)
-
-        # 👑 3. 执行 EMA 平滑滚动 (0.999 抵御 Minibatch 高频刷新)
         ema_decay = 0.999
-
         new_ema_reward = jnp.where(
-            self.steps == 0,
-            mb_mean_reward,
-            ema_decay * self.ema_reward + (1.0 - ema_decay) * mb_mean_reward
+            self.steps == 0, mb_mean_reward, ema_decay * self.ema_reward + (1.0 - ema_decay) * mb_mean_reward
         )
         new_ema_v_loss = jnp.where(
-            self.steps == 0,
-            current_v_loss,
-            ema_decay * self.ema_v_loss + (1.0 - ema_decay) * current_v_loss
+            self.steps == 0, final_v_loss, ema_decay * self.ema_v_loss + (1.0 - ema_decay) * final_v_loss
         )
         new_ema_v_loss_sq = jnp.where(
-            self.steps == 0,
-            jnp.square(current_v_loss),
-            ema_decay * self.ema_v_loss_sq + (1.0 - ema_decay) * jnp.square(current_v_loss)
+            self.steps == 0, jnp.square(final_v_loss),
+            ema_decay * self.ema_v_loss_sq + (1.0 - ema_decay) * jnp.square(final_v_loss)
         )
 
-        # 👑 4. 把 EMA 指标塞进 TensorBoard
         final_metrics["ema/reward"] = new_ema_reward
         final_metrics["ema/v_loss"] = new_ema_v_loss
         final_metrics["ema/v_loss_sq"] = new_ema_v_loss_sq
 
-        # 👑 5. 一波带走：生成最终的 State (去掉了坑人的省略号，彻底完整！)
         new_state = jdc.replace(
             self,
             params=DGPOFMParams(optax.apply_updates(self.params.policy, p_updates), new_v_params),
@@ -360,7 +286,6 @@ class DGPOFMState:
             opt_state_value=new_v_opt_state,
             steps=self.steps + 1,
             prng=next_prng,
-            # 缝入新鲜出炉的 EMA
             ema_reward=new_ema_reward,
             ema_v_loss=new_ema_v_loss,
             ema_v_loss_sq=new_ema_v_loss_sq
