@@ -298,15 +298,18 @@ class DGPOFMState:
         N, K_plus_1, act_dim = pool_actions.shape
         flat_obs = obs_norm.reshape((N, self.env.observation_size))
         obs_pool_b = jnp.broadcast_to(flat_obs[:, None, :], (N, K_plus_1, flat_obs.shape[-1]))
-        # 👑 你的神来之笔：在送给 Critic 之前，强行投影回物理流形！
+        # 1. 👑 给 Actor 留一点“刹车缓冲带”，彻底切断 16.9 这种数值爆炸，但允许微小越界
+        margin = 1.1
+        pool_actions = jnp.clip(pool_actions, -margin, margin)
+
+        # 2. 👑 送给 Critic 时，依然执行绝对严格的物理截断，防止幻觉
         eval_actions = jnp.clip(pool_actions, -1.0, 1.0)
 
-        # Critic 只看合法的动作，给出绝对客观、没有外推幻觉的真实 Q 值
         q_pool, _ = networks.value_mlp_fwd_with_features(value_params,
                                                          jnp.concatenate([obs_pool_b, eval_actions], axis=-1))
         q_pool = jax.lax.stop_gradient(q_pool)
 
-        # 后续拿着这个纯净的 q_pool，直接去算胜率、做 ANO 惩罚、更新 Actor
+        # 后面拿着 pool_actions (带缓冲带的) 去做 ANO 距离惩罚和更新 Actor
 
         # 🗑️ 之前的 target_qs_safe, q_real, td_error_abs 全部被删除了！
         # 现在的它只负责纯粹的内部竞争博弈！
