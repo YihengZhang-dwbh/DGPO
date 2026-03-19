@@ -484,50 +484,60 @@ class DGPOFMState:
     # ==========================================
     # 👑 阶段三辅助函数：只更新 Actor
     # ==========================================
-    def _update_actor_only(self, transitions: DGPOFMTransition, prng: Array, global_v_loss: Array) -> tuple[DGPOFMState, dict[str, Array]]:
-        cfg = self.config  # 👑 就是这一行！
-        # ...
-        obs_dim = self.env.observation_size
-        # 👑 同样修复 N 的计算
-        N = transitions.obs.size // obs_dim
+    def _update_actor_only(self, transitions: DGPOFMTransition, prng: Array, global_v_loss: Array) -> tuple[
+        DGPOFMState, dict[str, Array]]:
+        cfg, sch = self.config, self.get_schedule()
+        prng_gen, prng_pol, next_prng = jax.random.split(prng, 3)
 
+        obs_dim = self.env.observation_size
+        act_dim = self.env.action_size
+        t_dim = cfg.timestep_embed_dim
+
+        # 👑 动态计算 N，确保适配 Minibatch 形状
+        N = transitions.obs.size // obs_dim
         obs_flat = ((transitions.obs - self.obs_stats.mean) / self.obs_stats.std
                     if cfg.normalize_observations else transitions.obs).reshape((N, obs_dim))
-        # ...
 
-        # 此时使用传入的全局平均 V-Loss，而不是 minibatch 局部的
+        # 🎯 核心输入：本轮全局大盘分和当前 Batch 的 Reward
         final_v_loss = global_v_loss
         mb_mean_reward = jnp.mean(transitions.reward)
 
+        # ==========================================
+        # 1. 快速生成动作池 (3步 Euler 采样)
+        # ==========================================
         K = cfg.num_generated_actions
         obs_b_gen = jnp.broadcast_to(obs_flat[:, None, :], (N, K, obs_dim))
-
-        # 生成动作池逻辑 (保持原样)
         fast_flow_steps = 3
         fast_full_t = jnp.linspace(1.0, 0.0, fast_flow_steps + 1)
-        fast_t_current, fast_t_next = fast_full_t[:-1], fast_full_t[1:]
+        fast_t_curr, fast_t_next = fast_full_t[:-1], fast_full_t[1:]
 
         def gen_step(x, t_tup):
-            t_curr, t_next = t_tup
-            # 👑 建议改成这样，直接从外层拿到 cfg 和 t_dim
-            t_embed_raw = self.embed_timestep(jnp.array([t_curr])[..., None])
-            t_embed = jnp.broadcast_to(t_embed_raw[:, None, :], (N, K, t_dim))
-            vel = networks.flow_mlp_fwd(jax.lax.stop_gradient(self.params.policy), obs_b_gen, x, t_embed) * cfg.policy_mlp_output_scale
-            return x + (t_next - t_curr) * vel, None
+            t_c, t_n = t_tup
+            t_embed = jnp.broadcast_to(self.embed_timestep(jnp.array([t_c])[..., None])[:, None, :], (N, K, t_dim))
+            vel = networks.flow_mlp_fwd(jax.lax.stop_gradient(self.params.policy), obs_b_gen, x,
+                                        t_embed) * cfg.policy_mlp_output_scale
+            return x + (t_n - t_c) * vel, None
 
-        gen_acts, _ = jax.lax.scan(gen_step, jax.random.normal(prng_gen, (N, K, act_dim)),
-                                   (fast_t_current, fast_t_next))
+        gen_acts, _ = jax.lax.scan(gen_step, jax.random.normal(prng_gen, (N, K, act_dim)), (fast_t_curr, fast_t_next))
+        # 组合池：[真动作 (1个), 假动作 (K个)]
         pool_actions = jnp.concatenate([transitions.action.reshape((N, 1, act_dim)), jnp.clip(gen_acts, -1.1, 1.1)],
                                        axis=1)
 
+        # ==========================================
+        # 2. 计算重采样权重 (Q-Guided Probs)
+        # ==========================================
         probs, fresh_metrics = self._compute_fresh_weights(self.params.value, obs_flat, pool_actions)
 
+        # ==========================================
+        # 3. 策略损失闭包 (包含信任域熔断逻辑)
+        # ==========================================
         def policy_loss_fn(p_params):
             M = cfg.num_epsilon_samples
             p_idx, p_eps, p_t, p_acc, p_trust = jax.random.split(prng_pol, 5)
             logits = jnp.log(probs + 1e-8)
             accept_threshold = 1.0 / K
 
+            # --- 采样与基础掩码 ---
             if cfg.independent_noise_sampling:
                 sampled_indices = jax.random.categorical(p_idx, jnp.broadcast_to(logits[:, None, :], (N, M, K + 1)),
                                                          axis=-1)
@@ -546,7 +556,7 @@ class DGPOFMState:
 
             valid_mask = (is_real | is_fake_accepted).astype(jnp.float32)
 
-            # --- Bias Correction (基于外层 Rollout 步数) ---
+            # --- 👑 同步偏差校正 (基于 Rollout 步数) ---
             t_outer = (self.steps // (cfg.num_updates_per_batch * cfg.num_minibatches)) + 1.0
             bc_v = 1.0 - jnp.power(cfg.beta_v, t_outer)
             bc_r = 1.0 - jnp.power(cfg.beta_r, t_outer)
@@ -554,39 +564,47 @@ class DGPOFMState:
             hat_r, hat_r_sq = self.ema_reward / bc_r, self.ema_reward_sq / bc_r
             hat_v, hat_v_sq = self.ema_v_loss / bc_v, self.ema_v_loss_sq / bc_v
 
-            reward_std = jnp.sqrt(jnp.maximum(hat_r_sq - jnp.square(hat_r), 0.0)) + 1e-5
-            reward_z_score = (mb_mean_reward - hat_r) / reward_std
-            v_loss_std = jnp.sqrt(jnp.maximum(hat_v_sq - jnp.square(hat_v), 0.0)) + 1e-5
-            v_loss_z_score = (final_v_loss - hat_v) / v_loss_std
+            # --- Z-Score & 信任概率 ---
+            r_std = jnp.sqrt(jnp.maximum(hat_r_sq - jnp.square(hat_r), 0.0)) + 1e-5
+            v_std = jnp.sqrt(jnp.maximum(hat_v_sq - jnp.square(hat_v), 0.0)) + 1e-5
 
-            real_trust_prob = jnp.clip(jnp.exp(-jnp.maximum(-reward_z_score - 0.1, 0.0) / 0.5), 0.01, 1.0)
-            fake_trust_prob = jnp.clip(jnp.exp(-jnp.maximum(v_loss_z_score - 0.1, 0.0) / 0.5), 0.01, 1.0)
+            r_z = (mb_mean_reward - hat_r) / r_std
+            v_z = (final_v_loss - hat_v) / v_std
 
-            trust_mask = (jax.random.uniform(p_trust, (N, M)) < jnp.where(is_real, real_trust_prob,
-                                                                          fake_trust_prob)).astype(jnp.float32)
+            # 严格阈值 0.1，平滑系数 0.5
+            r_trust = jnp.clip(jnp.exp(-jnp.maximum(-r_z - 0.1, 0.0) / 0.5), 0.01, 1.0)
+            v_trust = jnp.clip(jnp.exp(-jnp.maximum(v_z - 0.1, 0.0) / 0.5), 0.01, 1.0)
+
+            trust_mask = (jax.random.uniform(p_trust, (N, M)) < jnp.where(is_real, r_trust, v_trust)).astype(
+                jnp.float32)
             final_valid_mask = valid_mask * trust_mask
 
-            # 速度场 Loss 计算...
+            # --- Flow Loss 计算 ---
             eps = jax.random.normal(p_eps, (N, M, act_dim))
             t = sch.t_current[jax.random.randint(p_t, (N, M, 1), 0, cfg.flow_steps)]
             x_t = t * eps + (1.0 - t) * a_target
-            vel = networks.flow_mlp_fwd(p_params, jnp.broadcast_to(obs_flat[:, None, :], (N, M, obs_dim)), x_t,
-                                        self.embed_timestep(t)) * cfg.policy_mlp_output_scale
-            err = jnp.sum((eps - ((x_t - t * vel) + vel)) ** 2 if cfg.output_mode == "u_but_supervise_as_eps" else (
-                                                                                                                               vel - (
-                                                                                                                                   eps - a_target)) ** 2,
-                          axis=-1)
+
+            t_embed = self.embed_timestep(t)
+            obs_p = jnp.broadcast_to(obs_flat[:, None, :], (N, M, obs_dim))
+            vel = networks.flow_mlp_fwd(p_params, obs_p, x_t, t_embed) * cfg.policy_mlp_output_scale
+
+            if cfg.output_mode == "u_but_supervise_as_eps":
+                err = jnp.sum((eps - ((x_t - t * vel) + vel)) ** 2, axis=-1)
+            else:
+                err = jnp.sum((vel - (eps - a_target)) ** 2, axis=-1)
+
             loss = jnp.mean(err * final_valid_mask)
 
             return loss, {
                 "policy_loss": loss,
+                "q_guided/real_trust_prob": r_trust,
+                "q_guided/fake_trust_prob": v_trust,
                 "q_guided/final_effective_ratio": jnp.mean(final_valid_mask),
-                "q_guided/real_trust_prob": real_trust_prob,
-                "q_guided/fake_trust_prob": fake_trust_prob,
-                "q_guided/reward_z_score": reward_z_score,
-                "q_guided/v_loss_z_score": v_loss_z_score,
+                "q_guided/reward_z_score": r_z,
+                "q_guided/v_loss_z_score": v_z,
             }
 
+        # --- 4. 梯度更新 ---
         (p_loss, p_metrics), p_grads = jax.value_and_grad(policy_loss_fn, has_aux=True)(self.params.policy)
         p_updates, new_p_opt = self.opt_policy.update(p_grads, self.opt_state_policy, self.params.policy)
 
@@ -594,7 +612,7 @@ class DGPOFMState:
             self,
             params=jdc.replace(self.params, policy=optax.apply_updates(self.params.policy, p_updates)),
             opt_state_policy=new_p_opt,
-            steps=self.steps + 1,
+            steps=self.steps + 1,  # 👑 在这里推进 steps，同步内层计数
             prng=next_prng
         )
         return new_state, {**p_metrics, **fresh_metrics}
