@@ -647,39 +647,64 @@ class DGPOFMState:
         new_action_info = jdc.replace(transitions.action_info, target_qs=target_qs)
         new_transitions = jdc.replace(transitions, action_info=new_action_info)
 
-        # 👑 阶段一：全量 Critic 更新 (得到 37.83)
-        def critic_step(carry, transitions_minibatch): # 👑 注意这里第二个参数
-            return carry._update_critic_only(transitions_minibatch, jax.random.fold_in(carry.prng, carry.steps))
+        # ==========================================
+        # 👑 阶段一：Critic 更新 (双层 Scan)
+        # ==========================================
+        def critic_epoch_step(carry_state, _):
+            # 1. 每一轮 Epoch 开始前，重新打乱并切分 Minibatches
+            # 注意这里 fold_in 用了 steps，保证每轮 Epoch 的打乱顺序不同
+            minibatches = new_transitions.prepare_minibatches(
+                jax.random.fold_in(carry_state.prng, carry_state.steps),
+                config.num_minibatches,
+                config.batch_size
+            )
 
-        # 👑 确保 xs 传入的是切分好的 minibatches
+            # 2. 内层 Scan：跑完所有的 32 个 Minibatch
+            def minibatch_scan_fn(ms, mb):
+                return ms._update_critic_only(mb, jax.random.fold_in(ms.prng, ms.steps + 1))
+
+            final_ms, mb_metrics = jax.lax.scan(minibatch_scan_fn, init=carry_state, xs=minibatches)
+            return final_ms, mb_metrics
+
+        # 外层跑 16 个 Epoch
         state_after_v, all_v_metrics = jax.lax.scan(
-            critic_step,
-            init=state,
-            xs=new_transitions.prepare_minibatches(jax.random.fold_in(state.prng, state.steps), config.num_minibatches, config.batch_size),
-            length=config.num_updates_per_batch # 如果 length 和 xs 的第 0 维长度不一致也会报错
+            critic_epoch_step, init=state, length=config.num_updates_per_batch
         )
 
-        # 👑 阶段二：同步更新 EMA (实时判官)
-        global_v_loss = jnp.mean(all_v_metrics["v_loss/total"])
-        batch_reward = jnp.mean(transitions.reward)
+        # 🎯 此时 all_v_metrics["v_loss/total"] 形状是 (16, 32)
+        current_global_v_loss = jnp.mean(all_v_metrics["v_loss/total"])
 
+        # ==========================================
+        # 👑 阶段二：同步更新 EMA (此时已拿到全局平均值)
+        # ==========================================
+        batch_reward = jnp.mean(transitions.reward)
         new_state = jdc.replace(
             state_after_v,
             ema_reward=config.beta_r * state_after_v.ema_reward + (1.0 - config.beta_r) * batch_reward,
             ema_reward_sq=config.beta_r * state_after_v.ema_reward_sq + (1.0 - config.beta_r) * jnp.square(
                 batch_reward),
-            ema_v_loss=config.beta_v * state_after_v.ema_v_loss + (1.0 - config.beta_v) * global_v_loss,
+            ema_v_loss=config.beta_v * state_after_v.ema_v_loss + (1.0 - config.beta_v) * current_global_v_loss,
             ema_v_loss_sq=config.beta_v * state_after_v.ema_v_loss_sq + (1.0 - config.beta_v) * jnp.square(
-                global_v_loss)
+                current_global_v_loss)
         )
 
-        # 👑 阶段三：全量 Actor 更新 (基于实时 EMA)
-        def actor_step(carry, _):
-            return carry._update_actor_only(
-                new_transitions.prepare_minibatches(jax.random.fold_in(carry.prng, carry.steps), config.num_minibatches,
-                                                    config.batch_size), jax.random.fold_in(carry.prng, carry.steps + 1),
-                global_v_loss)
+        # ==========================================
+        # 👑 阶段三：Actor 更新 (同样双层 Scan)
+        # ==========================================
+        def actor_epoch_step(carry_state, _):
+            minibatches = new_transitions.prepare_minibatches(
+                jax.random.fold_in(carry_state.prng, carry_state.steps),
+                config.num_minibatches,
+                config.batch_size
+            )
 
-        final_state, all_p_metrics = jax.lax.scan(actor_step, init=new_state, length=config.num_updates_per_batch)
+            def minibatch_scan_fn(ms, mb):
+                return ms._update_actor_only(mb, jax.random.fold_in(ms.prng, ms.steps + 2), current_global_v_loss)
+
+            return jax.lax.scan(minibatch_scan_fn, init=carry_state, xs=minibatches)
+
+        final_state, all_p_metrics = jax.lax.scan(
+            actor_epoch_step, init=new_state, length=config.num_updates_per_batch
+        )
 
         return final_state, {**all_v_metrics, **all_p_metrics}
