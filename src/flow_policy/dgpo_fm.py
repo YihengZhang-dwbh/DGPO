@@ -20,7 +20,7 @@ class DGPOFMConfig:
     # --- 全新 Q-Guided 生成控制核心 ---
     independent_noise_sampling: jdc.Static[bool] = True
     use_global_variance: jdc.Static[bool] = False
-    temp_func_type: jdc.Static[Literal["log", "cbrt", "std", "fixed"]] = "std"
+    temp_func_type: jdc.Static[Literal["log", "cbrt", "std", "fixed", "max"]] = "max"
     base_tolerance: float = 1.0
     resampling_alpha_k: float = 0.3
     resampling_alpha_min: float = 0.0001
