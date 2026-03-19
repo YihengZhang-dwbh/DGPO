@@ -100,9 +100,9 @@ class DGPOFMState:
     prng: Array
     steps: Array
     # 👑 动态接受率的 EMA 跟踪器
-    ema_reward: jnp.ndarray = struct.field(default_factory=lambda: jnp.zeros(()))
-    ema_v_loss: jnp.ndarray = struct.field(default_factory=lambda: jnp.zeros(()))
-    ema_v_loss_sq: jnp.ndarray = struct.field(default_factory=lambda: jnp.zeros(()))
+    ema_reward: jnp.ndarray = dataclasses.field(default_factory=lambda: jnp.zeros(()))
+    ema_v_loss: jnp.ndarray = dataclasses.field(default_factory=lambda: jnp.zeros(()))
+    ema_v_loss_sq: jnp.ndarray = dataclasses.field(default_factory=lambda: jnp.zeros(()))
 
     @staticmethod
     def init(prng: Array, env: jdc.Static[mjp.MjxEnv], config: DGPOFMConfig) -> DGPOFMState:
