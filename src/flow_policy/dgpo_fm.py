@@ -21,6 +21,8 @@ class DGPOFMConfig:
     independent_noise_sampling: jdc.Static[bool] = True
     use_global_variance: jdc.Static[bool] = False
     temp_func_type: jdc.Static[Literal["log", "cbrt", "std", "fixed", "max"]] = "max"
+    action_clip: jdc.Static[Literal["hard", "margin", "tanh"]] = "tanh"
+    clip_margin: float = 1.1  # 针对 margin 和 tanh 的系数 C
     base_tolerance: float = 1.0
     resampling_alpha_k: float = 0.3
     resampling_alpha_min: float = 0.0001
@@ -132,6 +134,17 @@ class DGPOFMState:
             opt_state_value=opt_value.init(network_params.value),
             prng=prng2, steps=jnp.zeros((), dtype=jnp.int32),
         )
+
+    def _apply_clip(self, x: Array) -> Array:
+        cfg = self.config
+        if cfg.action_clip == "hard":
+            return jnp.clip(x, -1.0, 1.0)
+        elif cfg.action_clip == "margin":
+            return jnp.clip(x, -cfg.clip_margin, cfg.clip_margin)
+        elif cfg.action_clip == "tanh":
+            # C * tanh(x/C) 保证了 0 附近的导数为 1，且范围覆盖 [-C, C]
+            return cfg.clip_margin * jnp.tanh(x / cfg.clip_margin)
+        return x
 
     # 👑 修复 1：移除外挂 prng 参数，直接从 self 中取
     def _step_minibatch(self, transitions: DGPOFMTransition) -> tuple[DGPOFMState, dict[str, Array]]:
@@ -346,11 +359,11 @@ class DGPOFMState:
         obs_pool_b = jnp.broadcast_to(flat_obs[:, None, :], (N, K_plus_1, flat_obs.shape[-1]))
 
         # 2. 👑 送给 Critic 时，依然执行绝对严格的物理截断，防止幻觉
-        # eval_actions = jnp.clip(pool_actions, -1.0, 1.0)
-        eval_actions = jnp.clip(pool_actions, -114514, 114514)
+        eval_actions = jnp.clip(pool_actions, -1.0, 1.0)
+        # eval_actions = jnp.clip(pool_actions, -114514, 114514)
         # 👑 你的软映射逻辑 (假设系数 C = 1.1)
-        C = 1.1
-        eval_actions = C * jnp.tanh(pool_actions / C)
+        # C = 1.1
+        # eval_actions = C * jnp.tanh(pool_actions / C)
 
         # 喂给 Critic 评分 (此处带 stop_gradient，完全不求导)
         q_pool, _ = networks.value_mlp_fwd_with_features(value_params,
@@ -427,9 +440,11 @@ class DGPOFMState:
         return jax.lax.stop_gradient(pool_probs), metrics
 
     def _compute_value_loss(self, value_params, obs_norm, actions, truncation, target_qs):
-        concat_inputs = jnp.concatenate([obs_norm, actions], axis=-1)
+        # 👑 修改点 2：Critic 训练时的输入映射
+        eval_actions = self._apply_clip(actions)
+        concat_inputs = jnp.concatenate([obs_norm, eval_actions], axis=-1)
         q_pred, _ = networks.value_mlp_fwd_with_features(value_params, concat_inputs)
-        q_pred = q_pred.reshape(target_qs.shape)
+        # ...
 
         v_error = (target_qs - q_pred) * (1 - truncation)
         mse_loss = jnp.mean(v_error ** 2)
@@ -470,9 +485,14 @@ class DGPOFMState:
         x0, _ = jax.lax.scan(euler_step, jax.random.normal(prng_sample, (*batch_dims, self.env.action_size)),
                              (self.get_schedule(), noise_path))
 
+        x_final = self._apply_clip(x0)
+
         if not deterministic:
-            x0 = x0 + jax.random.normal(prng_feather, (*batch_dims, self.env.action_size)) * self.config.feather_std
-        return x0, DGPOFMActionInfo()
+            x_final = x_final + jax.random.normal(prng_feather, ...) * self.config.feather_std
+            # 扰动后再次截断确保绝对安全
+            x_final = self._apply_clip(x_final)
+
+        return x_final, DGPOFMActionInfo()
 
     # ==========================================
     # 👑 阶段一辅助函数：只更新 Critic
@@ -558,11 +578,20 @@ class DGPOFMState:
             return x + (t_n - t_c) * vel, None
 
         gen_acts, _ = jax.lax.scan(gen_step, jax.random.normal(prng_gen, (N, K, act_dim)), (fast_t_curr, fast_t_next))
-        # 组合池：[真动作 (1个), 假动作 (K个)]
-        # pool_actions = jnp.concatenate([transitions.action.reshape((N, 1, act_dim)), jnp.clip(gen_acts, -1.1, 1.1)],
-        #                                axis=1)
-        pool_actions = jnp.concatenate([transitions.action.reshape((N, 1, act_dim)), jnp.clip(gen_acts, -114514, 114514)],
-                                       axis=1)
+        # 组合池
+        pool_actions = jnp.concatenate([
+            transitions.action.reshape((N, 1, act_dim)),
+            gen_acts
+        ], axis=1)
+
+        # 👑 修改点 3：对整个动作池进行统一映射
+        # 这一步极其关键：它同时决定了后面 _compute_fresh_weights 里的 Q 评测
+        # 以及 policy_loss_fn 里的速度场拟合目标 a_target
+        pool_actions = self._apply_clip(pool_actions)
+
+        # 后续的 probs 和 a_target 都会自动基于这个截断后的 pool_actions 运行
+        probs, fresh_metrics = self._compute_fresh_weights(self.params.value, obs_flat, pool_actions)
+        # ...
 
         # ==========================================
         # 2. 计算重采样权重 (Q-Guided Probs)
@@ -690,8 +719,12 @@ class DGPOFMState:
         boot_noise = jax.random.normal(prng_boot, (1, bootstrap_obs.shape[1], state.env.action_size))
         bootstrap_act, _ = jax.lax.scan(boot_step_fn, boot_noise,
                                         (state.get_schedule().t_current, state.get_schedule().t_next))
-        bootstrap_q, _ = networks.value_mlp_fwd_with_features(state.params.value,
-                                                              jnp.concatenate([bootstrap_obs, bootstrap_act], axis=-1))
+        clipped_boot_act = self._apply_clip(bootstrap_act)
+
+        bootstrap_q, _ = networks.value_mlp_fwd_with_features(
+            state.params.value,
+            jnp.concatenate([bootstrap_obs, clipped_boot_act], axis=-1)
+        )
 
         target_qs, _ = jax.lax.stop_gradient(
             rollouts.compute_gae(
