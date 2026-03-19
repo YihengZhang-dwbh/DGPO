@@ -348,7 +348,11 @@ class DGPOFMState:
         # 2. 👑 送给 Critic 时，依然执行绝对严格的物理截断，防止幻觉
         # eval_actions = jnp.clip(pool_actions, -1.0, 1.0)
         eval_actions = jnp.clip(pool_actions, -114514, 114514)
+        # 👑 你的软映射逻辑 (假设系数 C = 1.1)
+        C = 1.1
+        eval_actions = C * jnp.tanh(pool_actions / C)
 
+        # 喂给 Critic 评分 (此处带 stop_gradient，完全不求导)
         q_pool, _ = networks.value_mlp_fwd_with_features(value_params,
                                                          jnp.concatenate([obs_pool_b, eval_actions], axis=-1))
         q_pool = jax.lax.stop_gradient(q_pool)
