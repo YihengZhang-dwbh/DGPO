@@ -484,8 +484,8 @@ class DGPOFMState:
     # ==========================================
     # 👑 阶段三辅助函数：只更新 Actor
     # ==========================================
-    def _update_actor_only(self, transitions: DGPOFMTransition, prng: Array, global_v_loss: Array) -> tuple[
-        DGPOFMState, dict[str, Array]]:
+    def _update_actor_only(self, transitions: DGPOFMTransition, prng: Array, global_v_loss: Array) -> tuple[DGPOFMState, dict[str, Array]]:
+        cfg = self.config  # 👑 就是这一行！
         # ...
         obs_dim = self.env.observation_size
         # 👑 同样修复 N 的计算
