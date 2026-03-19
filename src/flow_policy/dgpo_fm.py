@@ -30,6 +30,9 @@ class DGPOFMConfig:
 
     use_hard_resampling: jdc.Static[bool] = True
 
+    beta_r: float = 0.9
+    beta_v: float = 0.9999
+
     w_v_loss: float = 1.0
     learning_rate_p: float = 3e-4
     learning_rate_v: float = 3e-4
@@ -221,8 +224,8 @@ class DGPOFMState:
             t_inner = self.steps + 1.0
             t_outer = (self.steps // (cfg.num_updates_per_batch * cfg.num_minibatches)) + 1.0
 
-            bias_correction_v = 1.0 - jnp.power(0.9999, t_inner)
-            bias_correction_r = 1.0 - jnp.power(0.9, t_outer)
+            bias_correction_v = 1.0 - jnp.power(self.config.beta_v, t_inner)
+            bias_correction_r = 1.0 - jnp.power(self.config.beta_r, t_outer)
 
             hat_ema_reward = self.ema_reward / bias_correction_r
             hat_ema_reward_sq = self.ema_reward_sq / bias_correction_r
@@ -310,7 +313,7 @@ class DGPOFMState:
         # ==========================================
         # 👑 _step_minibatch: 纯净版 V-loss EMA 更新
         # ==========================================
-        ema_decay = 0.9999
+        ema_decay = self.config.beta_v
 
         # 没有任何 hack，直接算！
         new_ema_v_loss = ema_decay * self.ema_v_loss + (1.0 - ema_decay) * final_v_loss
@@ -485,7 +488,7 @@ class DGPOFMState:
         # 👑 training_step: 纯净版 Reward EMA 更新 (从 0 累加)
         # ==========================================
         batch_mean_reward = jnp.mean(transitions.reward)
-        env_ema_decay = 0.9
+        env_ema_decay = self.config.beta_r
 
         # 没有任何 hack，直接算！
         new_ema_reward = env_ema_decay * state.ema_reward + (1.0 - env_ema_decay) * batch_mean_reward
