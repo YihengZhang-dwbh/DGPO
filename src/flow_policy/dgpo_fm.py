@@ -191,6 +191,8 @@ class DGPOFMState:
 
             accept_threshold = 1.0 / K
 
+            accept_threshold = 1.0 / K
+
             if cfg.independent_noise_sampling:
                 sampled_indices = jax.random.categorical(p_idx, jnp.broadcast_to(logits[:, None, :], (N, M, K + 1)),
                                                          axis=-1)
@@ -200,72 +202,72 @@ class DGPOFMState:
                 is_real = (sampled_indices == 0)
                 is_fake = (sampled_indices > 0)
                 is_fake_accepted = is_fake & (rand_vals < accept_threshold)
-                valid_mask = (is_real | is_fake_accepted).astype(jnp.float32)
             else:
                 sampled_indices = jax.random.categorical(p_idx, logits, axis=-1)[:, None]
                 a_target = jnp.broadcast_to(pool_actions[jnp.arange(N), sampled_indices[:, 0]][:, None, :],
                                             (N, M, act_dim))
                 rand_vals = jax.random.uniform(p_acc, (N, 1))
-                is_real = (sampled_indices == 0)
-                is_fake = (sampled_indices > 0)
-                is_fake_accepted = is_fake & (rand_vals < accept_threshold)
-                valid_mask = jnp.broadcast_to((is_real | is_fake_accepted).astype(jnp.float32), (N, M))
+                # 👑 统一广播到 (N, M)，保证后续掩码操作维度绝对安全
+                is_real = jnp.broadcast_to(sampled_indices == 0, (N, M))
+                is_fake = jnp.broadcast_to(sampled_indices > 0, (N, M))
+                is_fake_accepted = jnp.broadcast_to(is_fake & (rand_vals < accept_threshold), (N, M))
+
+            # 👑 原始基础掩码 (没有被 EMA 熔断器干预前的存活率)
+            valid_mask = (is_real | is_fake_accepted).astype(jnp.float32)
 
             # ==========================================
-            # 👑 终极解耦：真假动作的双轨独立信任域
+            # 👑 终极数学防线：Adam 式无偏估计 (Bias Correction)
             # ==========================================
-            safe_ema_reward = jnp.where(self.steps == 0, mb_mean_reward, self.ema_reward)
-            safe_ema_reward_sq = jnp.where(self.steps == 0, jnp.square(mb_mean_reward), self.ema_reward_sq)
+            t_inner = self.steps + 1.0
+            t_outer = (self.steps // (cfg.num_updates_per_batch * cfg.num_minibatches)) + 1.0
 
-            safe_ema_v_loss = jnp.where(self.steps == 0, final_v_loss, self.ema_v_loss)
-            safe_ema_v_loss_sq = jnp.where(self.steps == 0, jnp.square(final_v_loss), self.ema_v_loss_sq)
+            bias_correction_v = 1.0 - jnp.power(0.9999, t_inner)
+            bias_correction_r = 1.0 - jnp.power(0.99, t_outer)
 
-            # 1. 衡量环境真实表现 (Reward Z-Score)
-            reward_var = jnp.maximum(safe_ema_reward_sq - jnp.square(safe_ema_reward), 0.0)
+            hat_ema_reward = self.ema_reward / bias_correction_r
+            hat_ema_reward_sq = self.ema_reward_sq / bias_correction_r
+            hat_ema_v_loss = self.ema_v_loss / bias_correction_v
+            hat_ema_v_loss_sq = self.ema_v_loss_sq / bias_correction_v
+
+            # ==========================================
+            # 🛡️ 用无偏估计计算 Z-Score
+            # ==========================================
+            reward_var = jnp.maximum(hat_ema_reward_sq - jnp.square(hat_ema_reward), 0.0)
             reward_std = jnp.sqrt(reward_var) + 1e-5
-            reward_z_score = (mb_mean_reward - safe_ema_reward) / reward_std
+            reward_z_score = (mb_mean_reward - hat_ema_reward) / reward_std
 
-            # 2. 衡量 Critic 幻觉程度 (V-Loss Z-Score)
-            v_loss_var = jnp.maximum(safe_ema_v_loss_sq - jnp.square(safe_ema_v_loss), 0.0)
+            v_loss_var = jnp.maximum(hat_ema_v_loss_sq - jnp.square(hat_ema_v_loss), 0.0)
             v_loss_std = jnp.sqrt(v_loss_var) + 1e-5
-            v_loss_z_score = (final_v_loss - safe_ema_v_loss) / v_loss_std
+            v_loss_z_score = (final_v_loss - hat_ema_v_loss) / v_loss_std
 
-            # ==========================================
-            # 🛡️ 审判真动作：Reward 信任率 (Real Trust)
-            # ==========================================
-            # 逻辑：Reward 只要大于均值，或者在 1 个标准差的正常震荡下跌内，保持 100% 信任。
-            # 只有当 Reward 发生严重崩盘 (跌破 1 个标准差)，说明这批真动作很烂，开始降低拟合它们的概率！
-            real_trust_prob = jnp.exp(-jnp.maximum(-reward_z_score - 1.0, 0.0) / 1.0)
+            # 🛡️ 审判真假动作的独立概率 (零容忍严格阈值 0.2)
+            real_trust_prob = jnp.exp(-jnp.maximum(-reward_z_score - 0.2, 0.0) / 0.5)
             real_trust_prob = jnp.clip(real_trust_prob, 0.01, 1.0)
 
-            # ==========================================
-            # 🛡️ 审判假动作：V-Loss 信任率 (Fake Trust)
-            # ==========================================
-            # 逻辑：V-loss 在 1 个标准差内，完全信任 Critic 的打分，放行假动作。
-            # 一旦 V-loss 暴增 (超过 1 个标准差)，说明 Critic 瞎了，瞬间按死假动作！
-            fake_trust_prob = jnp.exp(-jnp.maximum(v_loss_z_score - 1.0, 0.0) / 0.5)
+            fake_trust_prob = jnp.exp(-jnp.maximum(v_loss_z_score - 0.2, 0.0) / 0.5)
             fake_trust_prob = jnp.clip(fake_trust_prob, 0.01, 1.0)
 
             # ==========================================
-            # ⚔️ 命运切割：各自接受各自的裁决！
+            # 👑 2. 你的极简漏斗逻辑：拼合概率，直接作用于 valid_mask！
             # ==========================================
-            p_trust_r, p_trust_f = jax.random.split(p_trust, 2)
-            trust_rand_real = jax.random.uniform(p_trust_r, (N, 1))
-            trust_rand_fake = jax.random.uniform(p_trust_f, (N, 1))
+            # 用 is_real 作为路由：真动作走 real_trust_prob，假动作走 fake_trust_prob
+            combined_trust_prob = jnp.where(is_real, real_trust_prob, fake_trust_prob)
 
-            # 👑 真动作掩码：被 Softmax 选中，并且躲过 Reward 崩盘惩罚
-            real_mask = is_real & (trust_rand_real < real_trust_prob)
+            # 统一撒下一张随机网 (N, M)
+            trust_rand = jax.random.uniform(p_trust, (N, M))
+            trust_mask = (trust_rand < combined_trust_prob).astype(jnp.float32)
 
-            # 👑 假动作掩码：被 Softmax 选中，通过 1/K 降采样，并且躲过 V-loss 幻觉熔断
-            fake_mask = is_fake & (rand_vals < accept_threshold) & (trust_rand_fake < fake_trust_prob)
+            # ⚔️ 命运切割：在基础掩码上叠加信任掩码！
+            final_valid_mask = valid_mask * trust_mask
 
-            # 最终的吸收池融合！
-            final_valid_mask = (real_mask | fake_mask).astype(jnp.float32)
-
-            # 统计重新定义的监控漏斗
-            actual_fake_accept_rate = jnp.sum(fake_mask.astype(jnp.float32)) / jnp.maximum(1.0, jnp.sum(
+            # 统计重新定义的监控漏斗 (注意这里统计假动作存活率时也要用新的组合逻辑)
+            final_fake_mask = is_fake_accepted & (trust_rand < fake_trust_prob)
+            actual_fake_accept_rate = jnp.sum(final_fake_mask.astype(jnp.float32)) / jnp.maximum(1.0, jnp.sum(
                 is_fake.astype(jnp.float32)))
 
+            # ==========================================
+            # 🌊 速度场拟合与 Loss 计算
+            # ==========================================
             eps = jax.random.normal(p_eps, (N, M, act_dim))
             t_idx = jax.random.randint(p_t, (N, M, 1), 0, cfg.flow_steps)
             t = sch.t_current[t_idx]
@@ -287,9 +289,8 @@ class DGPOFMState:
                 "q_guided/real_win_ratio": jnp.mean(is_real.astype(jnp.float32)),
                 "q_guided/fake_win_ratio": jnp.mean(is_fake.astype(jnp.float32)),
                 "q_guided/fake_accept_ratio": actual_fake_accept_rate,
-                "q_guided/final_effective_ratio": jnp.mean(final_valid_mask),
-
-                # 👑 全新解耦双轨监控指标
+                "q_guided/overall_valid_ratio": jnp.mean(valid_mask),  # 👑 回来了，基础通过率！
+                "q_guided/final_effective_ratio": jnp.mean(final_valid_mask),  # 👑 终极通过率！
                 "q_guided/real_trust_prob": real_trust_prob,
                 "q_guided/fake_trust_prob": fake_trust_prob,
                 "q_guided/reward_z_score": reward_z_score,
@@ -306,18 +307,14 @@ class DGPOFMState:
         # 👑 内层只负责跟踪跟着网络权重大幅波动的 V-Loss
         # ==========================================
         # 抵御高频刷新的极高 decay
+        # ==========================================
+        # 👑 _step_minibatch: 纯净版 V-loss EMA 更新
+        # ==========================================
         ema_decay = 0.9999
 
-        new_ema_v_loss = jnp.where(
-            self.steps == 0,
-            final_v_loss,
-            ema_decay * self.ema_v_loss + (1.0 - ema_decay) * final_v_loss
-        )
-        new_ema_v_loss_sq = jnp.where(
-            self.steps == 0,
-            jnp.square(final_v_loss),
-            ema_decay * self.ema_v_loss_sq + (1.0 - ema_decay) * jnp.square(final_v_loss)
-        )
+        # 没有任何 hack，直接算！
+        new_ema_v_loss = ema_decay * self.ema_v_loss + (1.0 - ema_decay) * final_v_loss
+        new_ema_v_loss_sq = ema_decay * self.ema_v_loss_sq + (1.0 - ema_decay) * jnp.square(final_v_loss)
 
         final_metrics["ema/v_loss"] = new_ema_v_loss
         final_metrics["ema/v_loss_sq"] = new_ema_v_loss_sq
@@ -485,30 +482,21 @@ class DGPOFMState:
         new_transitions = jdc.replace(transitions, action_info=new_action_info)
 
         # ==========================================
-        # 👑 你的神级解耦：Reward EMA 只在拿到新轨迹时更新一次！
+        # 👑 training_step: 纯净版 Reward EMA 更新 (从 0 累加)
         # ==========================================
         batch_mean_reward = jnp.mean(transitions.reward)
-
-        # 因为一轮 Rollout 才会走到这里一次，所以恢复正常的平滑系数即可
         env_ema_decay = 0.99
 
-        new_ema_reward = jnp.where(
-            state.steps == 0,
-            batch_mean_reward,
-            env_ema_decay * state.ema_reward + (1.0 - env_ema_decay) * batch_mean_reward
-        )
-        new_ema_reward_sq = jnp.where(
-            state.steps == 0,
-            jnp.square(batch_mean_reward),
-            env_ema_decay * state.ema_reward_sq + (1.0 - env_ema_decay) * jnp.square(batch_mean_reward)
-        )
+        # 没有任何 hack，直接算！
+        new_ema_reward = env_ema_decay * state.ema_reward + (1.0 - env_ema_decay) * batch_mean_reward
+        new_ema_reward_sq = env_ema_decay * state.ema_reward_sq + (1.0 - env_ema_decay) * jnp.square(batch_mean_reward)
 
-        # 把更新好的 Reward EMA 塞进 State，带着它进入内层优化循环
         state = jdc.replace(
             state,
             ema_reward=new_ema_reward,
             ema_reward_sq=new_ema_reward_sq
         )
+
 
         # 👇 接下来是你原本的内层循环进入代码
         # 👑 修复 3：不再使用 partial 绑定固定的 prng
