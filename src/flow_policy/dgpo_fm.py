@@ -31,7 +31,7 @@ class DGPOFMConfig:
     use_hard_resampling: jdc.Static[bool] = True
 
     beta_r: float = 0.9
-    beta_v: float = 0.999
+    beta_v: float = 0.9
 
     w_v_loss: float = 1.0
     learning_rate_p: float = 3e-4
