@@ -485,11 +485,16 @@ class DGPOFMState:
         x0, _ = jax.lax.scan(euler_step, jax.random.normal(prng_sample, (*batch_dims, self.env.action_size)),
                              (self.get_schedule(), noise_path))
 
+        # 1. 👑 先进行第一轮截断 (确保确定性动作是合法的)
         x_final = self._apply_clip(x0)
 
         if not deterministic:
-            x_final = x_final + jax.random.normal(prng_feather, ...) * self.config.feather_std
-            # 扰动后再次截断确保绝对安全
+            prng_feather = jax.random.fold_in(prng, 0)  # 确保有随机 Key
+            # 👑 修复点：将 ... 替换为 x_final.shape
+            noise = jax.random.normal(prng_feather, x_final.shape)
+            x_final = x_final + noise * self.config.feather_std
+
+            # 2. 👑 扰动后再次截断，防止噪声把动作推到合法区间外
             x_final = self._apply_clip(x_final)
 
         return x_final, DGPOFMActionInfo()
