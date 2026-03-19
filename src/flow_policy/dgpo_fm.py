@@ -362,19 +362,38 @@ class DGPOFMState:
         # 🗑️ 之前的 target_qs_safe, q_real, td_error_abs 全部被删除了！
         # 现在的它只负责纯粹的内部竞争博弈！
 
-        if self.config.use_global_variance:
-            x_var = jax.lax.stop_gradient(jnp.var(q_pool))
-        else:
-            x_var = jax.lax.stop_gradient(jnp.var(q_pool, axis=-1, keepdims=True))
+        # ==========================================
+        # 👑 动态温度函数 f(x) 逻辑重构
+        # ==========================================
+        if self.config.temp_func_type == "max":
+            # 1. 计算优势：每个动作相对于池子平均 Q 值的偏离
+            # adv 形状: (N, K+1)
+            pool_mean = jnp.mean(q_pool, axis=-1, keepdims=True)
+            adv = q_pool - pool_mean
+            abs_adv = jnp.abs(adv)
 
-        if self.config.temp_func_type == "log":
-            f_x = jnp.log1p(x_var)
-        elif self.config.temp_func_type == "cbrt":
-            f_x = jnp.power(x_var + 1e-8, 1.0 / 3.0)
-        elif self.config.temp_func_type == "std":
-            f_x = jnp.sqrt(x_var + 1e-8)
-        elif self.config.temp_func_type == "fixed":
-            f_x = 1.0
+            # 2. 取最大绝对优势作为温度调节因子
+            if self.config.use_global_variance:
+                f_x = jnp.max(abs_adv)  # 全局最大冲击力
+            else:
+                f_x = jnp.max(abs_adv, axis=-1, keepdims=True)  # 每个样本独立的冲击力
+        else:
+            # 3. 维持原有的方差/标准差逻辑
+            if self.config.use_global_variance:
+                x_var = jnp.var(q_pool)
+            else:
+                x_var = jnp.var(q_pool, axis=-1, keepdims=True)
+
+            if self.config.temp_func_type == "log":
+                f_x = jnp.log1p(x_var)
+            elif self.config.temp_func_type == "cbrt":
+                f_x = jnp.power(x_var + 1e-8, 1.0 / 3.0)
+            elif self.config.temp_func_type == "std":
+                f_x = jnp.sqrt(x_var + 1e-8)
+            elif self.config.temp_func_type == "fixed":
+                f_x = 1.0
+            else:
+                f_x = 1.0  # Default
 
         if self.config.f_x_forward:
             alpha = jnp.maximum(self.config.resampling_alpha_min, self.config.resampling_alpha_k * f_x)
