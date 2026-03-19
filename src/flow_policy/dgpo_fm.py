@@ -151,14 +151,8 @@ class DGPOFMState:
                                         t_embed) * cfg.policy_mlp_output_scale
             return x + (t_next - t_curr) * vel, None
 
-        # 原代码：
         gen_acts, _ = jax.lax.scan(gen_step, jax.random.normal(prng_gen, (N, K, act_dim)),
                                    (fast_t_current, fast_t_next))
-
-        # 👑 加上这行：绝对不允许假动作超越物理边界去诱骗 Critic！
-        gen_acts = jnp.clip(gen_acts, -1.0, 1.0)
-
-        # 然后再拼接
         pool_actions = jnp.concatenate([transitions.action.reshape((N, 1, act_dim)), gen_acts], axis=1)
 
         def value_inner_step(carry, _):
@@ -304,29 +298,23 @@ class DGPOFMState:
         N, K_plus_1, act_dim = pool_actions.shape
         flat_obs = obs_norm.reshape((N, self.env.observation_size))
         obs_pool_b = jnp.broadcast_to(flat_obs[:, None, :], (N, K_plus_1, flat_obs.shape[-1]))
+        # 👑 你的神来之笔：在送给 Critic 之前，强行投影回物理流形！
+        eval_actions = jnp.clip(pool_actions, -1.0, 1.0)
+
+        # Critic 只看合法的动作，给出绝对客观、没有外推幻觉的真实 Q 值
         q_pool, _ = networks.value_mlp_fwd_with_features(value_params,
-                                                         jnp.concatenate([obs_pool_b, pool_actions], axis=-1))
+                                                         jnp.concatenate([obs_pool_b, eval_actions], axis=-1))
         q_pool = jax.lax.stop_gradient(q_pool)
 
-        # ==========================================
-        # 👑 统一信任域框架下的锚定邻域优化 (Anchored Neighborhood Optimization)
-        # ==========================================
-        # 1. 提取真实动作作为绝对安全的“锚点” (Anchor)
-        anchor_actions = pool_actions[:, 0:1, :]  # 形状 (N, 1, act_dim)
+        # 后续拿着这个纯净的 q_pool，直接去算胜率、做 ANO 惩罚、更新 Actor
 
-        # 2. 计算所有动作到锚点的欧氏距离平方 (🗑️ 删掉了多余的 keepdims=True！)
-        action_dist_sq = jnp.sum((pool_actions - anchor_actions) ** 2, axis=-1)
+        # 🗑️ 之前的 target_qs_safe, q_real, td_error_abs 全部被删除了！
+        # 现在的它只负责纯粹的内部竞争博弈！
 
-        # 3. 施加邻域惩罚！(比如惩罚系数定为 10.0)
-        # 距离锚点越远的动作，其 Q 值被打压得越狠
-        neighborhood_penalty_coef = 0.
-        q_pool_anchored = q_pool - neighborhood_penalty_coef * action_dist_sq
-
-        # ⚠️ 后续的所有方差和 Softmax 计算，全部换成被锚定优化后的 q_pool_anchored！
         if self.config.use_global_variance:
-            x_var = jax.lax.stop_gradient(jnp.var(q_pool_anchored))
+            x_var = jax.lax.stop_gradient(jnp.var(q_pool))
         else:
-            x_var = jax.lax.stop_gradient(jnp.var(q_pool_anchored, axis=-1, keepdims=True))
+            x_var = jax.lax.stop_gradient(jnp.var(q_pool, axis=-1, keepdims=True))
 
         if self.config.temp_func_type == "log":
             f_x = jnp.log1p(x_var)
@@ -342,8 +330,7 @@ class DGPOFMState:
         else:
             alpha = self.config.resampling_alpha_min / (1 + self.config.resampling_alpha_k * f_x)
 
-        # 依然是用锚定后的 Q 值去算最终胜率
-        logits = (q_pool_anchored - jnp.max(q_pool_anchored, axis=-1, keepdims=True)) / alpha
+        logits = (q_pool - jnp.max(q_pool, axis=-1, keepdims=True)) / alpha
         pool_probs = jax.nn.softmax(logits, axis=-1)
 
         # 连带返回的指标里也只留 Q 值相关的
@@ -400,8 +387,6 @@ class DGPOFMState:
         noise_path = jax.random.normal(prng_noise, (self.config.flow_steps, *batch_dims, self.env.action_size))
         x0, _ = jax.lax.scan(euler_step, jax.random.normal(prng_sample, (*batch_dims, self.env.action_size)),
                              (self.get_schedule(), noise_path))
-        # 👑 这是与环境交互的最后一道闸门！
-        x0 = jnp.clip(x0, -1.0, 1.0)
 
         if not deterministic:
             x0 = x0 + jax.random.normal(prng_feather, (*batch_dims, self.env.action_size)) * self.config.feather_std
@@ -436,15 +421,9 @@ class DGPOFMState:
             vel = networks.flow_mlp_fwd(state.params.policy, bootstrap_obs, x, t_embed) * config.policy_mlp_output_scale
             return x + (t_next - t_curr) * vel, None
 
-        # 原代码：
         boot_noise = jax.random.normal(prng_boot, (1, bootstrap_obs.shape[1], state.env.action_size))
         bootstrap_act, _ = jax.lax.scan(boot_step_fn, boot_noise,
                                         (state.get_schedule().t_current, state.get_schedule().t_next))
-
-        # 👑 加上这行：绝对不允许 GAE 的 Target 顺着非法动作爆炸！
-        bootstrap_act = jnp.clip(bootstrap_act, -1.0, 1.0)
-
-        # 然后再算 bootstrap_q (如果你用了伪 V(s) 估算，那就把这行加在算 boot_act_cloud 之后)
         bootstrap_q, _ = networks.value_mlp_fwd_with_features(state.params.value,
                                                               jnp.concatenate([bootstrap_obs, bootstrap_act], axis=-1))
 
