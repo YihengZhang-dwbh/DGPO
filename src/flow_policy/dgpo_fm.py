@@ -440,14 +440,20 @@ class DGPOFMState:
     # ==========================================
     def _update_critic_only(self, transitions: DGPOFMTransition, prng: Array) -> tuple[DGPOFMState, dict[str, Array]]:
         cfg = self.config
-        N = transitions.obs.shape[0] * transitions.obs.shape[1]
         obs_dim = self.env.observation_size
-        act_dim = self.env.action_size  # 👑 提上来！
+        act_dim = self.env.action_size
 
-        obs_flat = ((
-                                transitions.obs - self.obs_stats.mean) / self.obs_stats.std if cfg.normalize_observations else transitions.obs).reshape(
-            (N, obs_dim))
+        # 👑 修复：动态计算 N，适应所有前置维度 (无论是 minibatch 还是 full buffer)
+        # N = 32 * 30 * 1024 = 983040 (在你的例子中)
+        N = transitions.obs.size // obs_dim
+
+        obs_flat = ((transitions.obs - self.obs_stats.mean) / self.obs_stats.std
+                    if cfg.normalize_observations else transitions.obs).reshape((N, obs_dim))
+
+        # target_qs 也要同步 reshape
         target_qs = transitions.action_info.target_qs.reshape((N, 1))
+
+        # ... 后续逻辑保持不变 ...
 
         def value_inner_step(carry, _):
             # 现在闭包可以安全访问 act_dim 了
@@ -480,14 +486,14 @@ class DGPOFMState:
     # ==========================================
     def _update_actor_only(self, transitions: DGPOFMTransition, prng: Array, global_v_loss: Array) -> tuple[
         DGPOFMState, dict[str, Array]]:
-        prng_gen, prng_pol, next_prng = jax.random.split(prng, 3)
-        cfg, sch = self.config, self.get_schedule()
-        N = transitions.obs.shape[0] * transitions.obs.shape[1]
-        obs_dim, act_dim, t_dim = self.env.observation_size, self.env.action_size, cfg.timestep_embed_dim
+        # ...
+        obs_dim = self.env.observation_size
+        # 👑 同样修复 N 的计算
+        N = transitions.obs.size // obs_dim
 
-        obs_flat = ((
-                                transitions.obs - self.obs_stats.mean) / self.obs_stats.std if cfg.normalize_observations else transitions.obs).reshape(
-            (N, obs_dim))
+        obs_flat = ((transitions.obs - self.obs_stats.mean) / self.obs_stats.std
+                    if cfg.normalize_observations else transitions.obs).reshape((N, obs_dim))
+        # ...
 
         # 此时使用传入的全局平均 V-Loss，而不是 minibatch 局部的
         final_v_loss = global_v_loss
@@ -642,12 +648,16 @@ class DGPOFMState:
         new_transitions = jdc.replace(transitions, action_info=new_action_info)
 
         # 👑 阶段一：全量 Critic 更新 (得到 37.83)
-        def critic_step(carry, _):
-            return carry._update_critic_only(
-                new_transitions.prepare_minibatches(jax.random.fold_in(carry.prng, carry.steps), config.num_minibatches,
-                                                    config.batch_size), jax.random.fold_in(carry.prng, carry.steps + 1))
+        def critic_step(carry, transitions_minibatch): # 👑 注意这里第二个参数
+            return carry._update_critic_only(transitions_minibatch, jax.random.fold_in(carry.prng, carry.steps))
 
-        state_after_v, all_v_metrics = jax.lax.scan(critic_step, init=state, length=config.num_updates_per_batch)
+        # 👑 确保 xs 传入的是切分好的 minibatches
+        state_after_v, all_v_metrics = jax.lax.scan(
+            critic_step,
+            init=state,
+            xs=new_transitions.prepare_minibatches(jax.random.fold_in(state.prng, state.steps), config.num_minibatches, config.batch_size),
+            length=config.num_updates_per_batch # 如果 length 和 xs 的第 0 维长度不一致也会报错
+        )
 
         # 👑 阶段二：同步更新 EMA (实时判官)
         global_v_loss = jnp.mean(all_v_metrics["v_loss/total"])
