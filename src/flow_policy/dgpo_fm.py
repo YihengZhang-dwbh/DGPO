@@ -163,7 +163,8 @@ class DGPOFMState:
 
         gen_acts, _ = jax.lax.scan(gen_step, jax.random.normal(prng_gen, (N, K, act_dim)),
                                    (fast_t_current, fast_t_next))
-        gen_acts = jnp.clip(gen_acts, -1.1, 1.1)
+        # gen_acts = jnp.clip(gen_acts, -1.1, 1.1)
+        gen_acts = jnp.clip(gen_acts, -114514, 114514)
         pool_actions = jnp.concatenate([transitions.action.reshape((N, 1, act_dim)), gen_acts], axis=1)
 
         def value_inner_step(carry, _):
@@ -345,7 +346,8 @@ class DGPOFMState:
         obs_pool_b = jnp.broadcast_to(flat_obs[:, None, :], (N, K_plus_1, flat_obs.shape[-1]))
 
         # 2. 👑 送给 Critic 时，依然执行绝对严格的物理截断，防止幻觉
-        eval_actions = jnp.clip(pool_actions, -1.0, 1.0)
+        # eval_actions = jnp.clip(pool_actions, -1.0, 1.0)
+        eval_actions = jnp.clip(pool_actions, -114514, 114514)
 
         q_pool, _ = networks.value_mlp_fwd_with_features(value_params,
                                                          jnp.concatenate([obs_pool_b, eval_actions], axis=-1))
@@ -522,7 +524,9 @@ class DGPOFMState:
 
         gen_acts, _ = jax.lax.scan(gen_step, jax.random.normal(prng_gen, (N, K, act_dim)), (fast_t_curr, fast_t_next))
         # 组合池：[真动作 (1个), 假动作 (K个)]
-        pool_actions = jnp.concatenate([transitions.action.reshape((N, 1, act_dim)), jnp.clip(gen_acts, -1.1, 1.1)],
+        # pool_actions = jnp.concatenate([transitions.action.reshape((N, 1, act_dim)), jnp.clip(gen_acts, -1.1, 1.1)],
+        #                                axis=1)
+        pool_actions = jnp.concatenate([transitions.action.reshape((N, 1, act_dim)), jnp.clip(gen_acts, -114514, 114514)],
                                        axis=1)
 
         # ==========================================
