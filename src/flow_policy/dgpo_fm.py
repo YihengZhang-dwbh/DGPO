@@ -218,7 +218,12 @@ class DGPOFMState:
             v_loss_std = jnp.sqrt(v_loss_var) + 1e-5
             z_score = (final_v_loss - safe_ema_v_loss) / v_loss_std
 
-            z_trust_prob = jnp.exp(-jnp.maximum(z_score - 1.0, 0.0) / 1.5)
+            # z_trust_prob = jnp.exp(-jnp.maximum(z_score - 1.0, 0.0) / 1.5)
+            # z_trust_prob = jnp.clip(z_trust_prob, 0.01, 1.0)
+            # 😈 拔掉 1.0 的免死金牌！只要 v_loss 大于历史均值 (z_score > 0)，立刻开始扣接受率！
+            # 并且把衰减分母从 1.5 改成 0.5（分母越小，跌得越惨）。
+            # 比如现在 z_score 是 0.5 的话，接受率直接暴跌到 exp(-1) ≈ 36%
+            z_trust_prob = jnp.exp(-jnp.maximum(z_score, 0.0) / 0.5)
             z_trust_prob = jnp.clip(z_trust_prob, 0.01, 1.0)
             global_trust_prob = jnp.where(is_breakthrough, 1.0, z_trust_prob)
 
