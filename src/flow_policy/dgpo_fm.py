@@ -83,6 +83,8 @@ class DGPOFMParams:
 @jdc.pytree_dataclass
 class DGPOFMActionInfo:
     target_qs: Array = dataclasses.field(default_factory=lambda: jnp.zeros(()))
+    # 👑 新增：用来存储 Actor 原始输出的“原像”
+    raw_action: Array = dataclasses.field(default_factory=lambda: jnp.zeros(()))
 
 
 @jdc.pytree_dataclass
@@ -479,19 +481,20 @@ class DGPOFMState:
         x0, _ = jax.lax.scan(euler_step, jax.random.normal(prng_sample, (*batch_dims, self.env.action_size)),
                              (self.get_schedule(), noise_path))
 
-        # 1. 👑 先进行第一轮截断 (确保确定性动作是合法的)
-        x_final = self._apply_clip(x0)
+        # 👑 1. 这是原像 (Pre-image)
+        x_raw = x0
 
         if not deterministic:
-            prng_feather = jax.random.fold_in(prng, 0)  # 确保有随机 Key
-            # 👑 修复点：将 ... 替换为 x_final.shape
-            noise = jax.random.normal(prng_feather, x_final.shape)
-            x_final = x_final + noise * self.config.feather_std
+            prng_feather = jax.random.fold_in(prng, 0)
+            noise = jax.random.normal(prng_feather, x_raw.shape)
+            # 噪音直接加在原像上，保持速度场线性
+            x_raw = x_raw + noise * self.config.feather_std
 
-            # 2. 👑 扰动后再次截断，防止噪声把动作推到合法区间外
-            x_final = self._apply_clip(x_final)
+        # 👑 2. 映射成表像 (Image) 给环境执行
+        x_final = self._apply_clip(x_raw)
 
-        return x_final, DGPOFMActionInfo()
+        # 👑 3. 核心：把像给环境，把原像塞进 info 带走
+        return x_final, DGPOFMActionInfo(raw_action=x_raw)
 
     # ==========================================
     # 👑 阶段一辅助函数：只更新 Critic
@@ -555,9 +558,8 @@ class DGPOFMState:
         N = transitions.obs.size // obs_dim
         obs_flat = ((transitions.obs - self.obs_stats.mean) / self.obs_stats.std
                     if cfg.normalize_observations else transitions.obs).reshape((N, obs_dim))
-
-        # 👑 关键修复点：把 transitions.action 也展平成 (N, 1, act_dim)
-        real_action_flat = transitions.action.reshape((N, 1, act_dim))
+        # 👑 修复点：不再用 transitions.action (像)，而是用 action_info.raw_action (原像)！
+        real_action_flat = transitions.action_info.raw_action.reshape((N, 1, act_dim))
 
         # 🎯 核心输入
         final_v_loss = global_v_loss
@@ -583,12 +585,11 @@ class DGPOFMState:
 
         # 3. 👑 拼接动作池 (全是原像 Pre-images)
         # 现在两者形状都是 (30720, ..., 6)，可以安全拼接了
+        # 👑 此时池子里全是纯净的“原像”，没有任何二次污染
         pool_actions = jnp.concatenate([real_action_flat, gen_acts], axis=1)
 
-        # 4. 👑 映射到表像 (Images) 供 Critic 评估，但不覆盖 pool_actions
+        # 👑 映射成“像”，端给 Critic 打分
         pool_actions_clipped = self._apply_clip(pool_actions)
-
-        # 注意：这里传进去的是表像，得到的是重采样概率
         probs, fresh_metrics = self._compute_fresh_weights(self.params.value, obs_flat, pool_actions_clipped)
 
         # ==========================================
