@@ -299,34 +299,31 @@ class DGPOFMState:
         (p_loss, p_metrics), p_grads = jax.value_and_grad(policy_loss_fn, has_aux=True)(self.params.policy)
         p_updates, new_p_opt = self.opt_policy.update(p_grads, self.opt_state_policy, self.params.policy)
 
+        # (之前的代码：算出 p_updates 和 final_metrics)
         final_metrics = {**{k: v[-1] for k, v in extra_v_metrics.items()}, **p_metrics, **fresh_metrics}
 
-        ema_decay = 0.999
-        new_ema_reward = jnp.where(
-            self.steps == 0, mb_mean_reward, ema_decay * self.ema_reward + (1.0 - ema_decay) * mb_mean_reward
-        )
+        # ==========================================
+        # 👑 内层只负责跟踪跟着网络权重大幅波动的 V-Loss
+        # ==========================================
+        # 抵御高频刷新的极高 decay
+        ema_decay = 0.9999
+
         new_ema_v_loss = jnp.where(
-            self.steps == 0, final_v_loss, ema_decay * self.ema_v_loss + (1.0 - ema_decay) * final_v_loss
+            self.steps == 0,
+            final_v_loss,
+            ema_decay * self.ema_v_loss + (1.0 - ema_decay) * final_v_loss
         )
         new_ema_v_loss_sq = jnp.where(
-            self.steps == 0, jnp.square(final_v_loss),
+            self.steps == 0,
+            jnp.square(final_v_loss),
             ema_decay * self.ema_v_loss_sq + (1.0 - ema_decay) * jnp.square(final_v_loss)
         )
 
-        # ... 前面的 ema_reward 和 ema_v_loss 更新 ...
-
-        new_ema_reward_sq = jnp.where(
-            self.steps == 0,
-            jnp.square(mb_mean_reward),
-            ema_decay * self.ema_reward_sq + (1.0 - ema_decay) * jnp.square(mb_mean_reward)
-        )
-
-        final_metrics["ema/reward"] = new_ema_reward
-        final_metrics["ema/reward_std"] = jnp.sqrt(
-            jnp.maximum(new_ema_reward_sq - jnp.square(new_ema_reward), 0.0))  # 顺手记录到面板里！
         final_metrics["ema/v_loss"] = new_ema_v_loss
         final_metrics["ema/v_loss_sq"] = new_ema_v_loss_sq
 
+        # 👑 组装最终 State 时，只更新 V-loss 的 EMA！
+        # (注意：千万别把 ema_reward=... 写在这里了，否则会覆盖掉外层传进来的值)
         new_state = jdc.replace(
             self,
             params=DGPOFMParams(optax.apply_updates(self.params.policy, p_updates), new_v_params),
@@ -334,8 +331,6 @@ class DGPOFMState:
             opt_state_value=new_v_opt_state,
             steps=self.steps + 1,
             prng=next_prng,
-            ema_reward=new_ema_reward,
-            ema_reward_sq=new_ema_reward_sq,  # 👑 别忘了塞进 State！
             ema_v_loss=new_ema_v_loss,
             ema_v_loss_sq=new_ema_v_loss_sq
         )
@@ -489,6 +484,33 @@ class DGPOFMState:
         new_action_info = jdc.replace(transitions.action_info, target_qs=target_qs)
         new_transitions = jdc.replace(transitions, action_info=new_action_info)
 
+        # ==========================================
+        # 👑 你的神级解耦：Reward EMA 只在拿到新轨迹时更新一次！
+        # ==========================================
+        batch_mean_reward = jnp.mean(transitions.reward)
+
+        # 因为一轮 Rollout 才会走到这里一次，所以恢复正常的平滑系数即可
+        env_ema_decay = 0.99
+
+        new_ema_reward = jnp.where(
+            state.steps == 0,
+            batch_mean_reward,
+            env_ema_decay * state.ema_reward + (1.0 - env_ema_decay) * batch_mean_reward
+        )
+        new_ema_reward_sq = jnp.where(
+            state.steps == 0,
+            jnp.square(batch_mean_reward),
+            env_ema_decay * state.ema_reward_sq + (1.0 - env_ema_decay) * jnp.square(batch_mean_reward)
+        )
+
+        # 把更新好的 Reward EMA 塞进 State，带着它进入内层优化循环
+        state = jdc.replace(
+            state,
+            ema_reward=new_ema_reward,
+            ema_reward_sq=new_ema_reward_sq
+        )
+
+        # 👇 接下来是你原本的内层循环进入代码
         # 👑 修复 3：不再使用 partial 绑定固定的 prng
         def step_batch(state: DGPOFMState, _):
             step_prng = jax.random.fold_in(state.prng, state.steps)
