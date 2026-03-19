@@ -551,12 +551,15 @@ class DGPOFMState:
         act_dim = self.env.action_size
         t_dim = cfg.timestep_embed_dim
 
-        # 👑 动态计算 N，确保适配 Minibatch 形状
+        # 1. 动态计算 N
         N = transitions.obs.size // obs_dim
         obs_flat = ((transitions.obs - self.obs_stats.mean) / self.obs_stats.std
                     if cfg.normalize_observations else transitions.obs).reshape((N, obs_dim))
 
-        # 🎯 核心输入：本轮全局大盘分和当前 Batch 的 Reward
+        # 👑 关键修复点：把 transitions.action 也展平成 (N, 1, act_dim)
+        real_action_flat = transitions.action.reshape((N, 1, act_dim))
+
+        # 🎯 核心输入
         final_v_loss = global_v_loss
         mb_mean_reward = jnp.mean(transitions.reward)
 
@@ -576,18 +579,17 @@ class DGPOFMState:
                                         t_embed) * cfg.policy_mlp_output_scale
             return x + (t_n - t_c) * vel, None
 
-        gen_acts, _ = jax.lax.scan(gen_step, jax.random.normal(prng_gen, (N, K, act_dim)), (fast_t_curr, fast_t_next))
-        # 组合池
-        # ... 生成 gen_acts (这是原像) ...
-        pool_actions = jnp.concatenate([transitions.action, gen_acts], axis=1)  # 全是原像
+        gen_acts, _ = jax.lax.scan(gen_step, jax.random.normal(prng_gen, (N, cfg.num_generated_actions, act_dim)), ...)
 
-        # 1. 拿原像去评测 (内部会自动 clip 供 Critic 看)
-        probs, _ = self._compute_fresh_weights(self.params.value, obs_flat, pool_actions)
+        # 3. 👑 拼接动作池 (全是原像 Pre-images)
+        # 现在两者形状都是 (30720, ..., 6)，可以安全拼接了
+        pool_actions = jnp.concatenate([real_action_flat, gen_acts], axis=1)
 
-        # ==========================================
-        # 2. 计算重采样权重 (Q-Guided Probs)
-        # ==========================================
-        probs, fresh_metrics = self._compute_fresh_weights(self.params.value, obs_flat, pool_actions)
+        # 4. 👑 映射到表像 (Images) 供 Critic 评估，但不覆盖 pool_actions
+        pool_actions_clipped = self._apply_clip(pool_actions)
+
+        # 注意：这里传进去的是表像，得到的是重采样概率
+        probs, fresh_metrics = self._compute_fresh_weights(self.params.value, obs_flat, pool_actions_clipped)
 
         # ==========================================
         # 3. 策略损失闭包 (包含信任域熔断逻辑)
