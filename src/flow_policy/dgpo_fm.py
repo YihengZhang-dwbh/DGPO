@@ -403,16 +403,28 @@ class DGPOFMState:
         logits = (q_pool - jnp.max(q_pool, axis=-1, keepdims=True)) / alpha
         pool_probs = jax.nn.softmax(logits, axis=-1)
 
-        # 连带返回的指标里也只留 Q 值相关的
-        return jax.lax.stop_gradient(pool_probs), {
+        # 统一计算 f_x 的均值，这个值最能反映当前池子的“兴奋程度”
+        f_x_mean = jnp.mean(f_x)
+
+        # 连带返回的指标字典
+        metrics = {
             "q_guided/q_real_mean": jnp.mean(q_pool[:, 0]),
             "q_guided/prob_real_mean": jnp.mean(pool_probs[:, 0]),
             "q_guided/alpha_mean": jnp.mean(alpha),
-            "q_guided/alpha_max": jnp.max(alpha),
-            "q_guided/alpha_min": jnp.min(alpha),
-            "q_guided/q_var_mean": jnp.mean(x_var),
-            "q_guided/f_x_mean": jnp.mean(f_x),
+            "q_guided/f_x_mean": f_x_mean,  # 👑 建议统一看这个，它是所有模式的原始驱动力
         }
+
+        # 👑 针对 "max" 模式的专属诊断指标
+        if self.config.temp_func_type == "max":
+            # 记录池子里最离谱的动作平均有多强
+            metrics["q_guided/max_abs_adv_avg"] = f_x_mean
+            # 也可以额外记录一下池子的平均优势水平，对比看“尖峰”有多突出
+            metrics["q_guided/pool_abs_adv_mean"] = jnp.mean(jnp.abs(q_pool - jnp.mean(q_pool, axis=-1, keepdims=True)))
+        else:
+            # 维持原有的方差/标准差记录
+            metrics["q_guided/q_var_mean"] = jnp.mean(x_var)
+
+        return jax.lax.stop_gradient(pool_probs), metrics
 
     def _compute_value_loss(self, value_params, obs_norm, actions, truncation, target_qs):
         concat_inputs = jnp.concatenate([obs_norm, actions], axis=-1)
