@@ -571,15 +571,16 @@ class DGPOFMState:
             hat_v, hat_v_sq = self.ema_v_loss / bc_v, self.ema_v_loss_sq / bc_v
 
             # --- Z-Score & 信任概率 ---
+            # --- Z-Score & 信任概率 ---
             r_std = jnp.sqrt(jnp.maximum(hat_r_sq - jnp.square(hat_r), 0.0)) + 1e-5
             v_std = jnp.sqrt(jnp.maximum(hat_v_sq - jnp.square(hat_v), 0.0)) + 1e-5
 
             r_z = (mb_mean_reward - hat_r) / r_std
             v_z = (final_v_loss - hat_v) / v_std
 
-            # 严格阈值 0.1，平滑系数 0.5
-            r_trust = jnp.clip(jnp.exp(-jnp.maximum(-r_z - 0.1, 0.0) / 0.5), 0.01, 1.0)
-            v_trust = jnp.clip(jnp.exp(-jnp.maximum(v_z - 0.1, 0.0) / 0.5), 0.01, 1.0)
+            # 👑 别再写 0.1 了，把这里改成引用 config 里的变量！
+            r_trust = jnp.clip(jnp.exp(-jnp.maximum(-r_z - cfg.tolerance_r, 0.0) / 0.5), 0.01, 1.0)
+            v_trust = jnp.clip(jnp.exp(-jnp.maximum(v_z - cfg.tolerance_v, 0.0) / 0.5), 0.01, 1.0)
 
             trust_mask = (jax.random.uniform(p_trust, (N, M)) < jnp.where(is_real, r_trust, v_trust)).astype(
                 jnp.float32)
