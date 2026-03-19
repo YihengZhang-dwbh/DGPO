@@ -222,7 +222,7 @@ class DGPOFMState:
             t_outer = (self.steps // (cfg.num_updates_per_batch * cfg.num_minibatches)) + 1.0
 
             bias_correction_v = 1.0 - jnp.power(0.9999, t_inner)
-            bias_correction_r = 1.0 - jnp.power(0.99, t_outer)
+            bias_correction_r = 1.0 - jnp.power(0.9, t_outer)
 
             hat_ema_reward = self.ema_reward / bias_correction_r
             hat_ema_reward_sq = self.ema_reward_sq / bias_correction_r
