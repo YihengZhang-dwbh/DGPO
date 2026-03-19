@@ -21,7 +21,7 @@ class DGPOFMConfig:
     independent_noise_sampling: jdc.Static[bool] = True
     use_global_variance: jdc.Static[bool] = False
     temp_func_type: jdc.Static[Literal["log", "cbrt", "std", "fixed", "max"]] = "max"
-    action_clip: jdc.Static[Literal["hard", "margin", "tanh"]] = "tanh"
+    action_clip: jdc.Static[Literal["hard", "margin", "tanh"]] = "margin"
     clip_margin: float = 1.1
     base_tolerance: float = 1.0
     resampling_alpha_k: float = 0.3
