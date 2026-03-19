@@ -358,19 +358,13 @@ class DGPOFMState:
         flat_obs = obs_norm.reshape((N, self.env.observation_size))
         obs_pool_b = jnp.broadcast_to(flat_obs[:, None, :], (N, K_plus_1, flat_obs.shape[-1]))
 
-        # 2. 👑 送给 Critic 时，依然执行绝对严格的物理截断，防止幻觉
-        eval_actions = jnp.clip(pool_actions, -1.0, 1.0)
-        # eval_actions = jnp.clip(pool_actions, -114514, 114514)
-        # 👑 你的软映射逻辑 (假设系数 C = 1.1)
-        # C = 1.1
-        # eval_actions = C * jnp.tanh(pool_actions / C)
+        eval_actions = self._apply_clip(pool_actions)  # 映射成表像供 Critic 评估
 
-        # 喂给 Critic 评分 (此处带 stop_gradient，完全不求导)
-        q_pool, _ = networks.value_mlp_fwd_with_features(value_params,
-                                                         jnp.concatenate([obs_pool_b, eval_actions], axis=-1))
+        q_pool, _ = networks.value_mlp_fwd_with_features(
+            value_params,
+            jnp.concatenate([obs_pool_b, eval_actions], axis=-1)
+        )
         q_pool = jax.lax.stop_gradient(q_pool)
-
-        # 后面拿着 pool_actions (带缓冲带的) 去做 ANO 距离惩罚和更新 Actor
 
         # 🗑️ 之前的 target_qs_safe, q_real, td_error_abs 全部被删除了！
         # 现在的它只负责纯粹的内部竞争博弈！
@@ -584,19 +578,11 @@ class DGPOFMState:
 
         gen_acts, _ = jax.lax.scan(gen_step, jax.random.normal(prng_gen, (N, K, act_dim)), (fast_t_curr, fast_t_next))
         # 组合池
-        pool_actions = jnp.concatenate([
-            transitions.action.reshape((N, 1, act_dim)),
-            gen_acts
-        ], axis=1)
+        # ... 生成 gen_acts (这是原像) ...
+        pool_actions = jnp.concatenate([transitions.action, gen_acts], axis=1)  # 全是原像
 
-        # 👑 修改点 3：对整个动作池进行统一映射
-        # 这一步极其关键：它同时决定了后面 _compute_fresh_weights 里的 Q 评测
-        # 以及 policy_loss_fn 里的速度场拟合目标 a_target
-        pool_actions = self._apply_clip(pool_actions)
-
-        # 后续的 probs 和 a_target 都会自动基于这个截断后的 pool_actions 运行
-        probs, fresh_metrics = self._compute_fresh_weights(self.params.value, obs_flat, pool_actions)
-        # ...
+        # 1. 拿原像去评测 (内部会自动 clip 供 Critic 看)
+        probs, _ = self._compute_fresh_weights(self.params.value, obs_flat, pool_actions)
 
         # ==========================================
         # 2. 计算重采样权重 (Q-Guided Probs)
