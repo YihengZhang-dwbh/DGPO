@@ -188,6 +188,17 @@ class DGPOFMState:
         # _compute_fresh_weights 里再也不需要传 target_qs 去算局部误差了
         probs, fresh_metrics = self._compute_fresh_weights(new_v_params, obs_flat, pool_actions)
 
+        # ==========================================
+        # 👇 👑 极速修复：在 policy_loss_fn 外面提前算好这俩标量！
+        # ==========================================
+        mb_mean_reward = jnp.mean(transitions.reward)
+
+        # ⚠️ 注意：这里要把 final_v_loss 也提前准备好！
+        # 如果你前面刚更新完 Critic，应该能从 Critic 的 metrics 里拿到 v_loss
+        # 比如：final_v_loss = extra_v_metrics["value_loss"][-1]
+        # (请根据你代码里实际存放 Critic Loss 的变量名来写)
+        final_v_loss = extra_v_metrics["value_loss"][-1]
+
         def policy_loss_fn(p_params):
             M = cfg.num_epsilon_samples
             p_idx, p_eps, p_t, p_acc, p_trust = jax.random.split(prng_pol, 5)
