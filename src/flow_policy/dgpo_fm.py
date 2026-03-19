@@ -153,6 +153,10 @@ class DGPOFMState:
 
         gen_acts, _ = jax.lax.scan(gen_step, jax.random.normal(prng_gen, (N, K, act_dim)),
                                    (fast_t_current, fast_t_next))
+        
+        # 👑 源头物理防线：生成完立刻上缓冲带！Actor 绝对看不见 1.1 以外的数字！
+        gen_acts = jnp.clip(gen_acts, -1.1, 1.1)
+
         pool_actions = jnp.concatenate([transitions.action.reshape((N, 1, act_dim)), gen_acts], axis=1)
 
         def value_inner_step(carry, _):
@@ -298,9 +302,6 @@ class DGPOFMState:
         N, K_plus_1, act_dim = pool_actions.shape
         flat_obs = obs_norm.reshape((N, self.env.observation_size))
         obs_pool_b = jnp.broadcast_to(flat_obs[:, None, :], (N, K_plus_1, flat_obs.shape[-1]))
-        # 1. 👑 给 Actor 留一点“刹车缓冲带”，彻底切断 16.9 这种数值爆炸，但允许微小越界
-        margin = 1.1
-        pool_actions = jnp.clip(pool_actions, -margin, margin)
 
         # 2. 👑 送给 Critic 时，依然执行绝对严格的物理截断，防止幻觉
         eval_actions = jnp.clip(pool_actions, -1.0, 1.0)
