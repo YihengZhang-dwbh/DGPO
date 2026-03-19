@@ -32,6 +32,8 @@ class DGPOFMConfig:
 
     beta_r: float = 0.9
     beta_v: float = 0.9
+    tolerance_r: float = 0.1
+    tolerance_v: float = 0.5
 
     w_v_loss: float = 1.0
     learning_rate_p: float = 3e-4
@@ -244,10 +246,10 @@ class DGPOFMState:
             v_loss_z_score = (final_v_loss - hat_ema_v_loss) / v_loss_std
 
             # 🛡️ 审判真假动作的独立概率 (零容忍严格阈值 0.2)
-            real_trust_prob = jnp.exp(-jnp.maximum(-reward_z_score - 0.1, 0.0) / 0.5)
+            real_trust_prob = jnp.exp(-jnp.maximum(-reward_z_score - self.config.tolerance_r, 0.0) / 0.5)
             real_trust_prob = jnp.clip(real_trust_prob, 0.01, 1.0)
 
-            fake_trust_prob = jnp.exp(-jnp.maximum(v_loss_z_score - 0.1, 0.0) / 0.5)
+            fake_trust_prob = jnp.exp(-jnp.maximum(v_loss_z_score - self.config.tolerance_v, 0.0) / 0.5)
             fake_trust_prob = jnp.clip(fake_trust_prob, 0.01, 1.0)
 
             # ==========================================
