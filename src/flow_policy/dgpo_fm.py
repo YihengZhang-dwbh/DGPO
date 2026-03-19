@@ -241,10 +241,10 @@ class DGPOFMState:
             v_loss_z_score = (final_v_loss - hat_ema_v_loss) / v_loss_std
 
             # 🛡️ 审判真假动作的独立概率 (零容忍严格阈值 0.2)
-            real_trust_prob = jnp.exp(-jnp.maximum(-reward_z_score - 0.2, 0.0) / 0.5)
+            real_trust_prob = jnp.exp(-jnp.maximum(-reward_z_score - 0.1, 0.0) / 0.5)
             real_trust_prob = jnp.clip(real_trust_prob, 0.01, 1.0)
 
-            fake_trust_prob = jnp.exp(-jnp.maximum(v_loss_z_score - 0.2, 0.0) / 0.5)
+            fake_trust_prob = jnp.exp(-jnp.maximum(v_loss_z_score - 0.1, 0.0) / 0.5)
             fake_trust_prob = jnp.clip(fake_trust_prob, 0.01, 1.0)
 
             # ==========================================
@@ -485,7 +485,7 @@ class DGPOFMState:
         # 👑 training_step: 纯净版 Reward EMA 更新 (从 0 累加)
         # ==========================================
         batch_mean_reward = jnp.mean(transitions.reward)
-        env_ema_decay = 0.99
+        env_ema_decay = 0.9
 
         # 没有任何 hack，直接算！
         new_ema_reward = env_ema_decay * state.ema_reward + (1.0 - env_ema_decay) * batch_mean_reward
