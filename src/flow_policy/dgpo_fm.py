@@ -152,7 +152,11 @@ class DGPOFMState:
         elif cfg.action_clip == "tanh":
             return cfg.clip_margin * jnp.tanh(x / cfg.clip_margin)
         elif cfg.action_clip == "fold":
-            return jnp.abs(x - 4.0 * jnp.floor((x + 3.0) / 4.0) + 1.0) - 1.0
+            # return jnp.abs(x - 4.0 * jnp.floor((x + 3.0) / (4.0)) + 1.0) - 1.0
+            T = 4.0*cfg.clip_margin
+            t = cfg.clip_margin
+            # return jnp.abs(x+ 3*t - T * jnp.floor((x + 3*t) / T) - 2*t ) - t
+            return jnp.abs(x - T * jnp.floor((x + 3*t) / T) + t ) - t
         return x
 
     def _compute_fresh_weights(self, value_params, obs_norm, pool_actions_raw) -> tuple[Array, dict[str, Array]]:
