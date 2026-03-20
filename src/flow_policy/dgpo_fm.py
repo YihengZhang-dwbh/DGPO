@@ -21,7 +21,7 @@ class DGPOFMConfig:
     independent_noise_sampling: jdc.Static[bool] = True
     use_global_variance: jdc.Static[bool] = False
     temp_func_type: jdc.Static[Literal["log", "cbrt", "std", "fixed", "max"]] = "max"
-    action_clip: jdc.Static[Literal["hard", "margin", "tanh"]] = "margin"
+    action_clip: jdc.Static[Literal["hard", "margin", "tanh", "sin"]] = "margin"
     clip_margin: float = 1.1
     penalty_coef: float = 10.0  # 👑 新增：L2 越界惩罚系数
     base_tolerance: float = 1.0
@@ -144,6 +144,8 @@ class DGPOFMState:
             return jnp.clip(x, -cfg.clip_margin, cfg.clip_margin)
         elif cfg.action_clip == "tanh":
             return cfg.clip_margin * jnp.tanh(x / cfg.clip_margin)
+        elif cfg.action_clip == "sin":
+            return cfg.clip_margin * jnp.sin(x / cfg.clip_margin)
         return x
 
     def _compute_fresh_weights(self, value_params, obs_norm, pool_actions_raw) -> tuple[Array, dict[str, Array]]:
