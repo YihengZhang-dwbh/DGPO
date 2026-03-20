@@ -158,13 +158,14 @@ class DGPOFMState:
             value_params,
             jnp.concatenate([obs_pool_b, eval_actions], axis=-1)
         )
-        q_pool = jax.lax.stop_gradient(q_pool)
+        # 👑 确保 q_pool 绝对是二维矩阵 (N, K+1)
+        q_pool = jax.lax.stop_gradient(q_pool).reshape((N, K_plus_1))
 
-        # 👑 2. 纪律处分：根据原像偏离物理区间的程度，施加 L2 爆炸惩罚
+        # 👑 去掉 keepdims=True，让 penalty 也是纯粹的 (N, K+1)
         out_of_bounds = jnp.maximum(jnp.abs(pool_actions_raw) - 1.0, 0.0)
-        penalty = self.config.penalty_coef * jnp.sum(jnp.square(out_of_bounds), axis=-1, keepdims=True)
+        penalty = self.config.penalty_coef * jnp.sum(jnp.square(out_of_bounds), axis=-1)
 
-        # 👑 3. 最终融合得分 = 物理价值 - 越界代价
+        # 👑 现在的减法是 (N, K+1) - (N, K+1)，绝对安全
         q_pool_penalized = q_pool - penalty
 
         # ==========================================
