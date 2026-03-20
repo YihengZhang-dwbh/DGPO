@@ -400,10 +400,18 @@ class DGPOFMState:
             # 👑 4. 提取目标并叠加 EMA Trust Mask
             # ==========================================
             real_acts = pool_actions[:, 0:1, :]
-            # 👑 2. 使用更安全的整数索引提取，彻底规避 take_along_axis 潜在的末尾维度广播问题
+            # 使用更安全的整数索引提取
             fake_acts = pool_actions[jnp.arange(N), fake_idx][:, None, :]
 
             a_target = jnp.where((assigned_classes == 1)[..., None], real_acts, fake_acts)
+
+            # ==========================================
+            # 👑 终极形态：目标动作的物理坍缩
+            # 如果是 hard 或 margin，速度场的目标直接设定为“像”！
+            # (由于 action_clip 是 jdc.Static，这个 if 会在 JIT 编译期直接优化掉)
+            # ==========================================
+            if cfg.action_clip in ["hard", "margin"]:
+                a_target = self._apply_clip(a_target)
 
             # 只保留抽中 1 或 2 的坑位
             alloc_valid_mask = (assigned_classes > 0).astype(jnp.float32)
