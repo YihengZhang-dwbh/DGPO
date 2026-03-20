@@ -23,6 +23,7 @@ class DGPOFMConfig:
     temp_func_type: jdc.Static[Literal["log", "cbrt", "std", "fixed", "max"]] = "max"
     action_clip: jdc.Static[Literal["hard", "margin", "tanh"]] = "margin"
     clip_margin: float = 1.1
+    penalty_coef: float = 10.0  # 👑 新增：L2 越界惩罚系数
     base_tolerance: float = 1.0
     resampling_alpha_k: float = 0.3
     resampling_alpha_min: float = 0.0001
@@ -145,13 +146,13 @@ class DGPOFMState:
             return cfg.clip_margin * jnp.tanh(x / cfg.clip_margin)
         return x
 
-    # 🗑️ 删除了上百行的死代码：_step_minibatch
-
-    def _compute_fresh_weights(self, value_params, obs_norm, eval_actions) -> tuple[Array, dict[str, Array]]:
-        # 👑 修复：这里的 eval_actions 已经是传进来的“表像”了，绝对不能再 clip！
-        N, K_plus_1, act_dim = eval_actions.shape
+    def _compute_fresh_weights(self, value_params, obs_norm, pool_actions_raw) -> tuple[Array, dict[str, Array]]:
+        N, K_plus_1, act_dim = pool_actions_raw.shape
         flat_obs = obs_norm.reshape((N, self.env.observation_size))
         obs_pool_b = jnp.broadcast_to(flat_obs[:, None, :], (N, K_plus_1, flat_obs.shape[-1]))
+
+        # 👑 1. 物理屏障：映射成表像供 Critic 评估客观物理价值
+        eval_actions = self._apply_clip(pool_actions_raw)
 
         q_pool, _ = networks.value_mlp_fwd_with_features(
             value_params,
@@ -159,9 +160,19 @@ class DGPOFMState:
         )
         q_pool = jax.lax.stop_gradient(q_pool)
 
+        # 👑 2. 纪律处分：根据原像偏离物理区间的程度，施加 L2 爆炸惩罚
+        out_of_bounds = jnp.maximum(jnp.abs(pool_actions_raw) - 1.0, 0.0)
+        penalty = self.config.penalty_coef * jnp.sum(jnp.square(out_of_bounds), axis=-1, keepdims=True)
+
+        # 👑 3. 最终融合得分 = 物理价值 - 越界代价
+        q_pool_penalized = q_pool - penalty
+
+        # ==========================================
+        # 👑 后续所有竞争，全部使用处分后的 q_pool_penalized
+        # ==========================================
         if self.config.temp_func_type == "max":
-            pool_mean = jnp.mean(q_pool, axis=-1, keepdims=True)
-            adv = q_pool - pool_mean
+            pool_mean = jnp.mean(q_pool_penalized, axis=-1, keepdims=True)
+            adv = q_pool_penalized - pool_mean
             abs_adv = jnp.abs(adv)
             if self.config.use_global_variance:
                 f_x = jnp.max(abs_adv)
@@ -169,9 +180,9 @@ class DGPOFMState:
                 f_x = jnp.max(abs_adv, axis=-1, keepdims=True)
         else:
             if self.config.use_global_variance:
-                x_var = jnp.var(q_pool)
+                x_var = jnp.var(q_pool_penalized)
             else:
-                x_var = jnp.var(q_pool, axis=-1, keepdims=True)
+                x_var = jnp.var(q_pool_penalized, axis=-1, keepdims=True)
 
             if self.config.temp_func_type == "log":
                 f_x = jnp.log1p(x_var)
@@ -187,12 +198,14 @@ class DGPOFMState:
         else:
             alpha = self.config.resampling_alpha_min / (1 + self.config.resampling_alpha_k * f_x)
 
-        logits = (q_pool - jnp.max(q_pool, axis=-1, keepdims=True)) / alpha
+        logits = (q_pool_penalized - jnp.max(q_pool_penalized, axis=-1, keepdims=True)) / alpha
         pool_probs = jax.nn.softmax(logits, axis=-1)
 
         f_x_mean = jnp.mean(f_x)
         metrics = {
             "q_guided/q_real_mean": jnp.mean(q_pool[:, 0]),
+            "q_guided/q_real_penalized_mean": jnp.mean(q_pool_penalized[:, 0]),
+            "q_guided/penalty_mean": jnp.mean(penalty),
             "q_guided/prob_real_mean": jnp.mean(pool_probs[:, 0]),
             "q_guided/alpha_mean": jnp.mean(alpha),
             "q_guided/f_x_mean": f_x_mean,
@@ -200,7 +213,7 @@ class DGPOFMState:
 
         if self.config.temp_func_type == "max":
             metrics["q_guided/max_abs_adv_avg"] = f_x_mean
-            metrics["q_guided/pool_abs_adv_mean"] = jnp.mean(jnp.abs(q_pool - jnp.mean(q_pool, axis=-1, keepdims=True)))
+            metrics["q_guided/pool_abs_adv_mean"] = jnp.mean(jnp.abs(q_pool_penalized - jnp.mean(q_pool_penalized, axis=-1, keepdims=True)))
         else:
             metrics["q_guided/q_var_mean"] = jnp.mean(x_var)
 
@@ -335,36 +348,64 @@ class DGPOFMState:
         # 👑 池子里全是原像
         pool_actions = jnp.concatenate([real_action_flat, gen_acts], axis=1)
 
-        # 👑 转换为表像供 Critic 评测！
-        pool_actions_clipped = self._apply_clip(pool_actions)
-        probs, fresh_metrics = self._compute_fresh_weights(self.params.value, obs_flat, pool_actions_clipped)
+        # 👑 直接传原像进 _compute_fresh_weights，让它内部去算 Clip 和 Penalty
+        probs, fresh_metrics = self._compute_fresh_weights(self.params.value, obs_flat, pool_actions)
 
         def policy_loss_fn(p_params):
             M = cfg.num_epsilon_samples
-            p_idx, p_eps, p_t, p_acc, p_trust = jax.random.split(prng_pol, 5)
-            logits = jnp.log(probs + 1e-8)
-            accept_threshold = 1.0 / K  # 🗑️ 删除了多余的重复定义
+            K_fakes = cfg.num_generated_actions
 
-            if cfg.independent_noise_sampling:
-                sampled_indices = jax.random.categorical(p_idx, jnp.broadcast_to(logits[:, None, :], (N, M, K + 1)),
-                                                         axis=-1)
-                # 👑 a_target 提取自原像 pool_actions！
-                a_target = jnp.take_along_axis(pool_actions[:, None, :, :], sampled_indices[..., None, None],
-                                               axis=2).squeeze(2)
-                rand_vals = jax.random.uniform(p_acc, (N, M))
-                is_real = (sampled_indices == 0)
-                is_fake_accepted = (sampled_indices > 0) & (rand_vals < accept_threshold)
-            else:
-                sampled_indices = jax.random.categorical(p_idx, logits, axis=-1)[:, None]
-                # 👑 a_target 提取自原像 pool_actions！
-                a_target = jnp.broadcast_to(pool_actions[jnp.arange(N), sampled_indices[:, 0]][:, None, :],
-                                            (N, M, act_dim))
-                rand_vals = jax.random.uniform(p_acc, (N, 1))
-                is_real = jnp.broadcast_to(sampled_indices == 0, (N, M))
-                is_fake_accepted = jnp.broadcast_to((sampled_indices > 0) & (rand_vals < accept_threshold), (N, M))
+            # 👑 完美的算力期望对齐公式：
+            # 保证在均匀分布下，真假动作刚好平分 M 个槽位
+            BUDGET = (float(M) / 2.0) * float(K_fakes + 1)
 
-            valid_mask = (is_real | is_fake_accepted).astype(jnp.float32)
+            p_idx_fake, p_idx_alloc, p_eps, p_t, p_trust = jax.random.split(prng_pol, 5)
 
+            # 1. 抽 1 个假动作 (索引 1 到 K)
+            fake_idx = jax.random.randint(p_idx_fake, (N,), 1, K_fakes + 1)
+
+            # 2. 提取概率
+            p_real = probs[:, 0]
+            p_fake = jnp.take_along_axis(probs, fake_idx[:, None], axis=1).squeeze(1)
+
+            # ==========================================
+            # 👑 3. 终极算力分配数学核心 (全动态且无分支)
+            # ==========================================
+            n_exp_real = p_real * BUDGET
+            n_exp_fake = p_fake * BUDGET
+            sum_exp = n_exp_real + n_exp_fake
+
+            # 分母路由：>8 按比率瓜分，<8 拿应得并留出空位
+            denom = jnp.maximum(float(M), sum_exp)
+
+            prob_real = n_exp_real / denom
+            prob_fake = n_exp_fake / denom
+            prob_discard = 1.0 - prob_real - prob_fake
+
+            alloc_probs = jnp.stack([prob_discard, prob_real, prob_fake], axis=-1)
+
+            # 一键轮盘赌：0=丢弃, 1=真动作, 2=假动作
+            assigned_classes = jax.random.categorical(
+                p_idx_alloc,
+                jnp.log(alloc_probs + 1e-8),
+                axis=-1,
+                shape=(N, M)
+            )
+
+            # ==========================================
+            # 👑 4. 提取目标并叠加 EMA Trust Mask
+            # ==========================================
+            real_acts = pool_actions[:, 0:1, :]
+            fake_acts = jnp.take_along_axis(pool_actions, fake_idx[:, None, None], axis=1)
+
+            a_target = jnp.where((assigned_classes == 1)[..., None], real_acts, fake_acts)
+
+            # 只保留抽中 1 或 2 的坑位
+            alloc_valid_mask = (assigned_classes > 0).astype(jnp.float32)
+            is_real_slot = (assigned_classes == 1)
+            is_fake_slot = (assigned_classes == 2)
+
+            # --- Z-Score EMA 防线 ---
             t_outer = (self.steps // (cfg.num_updates_per_batch * cfg.num_minibatches)) + 1.0
             bc_v = 1.0 - jnp.power(cfg.beta_v, t_outer)
             bc_r = 1.0 - jnp.power(cfg.beta_r, t_outer)
@@ -381,14 +422,17 @@ class DGPOFMState:
             r_trust = jnp.clip(jnp.exp(-jnp.maximum(-r_z + cfg.tolerance_r, 0.0) / 0.5), 0.01, 1.0)
             v_trust = jnp.clip(jnp.exp(-jnp.maximum(v_z - cfg.tolerance_v, 0.0) / 0.5), 0.01, 1.0)
 
-            trust_mask = (jax.random.uniform(p_trust, (N, M)) < jnp.where(is_real, r_trust, v_trust)).astype(
-                jnp.float32)
-            final_valid_mask = valid_mask * trust_mask
+            # 根据槽位归属自动路由 Trust Prob
+            combined_trust_prob = jnp.where(is_real_slot, r_trust, v_trust)
+            trust_mask = (jax.random.uniform(p_trust, (N, M)) < combined_trust_prob).astype(jnp.float32)
 
+            # 最终的掩码：既要分到算力，又要符合信任域
+            final_valid_mask = alloc_valid_mask * trust_mask
+
+            # --- Flow 拟合 ---
             eps = jax.random.normal(p_eps, (N, M, act_dim))
             t = sch.t_current[jax.random.randint(p_t, (N, M, 1), 0, cfg.flow_steps)]
 
-            # 👑 拟合原像的线性速度场
             x_t = t * eps + (1.0 - t) * a_target
 
             t_embed = self.embed_timestep(t)
@@ -407,6 +451,7 @@ class DGPOFMState:
                 "q_guided/real_trust_prob": r_trust,
                 "q_guided/fake_trust_prob": v_trust,
                 "q_guided/final_effective_ratio": jnp.mean(final_valid_mask),
+                "q_guided/actual_utilized_noises": jnp.mean(jnp.sum(alloc_valid_mask, axis=-1)),
                 "q_guided/reward_z_score": r_z,
                 "q_guided/v_loss_z_score": v_z,
             }
@@ -415,15 +460,13 @@ class DGPOFMState:
         (p_loss, p_metrics), p_grads = jax.value_and_grad(policy_loss_fn, has_aux=True)(self.params.policy)
         p_updates, new_p_opt = self.opt_policy.update(p_grads, self.opt_state_policy, self.params.policy)
 
-        # 👑 Actor 专属的 Metrics
         final_metrics = {**p_metrics, **fresh_metrics}
 
-        # 👑 只更新 Actor 的参数、优化器状态和步数
         new_state = jdc.replace(
             self,
             params=jdc.replace(self.params, policy=optax.apply_updates(self.params.policy, p_updates)),
             opt_state_policy=new_p_opt,
-            steps=self.steps + 1,  # 同步内层步数
+            steps=self.steps + 1,
             prng=next_prng
         )
 
