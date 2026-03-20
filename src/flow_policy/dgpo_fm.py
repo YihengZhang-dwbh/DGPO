@@ -595,10 +595,13 @@ class DGPOFMState:
         _, (prepped_action_info_chunked, prep_metrics_chunked) = jax.lax.scan(scan_prep_fn, None,
                                                                               (chunked_transitions, prngs))
 
-        # 还原回原来的形状 (unroll_length, num_envs) 以备 Actor 小循环打乱
+        # 👑 终极防弹修复：直接拿着外层已经建好模的 new_action_info 作为形状对照表！
+        # 无论 JAX 在 scan 里把数据拍扁成什么鬼样子（比如把 1920x16 拍成了 30720），
+        # 只要总元素个数是对的，我们就强行把它塞回原本完美的形状中。
         prepped_action_info = jax.tree_util.tree_map(
-            lambda x: x.reshape((config.unroll_length, config.num_envs, *x.shape[2:])),
-            prepped_action_info_chunked
+            lambda orig_target, chunked_data: chunked_data.reshape(orig_target.shape),
+            new_action_info,  # <--- 真理模具
+            prepped_action_info_chunked  # <--- 被 JAX 拍扁的数据
         )
         prep_metrics = jax.tree_util.tree_map(lambda x: jnp.mean(x), prep_metrics_chunked)
 
