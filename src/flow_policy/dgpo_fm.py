@@ -528,7 +528,17 @@ class DGPOFMState:
             )
         )
 
-        new_action_info = jdc.replace(transitions.action_info, target_qs=target_qs)
+        # 👑 核心修复：为外层大循环之前的池子填充正确的二维 Dummy 形状，防止 critic 的 swapaxes 崩溃！
+        N_u, N_e = target_qs.shape[0], target_qs.shape[1]
+        dummy_pool_actions = jnp.zeros((N_u, N_e, 1, 1))
+        dummy_pool_probs = jnp.zeros((N_u, N_e, 1))
+
+        new_action_info = jdc.replace(
+            transitions.action_info,
+            target_qs=target_qs,
+            pool_actions=dummy_pool_actions,  # 塞入安全的占位符
+            pool_probs=dummy_pool_probs  # 塞入安全的占位符
+        )
         new_transitions = jdc.replace(transitions, action_info=new_action_info)
 
         def critic_epoch_step(carry_state, _):
