@@ -357,16 +357,20 @@ class DGPOFMState:
 
         obs_dim = self.env.observation_size
         act_dim = self.env.action_size
-        N = transitions.obs.shape[0]
+
+        # 👑 绝对防弹的 Flatten：无论 minibatch 切成几维，用 size 强行算出绝对的 N！
+        N = transitions.obs.size // obs_dim
         obs_flat = ((transitions.obs - self.obs_stats.mean) / self.obs_stats.std
                     if cfg.normalize_observations else transitions.obs).reshape((N, obs_dim))
 
         mb_mean_reward = jnp.mean(transitions.reward)
         final_v_loss = global_v_loss
 
-        # 👑 直接读取外层已经固定好的池子，极速提取！
-        pool_actions = transitions.action_info.pool_actions
-        pool_probs = transitions.action_info.pool_probs
+        # 👑 提取大循环锁定的池子，并配套 Flatten 展平维数！
+        raw_pool_acts = transitions.action_info.pool_actions
+        raw_pool_probs = transitions.action_info.pool_probs
+        pool_actions = raw_pool_acts.reshape((N, raw_pool_acts.shape[-2], act_dim))
+        pool_probs = raw_pool_probs.reshape((N, raw_pool_probs.shape[-1]))
 
         def policy_loss_fn(p_params):
             M = cfg.num_epsilon_samples
