@@ -528,18 +528,28 @@ class DGPOFMState:
             )
         )
 
-        # 👑 核心修复：为外层大循环之前的池子填充正确的二维 Dummy 形状，防止 critic 的 swapaxes 崩溃！
+        # ==========================================
+        # 👑 核心修复：注入多维安全占位符，防止 JAX Scan 维度坍缩
+        # ==========================================
         N_u, N_e = target_qs.shape[0], target_qs.shape[1]
-        dummy_pool_actions = jnp.zeros((N_u, N_e, 1, 1))
-        dummy_pool_probs = jnp.zeros((N_u, N_e, 1))
+        act_dim = state.env.action_size
+
+        if config.sampling_mode == "relative_h_pool":
+            dummy_pool_acts = jnp.zeros((N_u, N_e, config.h_fakes_in_pool + 1, act_dim))
+            dummy_pool_probs = jnp.zeros((N_u, N_e, config.h_fakes_in_pool + 1))
+        else:
+            dummy_pool_acts = jnp.zeros((N_u, N_e, config.num_generated_actions + 1, act_dim))
+            dummy_pool_probs = jnp.zeros((N_u, N_e, config.num_generated_actions + 1))
 
         new_action_info = jdc.replace(
             transitions.action_info,
             target_qs=target_qs,
-            pool_actions=dummy_pool_actions,  # 塞入安全的占位符
-            pool_probs=dummy_pool_probs  # 塞入安全的占位符
+            pool_actions=dummy_pool_acts,  # 占好四维的坑
+            pool_probs=dummy_pool_probs  # 占好三维的坑
         )
         new_transitions = jdc.replace(transitions, action_info=new_action_info)
+
+        # 后面的 def critic_epoch_step ... 保持完全不变
 
         def critic_epoch_step(carry_state, _):
             minibatches = new_transitions.prepare_minibatches(
