@@ -385,10 +385,13 @@ class DGPOFMState:
 
             alloc_probs = jnp.stack([prob_discard, prob_real, prob_fake], axis=-1)
 
+            # 👑 1. 扩充维度为 (N, 1, 3)，让 JAX 能够正确广播到 (N, M)
+            logits = jnp.log(alloc_probs[:, None, :] + 1e-8)
+
             # 一键轮盘赌：0=丢弃, 1=真动作, 2=假动作
             assigned_classes = jax.random.categorical(
                 p_idx_alloc,
-                jnp.log(alloc_probs + 1e-8),
+                logits,
                 axis=-1,
                 shape=(N, M)
             )
@@ -397,7 +400,8 @@ class DGPOFMState:
             # 👑 4. 提取目标并叠加 EMA Trust Mask
             # ==========================================
             real_acts = pool_actions[:, 0:1, :]
-            fake_acts = jnp.take_along_axis(pool_actions, fake_idx[:, None, None], axis=1)
+            # 👑 2. 使用更安全的整数索引提取，彻底规避 take_along_axis 潜在的末尾维度广播问题
+            fake_acts = pool_actions[jnp.arange(N), fake_idx][:, None, :]
 
             a_target = jnp.where((assigned_classes == 1)[..., None], real_acts, fake_acts)
 
