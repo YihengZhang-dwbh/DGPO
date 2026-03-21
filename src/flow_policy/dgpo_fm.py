@@ -21,6 +21,7 @@ class DGPOFMConfig:
     independent_noise_sampling: jdc.Static[bool] = True
     use_global_variance: jdc.Static[bool] = False
     temp_func_type: jdc.Static[Literal["log", "cbrt", "std", "fixed", "max"]] = "max"
+    fast_flow_step: jdc.Static[int] = 10
 
     # 👑 动作边界处理：加入了无损折叠映射
     action_clip: jdc.Static[Literal["hard", "margin", "tanh", "fold"]] = "fold"
@@ -310,7 +311,7 @@ class DGPOFMState:
         real_action_flat = transitions_chunk.action_info.raw_action.reshape((N, 1, act_dim))
         obs_b_gen = jnp.broadcast_to(obs_flat[:, None, :], (N, K_fakes, obs_dim))
 
-        fast_flow_steps = 3
+        fast_flow_steps = self.config.fast_flow_step
         fast_full_t = jnp.linspace(1.0, 0.0, fast_flow_steps + 1)
         fast_t_curr, fast_t_next = fast_full_t[:-1], fast_full_t[1:]
 
