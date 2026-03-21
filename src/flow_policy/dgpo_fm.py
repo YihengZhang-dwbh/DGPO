@@ -21,7 +21,7 @@ class DGPOFMConfig:
     independent_noise_sampling: jdc.Static[bool] = True
     use_global_variance: jdc.Static[bool] = False
     temp_func_type: jdc.Static[Literal["log", "cbrt", "std", "fixed", "max"]] = "max"
-    fast_flow_step: jdc.Static[int] = 10
+    fast_flow_step: jdc.Static[int] = 5
 
     # 👑 动作边界处理：加入了无损折叠映射
     action_clip: jdc.Static[Literal["hard", "margin", "tanh", "fold"]] = "fold"
