@@ -22,9 +22,15 @@ class DGPOFMConfig:
     use_global_variance: jdc.Static[bool] = False
     temp_func_type: jdc.Static[Literal["log", "cbrt", "std", "fixed", "max"]] = "max"
     fast_flow_step: jdc.Static[int] = 5
+    # ... 其他 Config 参数 ...
+
+    # 👑 概率分配模式控制：经典的 KL 闭式解 (Softmax) vs 全新的线性概率质量重分配
+    prob_allocation_mode: jdc.Static[Literal["kl_softmax", "linear_redistribution"]] = "linear_redistribution"
+
+    # ...
 
     # 👑 动作边界处理：加入了无损折叠映射
-    action_clip: jdc.Static[Literal["hard", "margin", "tanh", "fold"]] = "fold"
+    action_clip: jdc.Static[Literal["hard", "margin", "tanh", "fold", "scale_clip"]] = "margin"
     clip_margin: float = 1.1
     penalty_coef: float = 10.0
 
@@ -41,8 +47,8 @@ class DGPOFMConfig:
 
     beta_r: float = 0.9
     beta_v: float = 0.9
-    tolerance_r: float = 0.1
-    tolerance_v: float = 0.5
+    tolerance_r: float = -10
+    tolerance_v: float = 10
 
     w_v_loss: float = 1.0
     learning_rate_p: float = 3e-4
@@ -177,42 +183,115 @@ class DGPOFMState:
         penalty = self.config.penalty_coef * jnp.sum(jnp.square(out_of_bounds), axis=-1)
 
         q_pool_penalized = q_pool - penalty
+        pool_mean = jnp.mean(q_pool_penalized, axis=-1, keepdims=True)
+        adv = q_pool_penalized - pool_mean
 
-        if self.config.temp_func_type == "max":
-            pool_mean = jnp.mean(q_pool_penalized, axis=-1, keepdims=True)
-            adv = q_pool_penalized - pool_mean
-            abs_adv = jnp.abs(adv)
-            f_x = jnp.max(abs_adv) if self.config.use_global_variance else jnp.max(abs_adv, axis=-1, keepdims=True)
-        else:
-            x_var = jnp.var(q_pool_penalized) if self.config.use_global_variance else jnp.var(q_pool_penalized, axis=-1,
-                                                                                              keepdims=True)
-            if self.config.temp_func_type == "log":
-                f_x = jnp.log1p(x_var)
-            elif self.config.temp_func_type == "cbrt":
-                f_x = jnp.power(x_var + 1e-8, 1.0 / 3.0)
-            elif self.config.temp_func_type == "std":
-                f_x = jnp.sqrt(x_var + 1e-8)
+        # ==========================================
+        # 👑 模式 A：经典的 KL 闭式解 (Softmax 分布)
+        # ==========================================
+        if self.config.prob_allocation_mode == "kl_softmax":
+            if self.config.temp_func_type == "max":
+                abs_adv = jnp.abs(adv)
+                f_x = jnp.max(abs_adv) if self.config.use_global_variance else jnp.max(abs_adv, axis=-1, keepdims=True)
             else:
-                f_x = 1.0
+                x_var = jnp.var(q_pool_penalized) if self.config.use_global_variance else jnp.var(q_pool_penalized,
+                                                                                                  axis=-1,
+                                                                                                  keepdims=True)
+                if self.config.temp_func_type == "log":
+                    f_x = jnp.log1p(x_var)
+                elif self.config.temp_func_type == "cbrt":
+                    f_x = jnp.power(x_var + 1e-8, 1.0 / 3.0)
+                elif self.config.temp_func_type == "std":
+                    f_x = jnp.sqrt(x_var + 1e-8)
+                else:
+                    f_x = 1.0
 
-        if self.config.f_x_forward:
-            alpha = jnp.maximum(self.config.resampling_alpha_min, self.config.resampling_alpha_k * f_x)
+            if self.config.f_x_forward:
+                alpha = jnp.maximum(self.config.resampling_alpha_min, self.config.resampling_alpha_k * f_x)
+            else:
+                alpha = self.config.resampling_alpha_min / (1 + self.config.resampling_alpha_k * f_x)
+
+            logits = (q_pool_penalized - jnp.max(q_pool_penalized, axis=-1, keepdims=True)) / alpha
+            pool_probs = jax.nn.softmax(logits, axis=-1)
+
+            metrics = {
+                "q_guided/q_real_mean": jnp.mean(q_pool[:, 0]),
+                "q_guided/q_real_penalized_mean": jnp.mean(q_pool_penalized[:, 0]),
+                "q_guided/penalty_mean": jnp.mean(penalty),
+                "q_guided/prob_real_mean": jnp.mean(pool_probs[:, 0]),
+                "q_guided/alpha_mean": jnp.mean(alpha),
+                "q_guided/f_x_mean": jnp.mean(f_x),
+            }
+            return jax.lax.stop_gradient(pool_probs), metrics
+
+        # ==========================================
+        # 👑 模式 B：全新的线性概率质量重分配机制
+        # ==========================================
+        elif self.config.prob_allocation_mode == "linear_redistribution":
+            # 强行固定 k，彻底无视自适应温度逻辑
+            k = self.config.resampling_alpha_k
+
+            p_base = jnp.ones((N, K_plus_1)) / K_plus_1
+
+            is_pos = adv > 0.0
+            is_neg = adv <= 0.0
+
+            p_pos = jnp.sum(p_base * is_pos, axis=-1, keepdims=True)
+            sum_A_pos = jnp.sum(adv * is_pos, axis=-1, keepdims=True) + 1e-8
+            sum_A_neg = jnp.sum(adv * is_neg, axis=-1, keepdims=True) - 1e-8
+
+            # --- Case 1: 正优势储备较少 (2p_+ <= 1.0) ---
+            new_p_c1_pos = p_base * (1 + k) + (adv * is_pos / sum_A_pos) * k * (1.0 - 2.0 * p_pos)
+            new_p_c1_neg = p_base * (1 - k)
+            p_case1 = jnp.where(is_pos, new_p_c1_pos, new_p_c1_neg)
+
+            # --- Case 2: 正优势储备过半 (2p_+ > 1.0) ---
+            new_p_c2_pos = p_base * (1 + k)
+            new_p_c2_neg = p_base * (1 - k) - (adv * is_neg / sum_A_neg) * k * (2.0 * p_pos - 1.0)
+            p_case2 = jnp.where(is_pos, new_p_c2_pos, new_p_c2_neg)
+
+            # --- Case 3: 概率池枯竭，按排位“劫富济贫” ---
+            target_p = p_base * (1 + k) * is_pos
+            sort_idx = jnp.argsort(-adv, axis=-1)
+            sorted_target_p = jnp.take_along_axis(target_p, sort_idx, axis=-1)
+
+            cum_p = jnp.cumsum(sorted_target_p, axis=-1)
+            full_alloc_mask = cum_p <= 1.0
+
+            prev_full_alloc_mask = jnp.concatenate([jnp.ones((N, 1), dtype=bool), full_alloc_mask[:, :-1]], axis=-1)
+            boundary_mask = prev_full_alloc_mask & ~full_alloc_mask
+            prev_cum_p = jnp.concatenate([jnp.zeros((N, 1)), cum_p[:, :-1]], axis=-1)
+
+            sorted_new_p = jnp.where(full_alloc_mask, sorted_target_p, 0.0)
+            # 增加 maximum 兜底，防止精度截断出现微小的负数
+            sorted_new_p = jnp.where(boundary_mask, jnp.maximum(0.0, 1.0 - prev_cum_p), sorted_new_p)
+
+            undo_sort_idx = jnp.argsort(sort_idx, axis=-1)
+            p_case3 = jnp.take_along_axis(sorted_new_p, undo_sort_idx, axis=-1)
+
+            # 路由整合：判断每个样本属于哪个 Case
+            cond_case3 = (p_pos * (1 + k) > 1.0)
+            cond_case1 = ~cond_case3 & (p_pos <= 0.5)
+
+            pool_probs = jnp.where(cond_case3, p_case3, jnp.where(cond_case1, p_case1, p_case2))
+
+            # 👑 防弹装甲：防止浮点数精度误差累计，做最后一次裁剪与归一化
+            pool_probs = jnp.clip(pool_probs, 0.0, 1.0)
+            pool_probs = pool_probs / jnp.sum(pool_probs, axis=-1, keepdims=True)
+
+            metrics = {
+                "q_guided/q_real_mean": jnp.mean(q_pool[:, 0]),
+                "q_guided/q_real_penalized_mean": jnp.mean(q_pool_penalized[:, 0]),
+                "q_guided/penalty_mean": jnp.mean(penalty),
+                "q_guided/prob_real_mean": jnp.mean(pool_probs[:, 0]),
+                "q_guided/k_val": k,
+                "q_guided/case3_ratio": jnp.mean(cond_case3.astype(jnp.float32)),
+                "q_guided/case1_ratio": jnp.mean(cond_case1.astype(jnp.float32)),
+            }
+            return jax.lax.stop_gradient(pool_probs), metrics
+
         else:
-            alpha = self.config.resampling_alpha_min / (1 + self.config.resampling_alpha_k * f_x)
-
-        logits = (q_pool_penalized - jnp.max(q_pool_penalized, axis=-1, keepdims=True)) / alpha
-        pool_probs = jax.nn.softmax(logits, axis=-1)
-
-        f_x_mean = jnp.mean(f_x)
-        metrics = {
-            "q_guided/q_real_mean": jnp.mean(q_pool[:, 0]),
-            "q_guided/q_real_penalized_mean": jnp.mean(q_pool_penalized[:, 0]),
-            "q_guided/penalty_mean": jnp.mean(penalty),
-            "q_guided/prob_real_mean": jnp.mean(pool_probs[:, 0]),
-            "q_guided/alpha_mean": jnp.mean(alpha),
-            "q_guided/f_x_mean": f_x_mean,
-        }
-        return jax.lax.stop_gradient(pool_probs), metrics
+            raise ValueError(f"Unknown prob_allocation_mode: {self.config.prob_allocation_mode}")
 
     def _compute_value_loss(self, value_params, obs_norm, actions, truncation, target_qs):
         concat_inputs = jnp.concatenate([obs_norm, actions], axis=-1)
