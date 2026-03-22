@@ -32,7 +32,7 @@ class DGPOFMConfig:
     # 👑 动作边界处理：加入了无损折叠映射
     action_clip: jdc.Static[Literal["hard", "margin", "tanh", "fold", "scale_clip"]] = "margin"
     clip_margin: float = 1.1
-    penalty_coef: float = 10.0
+    penalty_coef: float = 0
 
     # 👑 采样算力分配模式
     sampling_mode: jdc.Static[Literal["absolute_budget", "relative_h_pool"]] = "relative_h_pool"
