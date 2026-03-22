@@ -26,6 +26,9 @@ class DGPOFMConfig:
 
     # 👑 概率分配模式控制：经典的 KL 闭式解 (Softmax) vs 全新的线性概率质量重分配
     prob_allocation_mode: jdc.Static[Literal["kl_softmax", "linear_redistribution"]] = "linear_redistribution"
+    # 全新非对称线性重分配参数 (l: 惩罚剥夺率, r: 奖励增幅率)
+    resampling_l: float = 0.3
+    resampling_r: float = 0.4
 
     # ...
 
@@ -225,11 +228,12 @@ class DGPOFMState:
             return jax.lax.stop_gradient(pool_probs), metrics
 
         # ==========================================
-        # 👑 模式 B：全新的线性概率质量重分配机制
+        # 👑 模式 B：全新的非对称线性概率质量重分配机制 (l, r 独立控制)
         # ==========================================
         elif self.config.prob_allocation_mode == "linear_redistribution":
-            # 强行固定 k，彻底无视自适应温度逻辑
-            k = self.config.resampling_alpha_k
+            # 提取你设计的非对称双参
+            l_val = self.config.resampling_l
+            r_val = self.config.resampling_r
 
             p_base = jnp.ones((N, K_plus_1)) / K_plus_1
 
@@ -238,20 +242,21 @@ class DGPOFMState:
 
             p_pos = jnp.sum(p_base * is_pos, axis=-1, keepdims=True)
             sum_A_pos = jnp.sum(adv * is_pos, axis=-1, keepdims=True) + 1e-8
-            sum_A_neg = jnp.sum(adv * is_neg, axis=-1, keepdims=True) - 1e-8
+            sum_A_neg = jnp.sum(adv * is_neg, axis=-1, keepdims=True) - 1e-8  # 注意：这里是负数
 
-            # --- Case 1: 正优势储备较少 (2p_+ <= 1.0) ---
-            new_p_c1_pos = p_base * (1 + k) + (adv * is_pos / sum_A_pos) * k * (1.0 - 2.0 * p_pos)
-            new_p_c1_neg = p_base * (1 - k)
+            # --- Case 1: (l+r)*p_+ <= l ---
+            new_p_c1_pos = p_base * (1 + r_val) + (adv * is_pos / sum_A_pos) * (l_val - (l_val + r_val) * p_pos)
+            new_p_c1_neg = p_base * (1 - l_val)
             p_case1 = jnp.where(is_pos, new_p_c1_pos, new_p_c1_neg)
 
-            # --- Case 2: 正优势储备过半 (2p_+ > 1.0) ---
-            new_p_c2_pos = p_base * (1 + k)
-            new_p_c2_neg = p_base * (1 - k) - (adv * is_neg / sum_A_neg) * k * (2.0 * p_pos - 1.0)
+            # --- Case 2: (l+r)*p_+ > l ---
+            new_p_c2_pos = p_base * (1 + r_val)
+            # 注意：sum_A_neg 和 adv*is_neg 都是负数，相除为正。减去后面的项意味着进一步削减差动作的概率
+            new_p_c2_neg = p_base * (1 - l_val) - (adv * is_neg / sum_A_neg) * ((l_val + r_val) * p_pos - l_val)
             p_case2 = jnp.where(is_pos, new_p_c2_pos, new_p_c2_neg)
 
-            # --- Case 3: 概率池枯竭，按排位“劫富济贫” ---
-            target_p = p_base * (1 + k) * is_pos
+            # --- Case 3: p_+ * (1+r) > 1.0 (概率池枯竭，按排位“劫富济贫”) ---
+            target_p = p_base * (1 + r_val) * is_pos
             sort_idx = jnp.argsort(-adv, axis=-1)
             sorted_target_p = jnp.take_along_axis(target_p, sort_idx, axis=-1)
 
@@ -263,28 +268,29 @@ class DGPOFMState:
             prev_cum_p = jnp.concatenate([jnp.zeros((N, 1)), cum_p[:, :-1]], axis=-1)
 
             sorted_new_p = jnp.where(full_alloc_mask, sorted_target_p, 0.0)
-            # 增加 maximum 兜底，防止精度截断出现微小的负数
             sorted_new_p = jnp.where(boundary_mask, jnp.maximum(0.0, 1.0 - prev_cum_p), sorted_new_p)
 
             undo_sort_idx = jnp.argsort(sort_idx, axis=-1)
             p_case3 = jnp.take_along_axis(sorted_new_p, undo_sort_idx, axis=-1)
 
-            # 路由整合：判断每个样本属于哪个 Case
-            cond_case3 = (p_pos * (1 + k) > 1.0)
-            cond_case1 = ~cond_case3 & (p_pos <= 0.5)
+            # ==========================================
+            # 👑 路由整合：判断每个样本属于哪个 Case
+            # ==========================================
+            cond_case3 = (p_pos * (1 + r_val) > 1.0)
+            cond_case1 = ~cond_case3 & ((l_val + r_val) * p_pos <= l_val)
 
             pool_probs = jnp.where(cond_case3, p_case3, jnp.where(cond_case1, p_case1, p_case2))
 
-            # 👑 防弹装甲：防止浮点数精度误差累计，做最后一次裁剪与归一化
+            # 防弹装甲：防止浮点数精度误差累计或极个别劣质动作概率被减穿 0，做最后一次裁剪与归一化
             pool_probs = jnp.clip(pool_probs, 0.0, 1.0)
             pool_probs = pool_probs / jnp.sum(pool_probs, axis=-1, keepdims=True)
 
             metrics = {
                 "q_guided/q_real_mean": jnp.mean(q_pool[:, 0]),
                 "q_guided/q_real_penalized_mean": jnp.mean(q_pool_penalized[:, 0]),
-                "q_guided/penalty_mean": jnp.mean(penalty),
                 "q_guided/prob_real_mean": jnp.mean(pool_probs[:, 0]),
-                "q_guided/k_val": k,
+                "q_guided/l_val": l_val,
+                "q_guided/r_val": r_val,
                 "q_guided/case3_ratio": jnp.mean(cond_case3.astype(jnp.float32)),
                 "q_guided/case1_ratio": jnp.mean(cond_case1.astype(jnp.float32)),
             }
