@@ -29,6 +29,9 @@ class DGPOFMConfig:
     # 全新非对称线性重分配参数 (l: 惩罚剥夺率, r: 奖励增幅率)
     resampling_l: float = 0.3
     resampling_r: float = 0.4
+    # 👑 OOD 盲盒探索率 (基因突变注入)
+    # 建议设在 0.05 到 0.15 之间，Cheetahrun 推荐从 0.1 起步
+    resampling_ood_p: float = 0.1
 
     # ...
 
@@ -465,7 +468,9 @@ class DGPOFMState:
         def policy_loss_fn(p_params):
             M = cfg.num_epsilon_samples
             K_fakes = cfg.num_generated_actions
-            p_idx_fake, p_idx_alloc, p_eps, p_t, p_trust = jax.random.split(prng_pol, 5)
+
+            # 👑 分裂更多的随机钥匙，为 OOD 盲盒准备
+            p_idx_fake, p_idx_alloc, p_eps, p_t, p_trust, p_idx_uniform, p_ood_mask = jax.random.split(prng_pol, 7)
 
             if cfg.sampling_mode == "absolute_budget":
                 BUDGET = (float(M) / 2.0) * float(K_fakes + 1)
@@ -506,6 +511,28 @@ class DGPOFMState:
 
                 alloc_valid_mask = jnp.ones((N, M), dtype=jnp.float32)  # 全满！
                 is_real_slot = (assigned_local_idx == 0)
+
+            # ==========================================
+            # 👑 终极正则化：OOD 盲盒基因突变注入
+            #    按概率 p 强行覆盖 DGPO 挑出的动作，用纯随机动作拟合！
+            # ==========================================
+            if getattr(cfg, "resampling_ood_p", 0.0) > 0.0:
+                ood_p = cfg.resampling_ood_p
+
+                # 1. 蒙出 N * M 个绝对均匀的盲盒动作 (MuJoCo 动作默认 [-1, 1])
+                uniform_actions = jax.random.uniform(p_idx_uniform, (N, M, act_dim), minval=-1.0, maxval=1.0)
+
+                # 2. 生成掩码
+                ood_mask = jax.random.uniform(p_ood_mask, (N, M)) < ood_p
+
+                # 3. 强行截胡替换！
+                a_target = jnp.where(ood_mask[..., None], uniform_actions, a_target)
+
+                # 4. 盲盒是不讲武德的探索，它不再享受 reward 信任，只走 v_loss 探索信任！
+                is_real_slot = is_real_slot & (~ood_mask)
+
+                # 5. 如果原本在 absolute 模式下被废弃的算力槽，碰巧摇到了盲盒，我们把它激活！
+                alloc_valid_mask = jnp.maximum(alloc_valid_mask, ood_mask.astype(jnp.float32))
 
             # --- 速度场目标像坍缩 ---
             if cfg.action_clip in ["hard", "margin", "fold"]:
