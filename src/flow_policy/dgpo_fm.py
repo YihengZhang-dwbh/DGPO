@@ -20,12 +20,13 @@ class DGPOFMConfig:
     # --- 全新 Q-Guided 生成控制核心 ---
     independent_noise_sampling: jdc.Static[bool] = True
     use_global_variance: jdc.Static[bool] = False
-    temp_func_type: jdc.Static[Literal["log", "cbrt", "std", "fixed", "max"]] = "max"
+    temp_func_type: jdc.Static[Literal["log", "cbrt", "std", "fixed", "max"]] = "fixed"
     fast_flow_step: jdc.Static[int] = 5
     # ... 其他 Config 参数 ...
 
     # 👑 概率分配模式控制：经典的 KL 闭式解 (Softmax) vs 全新的线性概率质量重分配
-    prob_allocation_mode: jdc.Static[Literal["kl_softmax", "linear_redistribution"]] = "linear_redistribution"
+    # prob_allocation_mode: jdc.Static[Literal["kl_softmax", "linear_redistribution"]] = "linear_redistribution"
+    prob_allocation_mode: jdc.Static[Literal["kl_softmax", "linear_redistribution"]] = "kl_softmax"
     # 全新非对称线性重分配参数 (l: 惩罚剥夺率, r: 奖励增幅率)
     resampling_l: float = 0.3
     resampling_r: float = 0.4
