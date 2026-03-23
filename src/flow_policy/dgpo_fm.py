@@ -50,7 +50,9 @@ class DGPOFMConfig:
     resampling_alpha_min: float = 0.0001
     f_x_forward: jdc.Static[bool] = True
     num_generated_actions: jdc.Static[int] = 48  # 外层全局生成动作数 (K)
-    num_epsilon_samples: jdc.Static[int] = 8  # 内层拟合分配算力 (M)
+    # 👑 物理显存上限 (决定了极品动作能爽到什么程度)
+    # 如果显卡顶得住，拉到 128 甚至 256！
+    num_epsilon_samples: jdc.Static[int] = 128
 
     beta_r: float = 0.9
     beta_v: float = 0.9
@@ -467,73 +469,49 @@ class DGPOFMState:
         pool_probs = raw_pool_probs.reshape((N, raw_pool_probs.shape[-1]))
 
         def policy_loss_fn(p_params):
-            M = cfg.num_epsilon_samples
-            K_fakes = cfg.num_generated_actions
+            M = cfg.num_epsilon_samples  # 物理显存上限，例如 48
+            K_fakes = cfg.num_generated_actions  # 例如 7
 
-            # 👑 分裂更多的随机钥匙，为 OOD 盲盒准备
-            p_idx_fake, p_idx_alloc, p_eps, p_t, p_trust, p_idx_uniform, p_ood_mask = jax.random.split(prng_pol, 7)
-
-            if cfg.sampling_mode == "absolute_budget":
-                BUDGET = (float(M) / 2.0) * float(K_fakes + 1)
-                fake_idx = jax.random.randint(p_idx_fake, (N,), 1, K_fakes + 1)
-
-                p_real = pool_probs[:, 0]
-                p_fake = jnp.take_along_axis(pool_probs, fake_idx[:, None], axis=1).squeeze(1)
-
-                n_exp_real = p_real * BUDGET
-                n_exp_fake = p_fake * BUDGET
-                sum_exp = n_exp_real + n_exp_fake
-
-                denom = jnp.maximum(float(M), sum_exp)
-                prob_real = n_exp_real / denom
-                prob_fake = n_exp_fake / denom
-                prob_discard = 1.0 - prob_real - prob_fake
-
-                alloc_probs = jnp.stack([prob_discard, prob_real, prob_fake], axis=-1)
-                logits = jnp.log(alloc_probs[:, None, :] + 1e-8)
-
-                assigned_classes = jax.random.categorical(p_idx_alloc, logits, axis=-1, shape=(N, M))
-
-                real_acts = pool_actions[:, 0:1, :]
-                fake_acts = pool_actions[jnp.arange(N), fake_idx][:, None, :]
-                a_target = jnp.where((assigned_classes == 1)[..., None], real_acts, fake_acts)
-
-                alloc_valid_mask = (assigned_classes > 0).astype(jnp.float32)
-                is_real_slot = (assigned_classes == 1)
-            else:
-                # 👑 relative_h_pool 做法A 纯粹实现：
-                # 因为池子在外层已经被压缩到了 h+1，并且固定死了，这里直接瓜分！
-                local_logits = jnp.log(pool_probs[:, None, :] + 1e-8)
-
-                # 直接在 h+1 个动作中抽选 M 个槽位，100% 榨干算力！
-                assigned_local_idx = jax.random.categorical(p_idx_alloc, local_logits, axis=-1, shape=(N, M))
-
-                a_target = jnp.take_along_axis(pool_actions, assigned_local_idx[..., None], axis=1)
-
-                alloc_valid_mask = jnp.ones((N, M), dtype=jnp.float32)  # 全满！
-                is_real_slot = (assigned_local_idx == 0)
+            p_mask, p_eps, p_t, p_trust = jax.random.split(prng_pol, 4)
 
             # ==========================================
-            # 👑 终极正则化：OOD 盲盒基因突变注入
-            #    按概率 p 强行覆盖 DGPO 挑出的动作，用纯随机动作拟合！
+            # 👑 1. 强制锁死真动作，拒绝任何假动作
             # ==========================================
-            # 直接提取动态张量，删掉引发 JIT 崩溃的 if 语句！
-            ood_p = getattr(cfg, "resampling_ood_p", 0.0)
+            real_acts = pool_actions[:, 0:1, :]
+            # 把真动作广播填满整个物理显存槽 M
+            a_target = jnp.broadcast_to(real_acts, (N, M, act_dim))
+            is_real_slot = jnp.ones((N, M), dtype=bool)
 
-            # 1. 蒙出 N * M 个绝对均匀的盲盒动作 (MuJoCo 动作默认 [-1, 1])
-            uniform_actions = jax.random.uniform(p_idx_uniform, (N, M, act_dim), minval=-1.0, maxval=1.0)
+            # ==========================================
+            # 👑 2. 虚拟大池计算与显存截断 (Truncation)
+            # ==========================================
+            p_real = pool_probs[:, 0]
 
-            # 2. 生成掩码 (如果 ood_p 是 0.0，这里全是 False，自然不会替换)
-            ood_mask = jax.random.uniform(p_ood_mask, (N, M)) < ood_p
+            # 物理槽位上限 (M，比如你现在改成了 128)
+            M_float = float(M)
 
-            # 3. 强行截胡替换！
-            a_target = jnp.where(ood_mask[..., None], uniform_actions, a_target)
+            # 👑 解耦：虚拟算力预算！
+            # 之前我们是用 M * (K+1)，但这受限于物理上限。
+            # 现在我们直接给它一个庞大的虚拟总池！
+            # 假设你希望一个“完美动作(p_real=1.0)”能拿满 128 个槽，
+            # 甚至你希望“普通好动作(p_real=0.2)”就能拿满 128 个槽（即预算 = 128 / 0.2 = 640）
+            # 我们设一个显式的理论大池预算：
+            VIRTUAL_BUDGET = 640.0
 
-            # 4. 盲盒是不讲武德的探索，它不再享受 reward 信任，只走 v_loss 探索信任！
-            is_real_slot = is_real_slot & (~ood_mask)
+            # 算出真动作在这个 640 的大池子里该拿多少个
+            n_exp_real = p_real * VIRTUAL_BUDGET
 
-            # 5. 如果原本在 absolute 模式下被废弃的算力槽，碰巧摇到了盲盒，我们把它激活！
-            alloc_valid_mask = jnp.maximum(alloc_valid_mask, ood_mask.astype(jnp.float32))
+            # 物理截断：除以真实的物理槽位 M
+            # 假设 M=128：
+            # 若 n_exp_real = 200 -> 200/128 > 1.0 -> 截断到 1.0 (128个全亮)
+            # 若 n_exp_real = 32  -> 32/128 = 0.25 -> (25%的槽亮，期望提供32个算力)
+            keep_prob = jnp.clip(n_exp_real / M_float, 0.0, 1.0)
+
+            # ==========================================
+            # 👑 3. 纯正的硬随机采样 (Hard Bernoulli)
+            # ==========================================
+            rand_vals = jax.random.uniform(p_mask, (N, M))
+            alloc_valid_mask = (rand_vals < keep_prob[:, None]).astype(jnp.float32)
 
             # --- 速度场目标像坍缩 ---
             if cfg.action_clip in ["hard", "margin", "fold"]:
@@ -559,6 +537,7 @@ class DGPOFMState:
             combined_trust_prob = jnp.where(is_real_slot, r_trust, v_trust)
             trust_mask = (jax.random.uniform(p_trust, (N, M)) < combined_trust_prob).astype(jnp.float32)
 
+            # 最终有效槽位 = 虚拟池摇中的槽位 AND 通过信任域的槽位
             final_valid_mask = alloc_valid_mask * trust_mask
 
             # --- 极速 Flow 拟合 ---
@@ -576,16 +555,17 @@ class DGPOFMState:
             else:
                 err = jnp.sum((vel - (eps - a_target)) ** 2, axis=-1)
 
+            # jnp.mean 自动除以 M，因为无效的槽位被 mask 成了 0，
+            # 总体梯度的 Magnitude 完美等比例缩放，没有产生软权重的衰减副作用！
             loss = jnp.mean(err * final_valid_mask)
 
             return loss, {
                 "policy_loss": loss,
                 "q_guided/real_trust_prob": r_trust,
-                "q_guided/fake_trust_prob": v_trust,
-                "q_guided/final_effective_ratio": jnp.mean(final_valid_mask),
-                "q_guided/actual_utilized_noises": jnp.mean(jnp.sum(alloc_valid_mask, axis=-1)),
+                "q_guided/keep_prob": jnp.mean(keep_prob),
+                "q_guided/theoretical_exp_noises": jnp.mean(n_exp_real),
+                "q_guided/actual_hard_sampled_noises": jnp.mean(jnp.sum(alloc_valid_mask, axis=-1)),
                 "q_guided/reward_z_score": r_z,
-                "q_guided/v_loss_z_score": v_z,
             }
 
         (p_loss, p_metrics), p_grads = jax.value_and_grad(policy_loss_fn, has_aux=True)(self.params.policy)
