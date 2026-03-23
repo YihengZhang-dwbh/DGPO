@@ -517,23 +517,23 @@ class DGPOFMState:
             # 👑 终极正则化：OOD 盲盒基因突变注入
             #    按概率 p 强行覆盖 DGPO 挑出的动作，用纯随机动作拟合！
             # ==========================================
-            if getattr(cfg, "resampling_ood_p", 0.0) > 0.0:
-                ood_p = cfg.resampling_ood_p
+            # 直接提取动态张量，删掉引发 JIT 崩溃的 if 语句！
+            ood_p = getattr(cfg, "resampling_ood_p", 0.0)
 
-                # 1. 蒙出 N * M 个绝对均匀的盲盒动作 (MuJoCo 动作默认 [-1, 1])
-                uniform_actions = jax.random.uniform(p_idx_uniform, (N, M, act_dim), minval=-1.0, maxval=1.0)
+            # 1. 蒙出 N * M 个绝对均匀的盲盒动作 (MuJoCo 动作默认 [-1, 1])
+            uniform_actions = jax.random.uniform(p_idx_uniform, (N, M, act_dim), minval=-1.0, maxval=1.0)
 
-                # 2. 生成掩码
-                ood_mask = jax.random.uniform(p_ood_mask, (N, M)) < ood_p
+            # 2. 生成掩码 (如果 ood_p 是 0.0，这里全是 False，自然不会替换)
+            ood_mask = jax.random.uniform(p_ood_mask, (N, M)) < ood_p
 
-                # 3. 强行截胡替换！
-                a_target = jnp.where(ood_mask[..., None], uniform_actions, a_target)
+            # 3. 强行截胡替换！
+            a_target = jnp.where(ood_mask[..., None], uniform_actions, a_target)
 
-                # 4. 盲盒是不讲武德的探索，它不再享受 reward 信任，只走 v_loss 探索信任！
-                is_real_slot = is_real_slot & (~ood_mask)
+            # 4. 盲盒是不讲武德的探索，它不再享受 reward 信任，只走 v_loss 探索信任！
+            is_real_slot = is_real_slot & (~ood_mask)
 
-                # 5. 如果原本在 absolute 模式下被废弃的算力槽，碰巧摇到了盲盒，我们把它激活！
-                alloc_valid_mask = jnp.maximum(alloc_valid_mask, ood_mask.astype(jnp.float32))
+            # 5. 如果原本在 absolute 模式下被废弃的算力槽，碰巧摇到了盲盒，我们把它激活！
+            alloc_valid_mask = jnp.maximum(alloc_valid_mask, ood_mask.astype(jnp.float32))
 
             # --- 速度场目标像坍缩 ---
             if cfg.action_clip in ["hard", "margin", "fold"]:
