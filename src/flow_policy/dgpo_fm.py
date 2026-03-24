@@ -26,6 +26,7 @@ class DGPOFMConfig:
     m_centers: jdc.Static[int] = 8
     i_neighbors: jdc.Static[int] = 5
     perturb_std: float = 0.01
+    num_epsilon_samples: jdc.Static[int] = 8  # 👑 解除注释！恢复内层极速 Batch Size
 
     # 👑 双模式完美共存，默认保持经典作为 baseline
     prob_allocation_mode: jdc.Static[Literal["kl_softmax", "linear_redistribution"]] = "kl_softmax"
@@ -419,7 +420,9 @@ class DGPOFMState:
         final_v_loss = global_v_loss
 
         m_centers = cfg.m_centers
-        M_total = (m_centers + 1) * cfg.i_neighbors
+        i_neighbors = cfg.i_neighbors
+        # 👑 核心提速点：只取 M 个样本算梯度，彻底告别沉重的 M_total！
+        M = cfg.num_epsilon_samples
 
         raw_pool_acts = transitions.action_info.pool_actions
         raw_pool_probs = transitions.action_info.pool_probs
@@ -427,29 +430,27 @@ class DGPOFMState:
 
         pool_actions = raw_pool_acts.reshape((N, m_centers + 1, act_dim))
         pool_probs = raw_pool_probs.reshape((N, m_centers + 1))
-        pool_noises = raw_pool_noises.reshape((N, M_total, act_dim))
+        pool_noises = raw_pool_noises.reshape((N, m_centers + 1, i_neighbors, act_dim))
 
         def policy_loss_fn(p_params):
             p_idx_alloc, p_match, p_t, p_trust, p_idx_uniform, p_ood_mask = jax.random.split(prng_pol, 6)
 
             local_logits = jnp.where(pool_probs > 0, jnp.log(pool_probs + 1e-12), -1e9)
-            # 👑 核心修复：用 [:, None, :] 把形状变成 (N, 1, K)，完美迎合 JAX 的广播规则
-            assigned_idx = jax.random.categorical(p_idx_alloc, local_logits[:, None, :], axis=-1, shape=(N, M_total))
+
+            # 👑 仅仅从概率分布中采样出 M 个目标动作索引
+            assigned_idx = jax.random.categorical(p_idx_alloc, local_logits[:, None, :], axis=-1, shape=(N, M))
             a_target = jnp.take_along_axis(pool_actions, assigned_idx[..., None], axis=1)
 
-            # ==========================================
-            # 👑 全局随机打乱匹配 (Global Random Coupling)
-            # 交给概率和网络去自然调理
-            # ==========================================
-            match_keys = jax.random.uniform(p_match, (N, M_total))
-            shuffle_idx = jnp.argsort(match_keys, axis=-1)
-            shuffled_noises = jnp.take_along_axis(pool_noises, shuffle_idx[..., None], axis=1)
+            # 👑 仅仅为这 M 个动作，在其对应的邻域里挑 1 个微扰噪声！(完美斩断多余计算)
+            batch_idx = jnp.arange(N)[:, None]
+            neighbor_idx = jax.random.randint(p_match, (N, M), 0, i_neighbors)
+            shuffled_noises = pool_noises[batch_idx, assigned_idx, neighbor_idx]
 
             is_real_slot = (assigned_idx == 0)
 
             ood_p = cfg.resampling_ood_p
-            uniform_actions = jax.random.uniform(p_idx_uniform, (N, M_total, act_dim), minval=-1.0, maxval=1.0)
-            ood_mask = jax.random.uniform(p_ood_mask, (N, M_total)) < ood_p
+            uniform_actions = jax.random.uniform(p_idx_uniform, (N, M, act_dim), minval=-1.0, maxval=1.0)
+            ood_mask = jax.random.uniform(p_ood_mask, (N, M)) < ood_p
 
             a_target = jnp.where(ood_mask[..., None], uniform_actions, a_target)
             is_real_slot = is_real_slot & (~ood_mask)
@@ -474,14 +475,14 @@ class DGPOFMState:
             v_trust = jnp.clip(jnp.exp(-jnp.maximum(v_z - cfg.tolerance_v, 0.0) / 0.5), 0.01, 1.0)
 
             combined_trust_prob = jnp.where(is_real_slot, r_trust, v_trust)
-            trust_mask = (jax.random.uniform(p_trust, (N, M_total)) < combined_trust_prob).astype(jnp.float32)
+            trust_mask = (jax.random.uniform(p_trust, (N, M)) < combined_trust_prob).astype(jnp.float32)
 
             eps = shuffled_noises
-            t = sch.t_current[jax.random.randint(p_t, (N, M_total, 1), 0, cfg.flow_steps)]
+            t = sch.t_current[jax.random.randint(p_t, (N, M, 1), 0, cfg.flow_steps)]
             x_t = t * eps + (1.0 - t) * a_target
 
             t_embed = self.embed_timestep(t)
-            obs_p = jnp.broadcast_to(obs_flat[:, None, :], (N, M_total, obs_dim))
+            obs_p = jnp.broadcast_to(obs_flat[:, None, :], (N, M, obs_dim))
 
             vel = networks.flow_mlp_fwd(p_params, obs_p, x_t, t_embed) * cfg.policy_mlp_output_scale
 
@@ -511,6 +512,7 @@ class DGPOFMState:
 
         return new_state, p_metrics
 
+    
     @jdc.jit
     def training_step(self, transitions: DGPOFMTransition) -> tuple[DGPOFMState, dict[str, Array]]:
         config, state = self.config, self
