@@ -17,42 +17,30 @@ from . import math_utils, networks, rollouts
 
 @jdc.pytree_dataclass
 class DGPOFMConfig:
-    # --- 全新 Q-Guided 生成控制核心 ---
     independent_noise_sampling: jdc.Static[bool] = True
     use_global_variance: jdc.Static[bool] = False
     temp_func_type: jdc.Static[Literal["log", "cbrt", "std", "fixed", "max"]] = "fixed"
     fast_flow_step: jdc.Static[int] = 5
-    # ... 其他 Config 参数 ...
 
-    # 👑 概率分配模式控制：经典的 KL 闭式解 (Softmax) vs 全新的线性概率质量重分配
-    # prob_allocation_mode: jdc.Static[Literal["kl_softmax", "linear_redistribution"]] = "linear_redistribution"
+    # 👑 全新 ANO 架构核心超参
+    m_centers: jdc.Static[int] = 3
+    i_neighbors: jdc.Static[int] = 3
+    perturb_std: float = 0.01
+
+    # 👑 双模式完美共存，默认保持经典作为 baseline
     prob_allocation_mode: jdc.Static[Literal["kl_softmax", "linear_redistribution"]] = "kl_softmax"
-    # 全新非对称线性重分配参数 (l: 惩罚剥夺率, r: 奖励增幅率)
     resampling_l: float = 0.3
     resampling_r: float = 0.4
-    # 👑 OOD 盲盒探索率 (基因突变注入)
-    # 建议设在 0.05 到 0.15 之间，Cheetahrun 推荐从 0.1 起步
     resampling_ood_p: float = 0.1
 
-    # ...
-
-    # 👑 动作边界处理：加入了无损折叠映射
     action_clip: jdc.Static[Literal["hard", "margin", "tanh", "fold", "scale_clip"]] = "margin"
     clip_margin: float = 1.1
     penalty_coef: float = 0
-
-    # 👑 采样算力分配模式
-    sampling_mode: jdc.Static[Literal["absolute_budget", "relative_h_pool"]] = "relative_h_pool"
-    h_fakes_in_pool: jdc.Static[int] = 3  # 当模式为 relative_h_pool 时，每次大循环固定的假动作个数
 
     base_tolerance: float = 1.0
     resampling_alpha_k: float = 0.3
     resampling_alpha_min: float = 0.0001
     f_x_forward: jdc.Static[bool] = True
-    num_generated_actions: jdc.Static[int] = 48  # 外层全局生成动作数 (K)
-    # 👑 物理显存上限 (决定了极品动作能爽到什么程度)
-    # 如果显卡顶得住，拉到 128 甚至 256！
-    num_epsilon_samples: jdc.Static[int] = 128
 
     beta_r: float = 0.9
     beta_v: float = 0.9
@@ -105,9 +93,9 @@ class DGPOFMParams:
 class DGPOFMActionInfo:
     target_qs: Array = dataclasses.field(default_factory=lambda: jnp.zeros(()))
     raw_action: Array = dataclasses.field(default_factory=lambda: jnp.zeros(()))
-    # 👑 新增：用于缓存大循环外层计算好的池子和概率，彻底解耦内层
     pool_actions: Array = dataclasses.field(default_factory=lambda: jnp.zeros(()))
     pool_probs: Array = dataclasses.field(default_factory=lambda: jnp.zeros(()))
+    pool_noises: Array = dataclasses.field(default_factory=lambda: jnp.zeros(()))
 
 
 @jdc.pytree_dataclass
@@ -168,11 +156,9 @@ class DGPOFMState:
         elif cfg.action_clip == "tanh":
             return cfg.clip_margin * jnp.tanh(x / cfg.clip_margin)
         elif cfg.action_clip == "fold":
-            # return jnp.abs(x - 4.0 * jnp.floor((x + 3.0) / (4.0)) + 1.0) - 1.0
-            T = 4.0*cfg.clip_margin
+            T = 4.0 * cfg.clip_margin
             t = cfg.clip_margin
-            # return jnp.abs(x+ 3*t - T * jnp.floor((x + 3*t) / T) - 2*t ) - t
-            return jnp.abs(x - T * jnp.floor((x + 3*t) / T) + t ) - t
+            return jnp.abs(x - T * jnp.floor((x + 3 * t) / T) + t) - t
         return x
 
     def _compute_fresh_weights(self, value_params, obs_norm, pool_actions_raw) -> tuple[Array, dict[str, Array]]:
@@ -195,9 +181,6 @@ class DGPOFMState:
         pool_mean = jnp.mean(q_pool_penalized, axis=-1, keepdims=True)
         adv = q_pool_penalized - pool_mean
 
-        # ==========================================
-        # 👑 模式 A：经典的 KL 闭式解 (Softmax 分布)
-        # ==========================================
         if self.config.prob_allocation_mode == "kl_softmax":
             if self.config.temp_func_type == "max":
                 abs_adv = jnp.abs(adv)
@@ -223,24 +206,12 @@ class DGPOFMState:
             logits = (q_pool_penalized - jnp.max(q_pool_penalized, axis=-1, keepdims=True)) / alpha
             pool_probs = jax.nn.softmax(logits, axis=-1)
 
-            metrics = {
-                "q_guided/q_real_mean": jnp.mean(q_pool[:, 0]),
-                "q_guided/q_real_penalized_mean": jnp.mean(q_pool_penalized[:, 0]),
-                "q_guided/penalty_mean": jnp.mean(penalty),
-                "q_guided/prob_real_mean": jnp.mean(pool_probs[:, 0]),
-                "q_guided/alpha_mean": jnp.mean(alpha),
-                "q_guided/f_x_mean": jnp.mean(f_x),
-            }
+            metrics = {"q_guided/prob_real_mean": jnp.mean(pool_probs[:, 0])}
             return jax.lax.stop_gradient(pool_probs), metrics
 
-        # ==========================================
-        # 👑 模式 B：全新的非对称线性概率质量重分配机制 (l, r 独立控制)
-        # ==========================================
         elif self.config.prob_allocation_mode == "linear_redistribution":
-            # 提取你设计的非对称双参
             l_val = self.config.resampling_l
             r_val = self.config.resampling_r
-
             p_base = jnp.ones((N, K_plus_1)) / K_plus_1
 
             is_pos = adv > 0.0
@@ -248,27 +219,22 @@ class DGPOFMState:
 
             p_pos = jnp.sum(p_base * is_pos, axis=-1, keepdims=True)
             sum_A_pos = jnp.sum(adv * is_pos, axis=-1, keepdims=True) + 1e-8
-            sum_A_neg = jnp.sum(adv * is_neg, axis=-1, keepdims=True) - 1e-8  # 注意：这里是负数
+            sum_A_neg = jnp.sum(adv * is_neg, axis=-1, keepdims=True) - 1e-8
 
-            # --- Case 1: (l+r)*p_+ <= l ---
             new_p_c1_pos = p_base * (1 + r_val) + (adv * is_pos / sum_A_pos) * (l_val - (l_val + r_val) * p_pos)
             new_p_c1_neg = p_base * (1 - l_val)
             p_case1 = jnp.where(is_pos, new_p_c1_pos, new_p_c1_neg)
 
-            # --- Case 2: (l+r)*p_+ > l ---
             new_p_c2_pos = p_base * (1 + r_val)
-            # 注意：sum_A_neg 和 adv*is_neg 都是负数，相除为正。减去后面的项意味着进一步削减差动作的概率
             new_p_c2_neg = p_base * (1 - l_val) - (adv * is_neg / sum_A_neg) * ((l_val + r_val) * p_pos - l_val)
             p_case2 = jnp.where(is_pos, new_p_c2_pos, new_p_c2_neg)
 
-            # --- Case 3: p_+ * (1+r) > 1.0 (概率池枯竭，按排位“劫富济贫”) ---
             target_p = p_base * (1 + r_val) * is_pos
             sort_idx = jnp.argsort(-adv, axis=-1)
             sorted_target_p = jnp.take_along_axis(target_p, sort_idx, axis=-1)
 
             cum_p = jnp.cumsum(sorted_target_p, axis=-1)
             full_alloc_mask = cum_p <= 1.0
-
             prev_full_alloc_mask = jnp.concatenate([jnp.ones((N, 1), dtype=bool), full_alloc_mask[:, :-1]], axis=-1)
             boundary_mask = prev_full_alloc_mask & ~full_alloc_mask
             prev_cum_p = jnp.concatenate([jnp.zeros((N, 1)), cum_p[:, :-1]], axis=-1)
@@ -279,31 +245,17 @@ class DGPOFMState:
             undo_sort_idx = jnp.argsort(sort_idx, axis=-1)
             p_case3 = jnp.take_along_axis(sorted_new_p, undo_sort_idx, axis=-1)
 
-            # ==========================================
-            # 👑 路由整合：判断每个样本属于哪个 Case
-            # ==========================================
             cond_case3 = (p_pos * (1 + r_val) > 1.0)
             cond_case1 = ~cond_case3 & ((l_val + r_val) * p_pos <= l_val)
 
             pool_probs = jnp.where(cond_case3, p_case3, jnp.where(cond_case1, p_case1, p_case2))
-
-            # 防弹装甲：防止浮点数精度误差累计或极个别劣质动作概率被减穿 0，做最后一次裁剪与归一化
             pool_probs = jnp.clip(pool_probs, 0.0, 1.0)
             pool_probs = pool_probs / jnp.sum(pool_probs, axis=-1, keepdims=True)
 
-            metrics = {
-                "q_guided/q_real_mean": jnp.mean(q_pool[:, 0]),
-                "q_guided/q_real_penalized_mean": jnp.mean(q_pool_penalized[:, 0]),
-                "q_guided/prob_real_mean": jnp.mean(pool_probs[:, 0]),
-                "q_guided/l_val": l_val,
-                "q_guided/r_val": r_val,
-                "q_guided/case3_ratio": jnp.mean(cond_case3.astype(jnp.float32)),
-                "q_guided/case1_ratio": jnp.mean(cond_case1.astype(jnp.float32)),
-            }
+            metrics = {"q_guided/prob_real_mean": jnp.mean(pool_probs[:, 0])}
             return jax.lax.stop_gradient(pool_probs), metrics
-
         else:
-            raise ValueError(f"Unknown prob_allocation_mode: {self.config.prob_allocation_mode}")
+            raise ValueError(f"Unknown mode: {self.config.prob_allocation_mode}")
 
     def _compute_value_loss(self, value_params, obs_norm, actions, truncation, target_qs):
         concat_inputs = jnp.concatenate([obs_norm, actions], axis=-1)
@@ -351,7 +303,6 @@ class DGPOFMState:
             x_raw = x_raw + noise * self.config.feather_std
 
         x_final = self._apply_clip(x_raw)
-        # 初始化时不用管 pool_actions，后续外层大循环会填满
         return x_final, DGPOFMActionInfo(raw_action=x_raw)
 
     def _update_critic_only(self, transitions: DGPOFMTransition, prng: Array) -> tuple[DGPOFMState, dict[str, Array]]:
@@ -382,70 +333,77 @@ class DGPOFMState:
                                 opt_state_value=new_v_opt_state)
         return new_state, extra_v_metrics
 
-    # ==========================================
-    # 👑 全新架构：外层一次性目标准备函数 (防OOM分块处理)
-    # ==========================================
     def _prepare_actor_targets_chunk(self, transitions_chunk: DGPOFMTransition, prng: Array) -> tuple[
         DGPOFMActionInfo, dict[str, Array]]:
         cfg = self.config
-        prng_gen, prng_sample = jax.random.split(prng, 2)
+        prng_fake, prng_perturb = jax.random.split(prng, 2)
 
         obs_dim = self.env.observation_size
         act_dim = self.env.action_size
         t_dim = cfg.timestep_embed_dim
         N = transitions_chunk.obs.shape[0]
-        K_fakes = cfg.num_generated_actions
+
+        m_centers = cfg.m_centers
+        i_neighbors = cfg.i_neighbors
+        M_total = (m_centers + 1) * i_neighbors
+        perturb_std = cfg.perturb_std
 
         obs_flat = ((transitions_chunk.obs - self.obs_stats.mean) / self.obs_stats.std
                     if cfg.normalize_observations else transitions_chunk.obs)
-
         real_action_flat = transitions_chunk.action_info.raw_action.reshape((N, 1, act_dim))
-        obs_b_gen = jnp.broadcast_to(obs_flat[:, None, :], (N, K_fakes, obs_dim))
 
-        fast_flow_steps = self.config.fast_flow_step
-        fast_full_t = jnp.linspace(1.0, 0.0, fast_flow_steps + 1)
-        fast_t_curr, fast_t_next = fast_full_t[:-1], fast_full_t[1:]
+        fast_flow_steps = cfg.fast_flow_step
+
+        z_fake_centers = jax.random.normal(prng_fake, (N, m_centers, act_dim))
+
+        fast_full_t_inv = jnp.linspace(0.0, 1.0, fast_flow_steps + 1)
+        t_curr_inv, t_next_inv = fast_full_t_inv[:-1], fast_full_t_inv[1:]
+
+        def inverse_gen_step(x, t_tup):
+            t_c, t_n = t_tup
+            t_embed = jnp.broadcast_to(self.embed_timestep(jnp.array([t_c])[..., None])[:, None, :], (N, 1, t_dim))
+            obs_b_real = jnp.broadcast_to(obs_flat[:, None, :], (N, 1, obs_dim))
+            vel = networks.flow_mlp_fwd(jax.lax.stop_gradient(self.params.policy), obs_b_real, x,
+                                        t_embed) * cfg.policy_mlp_output_scale
+            return x + (t_n - t_c) * vel, None
+
+        z_true, _ = jax.lax.scan(inverse_gen_step, real_action_flat, (t_curr_inv, t_next_inv))
+
+        z_centers = jnp.concatenate([z_true, z_fake_centers], axis=1)
+
+        fast_full_t_fwd = jnp.linspace(1.0, 0.0, fast_flow_steps + 1)
+        t_curr_fwd, t_next_fwd = fast_full_t_fwd[:-1], fast_full_t_fwd[1:]
+        obs_b_fake = jnp.broadcast_to(obs_flat[:, None, :], (N, m_centers, obs_dim))
 
         def gen_step(x, t_tup):
             t_c, t_n = t_tup
             t_embed = jnp.broadcast_to(self.embed_timestep(jnp.array([t_c])[..., None])[:, None, :],
-                                       (N, K_fakes, t_dim))
-            vel = networks.flow_mlp_fwd(jax.lax.stop_gradient(self.params.policy), obs_b_gen, x,
+                                       (N, m_centers, t_dim))
+            vel = networks.flow_mlp_fwd(jax.lax.stop_gradient(self.params.policy), obs_b_fake, x,
                                         t_embed) * cfg.policy_mlp_output_scale
             return x + (t_n - t_c) * vel, None
 
-        gen_acts, _ = jax.lax.scan(gen_step, jax.random.normal(prng_gen, (N, K_fakes, act_dim)),
-                                   (fast_t_curr, fast_t_next))
+        fake_actions, _ = jax.lax.scan(gen_step, z_fake_centers, (t_curr_fwd, t_next_fwd))
+        actions_centers = jnp.concatenate([real_action_flat, fake_actions], axis=1)
 
-        # 👑 这是包含 48 个假动作的终极全集
-        pool_actions_full = jnp.concatenate([real_action_flat, gen_acts], axis=1)
-        probs_full, fresh_metrics = self._compute_fresh_weights(self.params.value, obs_flat, pool_actions_full)
+        probs_centers, fresh_metrics = self._compute_fresh_weights(self.params.value, obs_flat, actions_centers)
 
-        if cfg.sampling_mode == "relative_h_pool":
-            h = cfg.h_fakes_in_pool
-            # 👑 做法A实现：在外层一次性抽好 h 个假动作，冻结小池！
-            fake_indices = jax.random.randint(prng_sample, (N, h), 1, K_fakes + 1)
-            zero_idx = jnp.zeros((N, 1), dtype=jnp.int32)
-            pool_indices = jnp.concatenate([zero_idx, fake_indices], axis=1)  # 形状: (N, h+1)
+        # 👑 直接在这里把噪声池平铺为 M_total，回归你想要的全局维度
+        z_centers_expanded = jnp.expand_dims(z_centers, axis=2)
+        noise_perturbations = jax.random.normal(prng_perturb, (N, m_centers + 1, i_neighbors, act_dim)) * perturb_std
+        mask = (jnp.arange(i_neighbors) > 0).reshape(1, 1, i_neighbors, 1)
+        z_pool_expanded = z_centers_expanded + noise_perturbations * mask
+        z_pool_flat = z_pool_expanded.reshape((N, M_total, act_dim))
 
-            # 提取概率并相对归一化
-            local_probs_raw = jnp.take_along_axis(probs_full, pool_indices, axis=1)
-            local_probs = local_probs_raw / (jnp.sum(local_probs_raw, axis=-1, keepdims=True) + 1e-8)
+        new_action_info = jdc.replace(
+            transitions_chunk.action_info,
+            pool_actions=actions_centers,
+            pool_probs=probs_centers,
+            pool_noises=z_pool_flat  # 干净利落，直接交接平铺版
+        )
 
-            # 把这个压缩后的 h+1 专属池子和概率存起来
-            final_actions = jnp.take_along_axis(pool_actions_full, pool_indices[..., None], axis=1)
-            final_probs = local_probs
-        else:
-            # absolute_budget 模式：原样保留 49 个全集，交由内层去做绝对匹配
-            final_actions = pool_actions_full
-            final_probs = probs_full
-
-        new_action_info = jdc.replace(transitions_chunk.action_info, pool_actions=final_actions, pool_probs=final_probs)
         return new_action_info, fresh_metrics
 
-    # ==========================================
-    # 👑 极速版内层循环：再也没有 ODE 生成！
-    # ==========================================
     def _update_actor_only(self, transitions: DGPOFMTransition, prng: Array, global_v_loss: Array) -> tuple[
         DGPOFMState, dict[str, Array]]:
         cfg, sch = self.config, self.get_schedule()
@@ -453,8 +411,6 @@ class DGPOFMState:
 
         obs_dim = self.env.observation_size
         act_dim = self.env.action_size
-
-        # 👑 绝对防弹的 Flatten：无论 minibatch 切成几维，用 size 强行算出绝对的 N！
         N = transitions.obs.size // obs_dim
         obs_flat = ((transitions.obs - self.obs_stats.mean) / self.obs_stats.std
                     if cfg.normalize_observations else transitions.obs).reshape((N, obs_dim))
@@ -462,62 +418,44 @@ class DGPOFMState:
         mb_mean_reward = jnp.mean(transitions.reward)
         final_v_loss = global_v_loss
 
-        # 👑 提取大循环锁定的池子，并配套 Flatten 展平维数！
+        m_centers = cfg.m_centers
+        M_total = (m_centers + 1) * cfg.i_neighbors
+
         raw_pool_acts = transitions.action_info.pool_actions
         raw_pool_probs = transitions.action_info.pool_probs
-        pool_actions = raw_pool_acts.reshape((N, raw_pool_acts.shape[-2], act_dim))
-        pool_probs = raw_pool_probs.reshape((N, raw_pool_probs.shape[-1]))
+        raw_pool_noises = transitions.action_info.pool_noises
+
+        pool_actions = raw_pool_acts.reshape((N, m_centers + 1, act_dim))
+        pool_probs = raw_pool_probs.reshape((N, m_centers + 1))
+        pool_noises = raw_pool_noises.reshape((N, M_total, act_dim))
 
         def policy_loss_fn(p_params):
-            M = cfg.num_epsilon_samples  # 物理显存上限，例如 48
-            K_fakes = cfg.num_generated_actions  # 例如 7
+            p_idx_alloc, p_match, p_t, p_trust, p_idx_uniform, p_ood_mask = jax.random.split(prng_pol, 6)
 
-            p_mask, p_eps, p_t, p_trust = jax.random.split(prng_pol, 4)
-
-            # ==========================================
-            # 👑 1. 强制锁死真动作，拒绝任何假动作
-            # ==========================================
-            real_acts = pool_actions[:, 0:1, :]
-            # 把真动作广播填满整个物理显存槽 M
-            a_target = jnp.broadcast_to(real_acts, (N, M, act_dim))
-            is_real_slot = jnp.ones((N, M), dtype=bool)
+            local_logits = jnp.where(pool_probs > 0, jnp.log(pool_probs + 1e-12), -1e9)
+            assigned_idx = jax.random.categorical(p_idx_alloc, local_logits, axis=-1, shape=(N, M_total))
+            a_target = jnp.take_along_axis(pool_actions, assigned_idx[..., None], axis=1)
 
             # ==========================================
-            # 👑 2. 虚拟大池计算与显存截断 (Truncation)
+            # 👑 全局随机打乱匹配 (Global Random Coupling)
+            # 交给概率和网络去自然调理
             # ==========================================
-            p_real = pool_probs[:, 0]
+            match_keys = jax.random.uniform(p_match, (N, M_total))
+            shuffle_idx = jnp.argsort(match_keys, axis=-1)
+            shuffled_noises = jnp.take_along_axis(pool_noises, shuffle_idx[..., None], axis=1)
 
-            # 物理槽位上限 (M，比如你现在改成了 128)
-            M_float = float(M)
+            is_real_slot = (assigned_idx == 0)
 
-            # 👑 解耦：虚拟算力预算！
-            # 之前我们是用 M * (K+1)，但这受限于物理上限。
-            # 现在我们直接给它一个庞大的虚拟总池！
-            # 假设你希望一个“完美动作(p_real=1.0)”能拿满 128 个槽，
-            # 甚至你希望“普通好动作(p_real=0.2)”就能拿满 128 个槽（即预算 = 128 / 0.2 = 640）
-            # 我们设一个显式的理论大池预算：
-            VIRTUAL_BUDGET = 640.0
+            ood_p = cfg.resampling_ood_p
+            uniform_actions = jax.random.uniform(p_idx_uniform, (N, M_total, act_dim), minval=-1.0, maxval=1.0)
+            ood_mask = jax.random.uniform(p_ood_mask, (N, M_total)) < ood_p
 
-            # 算出真动作在这个 640 的大池子里该拿多少个
-            n_exp_real = p_real * VIRTUAL_BUDGET
+            a_target = jnp.where(ood_mask[..., None], uniform_actions, a_target)
+            is_real_slot = is_real_slot & (~ood_mask)
 
-            # 物理截断：除以真实的物理槽位 M
-            # 假设 M=128：
-            # 若 n_exp_real = 200 -> 200/128 > 1.0 -> 截断到 1.0 (128个全亮)
-            # 若 n_exp_real = 32  -> 32/128 = 0.25 -> (25%的槽亮，期望提供32个算力)
-            keep_prob = jnp.clip(n_exp_real / M_float, 0.0, 1.0)
-
-            # ==========================================
-            # 👑 3. 纯正的硬随机采样 (Hard Bernoulli)
-            # ==========================================
-            rand_vals = jax.random.uniform(p_mask, (N, M))
-            alloc_valid_mask = (rand_vals < keep_prob[:, None]).astype(jnp.float32)
-
-            # --- 速度场目标像坍缩 ---
             if cfg.action_clip in ["hard", "margin", "fold"]:
                 a_target = self._apply_clip(a_target)
 
-            # --- Z-Score EMA 信任防线 ---
             t_outer = (self.steps // (cfg.num_updates_per_batch * cfg.num_minibatches)) + 1.0
             bc_v = 1.0 - jnp.power(cfg.beta_v, t_outer)
             bc_r = 1.0 - jnp.power(cfg.beta_r, t_outer)
@@ -535,19 +473,15 @@ class DGPOFMState:
             v_trust = jnp.clip(jnp.exp(-jnp.maximum(v_z - cfg.tolerance_v, 0.0) / 0.5), 0.01, 1.0)
 
             combined_trust_prob = jnp.where(is_real_slot, r_trust, v_trust)
-            trust_mask = (jax.random.uniform(p_trust, (N, M)) < combined_trust_prob).astype(jnp.float32)
+            trust_mask = (jax.random.uniform(p_trust, (N, M_total)) < combined_trust_prob).astype(jnp.float32)
 
-            # 最终有效槽位 = 虚拟池摇中的槽位 AND 通过信任域的槽位
-            final_valid_mask = alloc_valid_mask * trust_mask
-
-            # --- 极速 Flow 拟合 ---
-            eps = jax.random.normal(p_eps, (N, M, act_dim))
-            t = sch.t_current[jax.random.randint(p_t, (N, M, 1), 0, cfg.flow_steps)]
-
+            eps = shuffled_noises
+            t = sch.t_current[jax.random.randint(p_t, (N, M_total, 1), 0, cfg.flow_steps)]
             x_t = t * eps + (1.0 - t) * a_target
 
             t_embed = self.embed_timestep(t)
-            obs_p = jnp.broadcast_to(obs_flat[:, None, :], (N, M, obs_dim))
+            obs_p = jnp.broadcast_to(obs_flat[:, None, :], (N, M_total, obs_dim))
+
             vel = networks.flow_mlp_fwd(p_params, obs_p, x_t, t_embed) * cfg.policy_mlp_output_scale
 
             if cfg.output_mode == "u_but_supervise_as_eps":
@@ -555,17 +489,12 @@ class DGPOFMState:
             else:
                 err = jnp.sum((vel - (eps - a_target)) ** 2, axis=-1)
 
-            # jnp.mean 自动除以 M，因为无效的槽位被 mask 成了 0，
-            # 总体梯度的 Magnitude 完美等比例缩放，没有产生软权重的衰减副作用！
-            loss = jnp.mean(err * final_valid_mask)
+            loss = jnp.mean(err * trust_mask)
 
             return loss, {
                 "policy_loss": loss,
                 "q_guided/real_trust_prob": r_trust,
-                "q_guided/keep_prob": jnp.mean(keep_prob),
-                "q_guided/theoretical_exp_noises": jnp.mean(n_exp_real),
-                "q_guided/actual_hard_sampled_noises": jnp.mean(jnp.sum(alloc_valid_mask, axis=-1)),
-                "q_guided/reward_z_score": r_z,
+                "q_guided/fake_trust_prob": v_trust,
             }
 
         (p_loss, p_metrics), p_grads = jax.value_and_grad(policy_loss_fn, has_aux=True)(self.params.policy)
@@ -588,8 +517,8 @@ class DGPOFMState:
             with jdc.copy_and_mutate(state) as state:
                 state.obs_stats = state.obs_stats.update(transitions.obs)
 
-        obs_norm = (
-                               transitions.obs - state.obs_stats.mean) / state.obs_stats.std if config.normalize_observations else transitions.obs
+        obs_norm = ((transitions.obs - state.obs_stats.mean) / state.obs_stats.std
+                    if config.normalize_observations else transitions.obs)
 
         concat_inputs = jnp.concatenate([obs_norm, transitions.action], axis=-1)
         q_pred, _ = networks.value_mlp_fwd_with_features(state.params.value, concat_inputs)
@@ -611,7 +540,6 @@ class DGPOFMState:
         boot_noise = jax.random.normal(prng_boot, (1, bootstrap_obs.shape[1], state.env.action_size))
         bootstrap_act, _ = jax.lax.scan(boot_step_fn, boot_noise,
                                         (state.get_schedule().t_current, state.get_schedule().t_next))
-
         clipped_boot_act = self._apply_clip(bootstrap_act)
 
         bootstrap_q, _ = networks.value_mlp_fwd_with_features(
@@ -630,28 +558,25 @@ class DGPOFMState:
             )
         )
 
-        # ==========================================
-        # 👑 核心修复：注入多维安全占位符，防止 JAX Scan 维度坍缩
-        # ==========================================
         N_u, N_e = target_qs.shape[0], target_qs.shape[1]
         act_dim = state.env.action_size
 
-        if config.sampling_mode == "relative_h_pool":
-            dummy_pool_acts = jnp.zeros((N_u, N_e, config.h_fakes_in_pool + 1, act_dim))
-            dummy_pool_probs = jnp.zeros((N_u, N_e, config.h_fakes_in_pool + 1))
-        else:
-            dummy_pool_acts = jnp.zeros((N_u, N_e, config.num_generated_actions + 1, act_dim))
-            dummy_pool_probs = jnp.zeros((N_u, N_e, config.num_generated_actions + 1))
+        m_centers = config.m_centers
+        M_total = (m_centers + 1) * config.i_neighbors
+
+        # 👑 干净的 4D 占位符，没有一点多余的计算
+        dummy_pool_acts = jnp.zeros((N_u, N_e, m_centers + 1, act_dim))
+        dummy_pool_probs = jnp.zeros((N_u, N_e, m_centers + 1))
+        dummy_pool_noises = jnp.zeros((N_u, N_e, M_total, act_dim))
 
         new_action_info = jdc.replace(
             transitions.action_info,
             target_qs=target_qs,
-            pool_actions=dummy_pool_acts,  # 占好四维的坑
-            pool_probs=dummy_pool_probs  # 占好三维的坑
+            pool_actions=dummy_pool_acts,
+            pool_probs=dummy_pool_probs,
+            pool_noises=dummy_pool_noises
         )
         new_transitions = jdc.replace(transitions, action_info=new_action_info)
-
-        # 后面的 def critic_epoch_step ... 保持完全不变
 
         def critic_epoch_step(carry_state, _):
             minibatches = new_transitions.prepare_minibatches(
@@ -677,9 +602,6 @@ class DGPOFMState:
                 current_global_v_loss)
         )
 
-        # ==========================================
-        # 👑 架构重塑核心：在外层大循环中，一次性安全分块计算 48 个假动作并抽出 h 池！
-        # ==========================================
         N_total = new_transitions.obs.shape[0] * new_transitions.obs.shape[1]
         flat_transitions = jax.tree_util.tree_map(lambda x: x.reshape((N_total, *x.shape[2:])), new_transitions)
         chunk_size = N_total // config.num_minibatches
@@ -697,21 +619,15 @@ class DGPOFMState:
         _, (prepped_action_info_chunked, prep_metrics_chunked) = jax.lax.scan(scan_prep_fn, None,
                                                                               (chunked_transitions, prngs))
 
-        # 👑 终极防弹修复：直接拿着外层已经建好模的 new_action_info 作为形状对照表！
-        # 无论 JAX 在 scan 里把数据拍扁成什么鬼样子（比如把 1920x16 拍成了 30720），
-        # 只要总元素个数是对的，我们就强行把它塞回原本完美的形状中。
         prepped_action_info = jax.tree_util.tree_map(
             lambda orig_target, chunked_data: chunked_data.reshape(orig_target.shape),
-            new_action_info,  # <--- 真理模具
-            prepped_action_info_chunked  # <--- 被 JAX 拍扁的数据
+            new_action_info,
+            prepped_action_info_chunked
         )
         prep_metrics = jax.tree_util.tree_map(lambda x: jnp.mean(x), prep_metrics_chunked)
 
         prepped_transitions = jdc.replace(new_transitions, action_info=prepped_action_info)
 
-        # ==========================================
-        # 👑 极速 Actor 小循环：只有纯粹的流拟合
-        # ==========================================
         def actor_epoch_step(carry_state, _):
             minibatches = prepped_transitions.prepare_minibatches(
                 jax.random.fold_in(carry_state.prng, carry_state.steps), config.num_minibatches, config.batch_size
