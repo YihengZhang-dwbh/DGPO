@@ -433,7 +433,8 @@ class DGPOFMState:
             p_idx_alloc, p_match, p_t, p_trust, p_idx_uniform, p_ood_mask = jax.random.split(prng_pol, 6)
 
             local_logits = jnp.where(pool_probs > 0, jnp.log(pool_probs + 1e-12), -1e9)
-            assigned_idx = jax.random.categorical(p_idx_alloc, local_logits, axis=-1, shape=(N, M_total))
+            # 👑 核心修复：用 [:, None, :] 把形状变成 (N, 1, K)，完美迎合 JAX 的广播规则
+            assigned_idx = jax.random.categorical(p_idx_alloc, local_logits[:, None, :], axis=-1, shape=(N, M_total))
             a_target = jnp.take_along_axis(pool_actions, assigned_idx[..., None], axis=1)
 
             # ==========================================
