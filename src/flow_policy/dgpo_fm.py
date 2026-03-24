@@ -23,15 +23,15 @@ class DGPOFMConfig:
     fast_flow_step: jdc.Static[int] = 5
 
     # 👑 全新 ANO 架构核心超参
-    m_centers: jdc.Static[int] = 3
-    i_neighbors: jdc.Static[int] = 3
+    m_centers: jdc.Static[int] = 8
+    i_neighbors: jdc.Static[int] = 5
     perturb_std: float = 0.01
 
     # 👑 双模式完美共存，默认保持经典作为 baseline
     prob_allocation_mode: jdc.Static[Literal["kl_softmax", "linear_redistribution"]] = "kl_softmax"
     resampling_l: float = 0.3
     resampling_r: float = 0.4
-    resampling_ood_p: float = 0.1
+    resampling_ood_p: float = 0.0
 
     action_clip: jdc.Static[Literal["hard", "margin", "tanh", "fold", "scale_clip"]] = "margin"
     clip_margin: float = 1.1
