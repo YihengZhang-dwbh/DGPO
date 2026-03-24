@@ -26,9 +26,8 @@ class DGPOFMConfig:
     m_centers: jdc.Static[int] = 8
     i_neighbors: jdc.Static[int] = 5
     perturb_std: float = 0.01
-    num_epsilon_samples: jdc.Static[int] = 8  # 👑 解除注释！恢复内层极速 Batch Size
 
-    # 👑 双模式完美共存，默认保持经典作为 baseline
+    # 👑 双模式完美共存
     prob_allocation_mode: jdc.Static[Literal["kl_softmax", "linear_redistribution"]] = "kl_softmax"
     resampling_l: float = 0.3
     resampling_r: float = 0.4
@@ -42,6 +41,9 @@ class DGPOFMConfig:
     resampling_alpha_k: float = 0.3
     resampling_alpha_min: float = 0.0001
     f_x_forward: jdc.Static[bool] = True
+
+    # 👑 极速内层算力控制
+    num_epsilon_samples: jdc.Static[int] = 8
 
     beta_r: float = 0.9
     beta_v: float = 0.9
@@ -389,7 +391,7 @@ class DGPOFMState:
 
         probs_centers, fresh_metrics = self._compute_fresh_weights(self.params.value, obs_flat, actions_centers)
 
-        # 👑 直接在这里把噪声池平铺为 M_total，回归你想要的全局维度
+        # 👑 直接在这里把噪声池平铺为 M_total，回归全局维度
         z_centers_expanded = jnp.expand_dims(z_centers, axis=2)
         noise_perturbations = jax.random.normal(prng_perturb, (N, m_centers + 1, i_neighbors, act_dim)) * perturb_std
         mask = (jnp.arange(i_neighbors) > 0).reshape(1, 1, i_neighbors, 1)
@@ -400,7 +402,7 @@ class DGPOFMState:
             transitions_chunk.action_info,
             pool_actions=actions_centers,
             pool_probs=probs_centers,
-            pool_noises=z_pool_flat  # 干净利落，直接交接平铺版
+            pool_noises=z_pool_flat
         )
 
         return new_action_info, fresh_metrics
@@ -420,9 +422,8 @@ class DGPOFMState:
         final_v_loss = global_v_loss
 
         m_centers = cfg.m_centers
-        i_neighbors = cfg.i_neighbors
-        # 👑 核心提速点：只取 M 个样本算梯度，彻底告别沉重的 M_total！
-        M = cfg.num_epsilon_samples
+        M_total = (m_centers + 1) * cfg.i_neighbors
+        M = cfg.num_epsilon_samples  # 👑 极速算力：只做 M 次梯度传播
 
         raw_pool_acts = transitions.action_info.pool_actions
         raw_pool_probs = transitions.action_info.pool_probs
@@ -430,21 +431,24 @@ class DGPOFMState:
 
         pool_actions = raw_pool_acts.reshape((N, m_centers + 1, act_dim))
         pool_probs = raw_pool_probs.reshape((N, m_centers + 1))
-        pool_noises = raw_pool_noises.reshape((N, m_centers + 1, i_neighbors, act_dim))
+        # 👑 接收外层展平好的整个 M_total 噪声题库
+        pool_noises_flat = raw_pool_noises.reshape((N, M_total, act_dim))
 
         def policy_loss_fn(p_params):
             p_idx_alloc, p_match, p_t, p_trust, p_idx_uniform, p_ood_mask = jax.random.split(prng_pol, 6)
 
             local_logits = jnp.where(pool_probs > 0, jnp.log(pool_probs + 1e-12), -1e9)
 
-            # 👑 仅仅从概率分布中采样出 M 个目标动作索引
+            # 👑 1. 从 m+1 个动作中，基于优势概率抽取 M 个 Target 动作
             assigned_idx = jax.random.categorical(p_idx_alloc, local_logits[:, None, :], axis=-1, shape=(N, M))
             a_target = jnp.take_along_axis(pool_actions, assigned_idx[..., None], axis=1)
 
-            # 👑 仅仅为这 M 个动作，在其对应的邻域里挑 1 个微扰噪声！(完美斩断多余计算)
-            batch_idx = jnp.arange(N)[:, None]
-            neighbor_idx = jax.random.randint(p_match, (N, M), 0, i_neighbors)
-            shuffled_noises = pool_noises[batch_idx, assigned_idx, neighbor_idx]
+            # ==========================================
+            # 👑 2. 核心修复：从 M_total 整个汪洋大海里，完全随机盲抽 M 个噪声！
+            # 彻底实现全局概率抢夺，强迫差区域向好动作靠拢！
+            # ==========================================
+            noise_idx = jax.random.randint(p_match, (N, M), 0, M_total)
+            shuffled_noises = jnp.take_along_axis(pool_noises_flat, noise_idx[..., None], axis=1)
 
             is_real_slot = (assigned_idx == 0)
 
@@ -512,7 +516,6 @@ class DGPOFMState:
 
         return new_state, p_metrics
 
-    
     @jdc.jit
     def training_step(self, transitions: DGPOFMTransition) -> tuple[DGPOFMState, dict[str, Array]]:
         config, state = self.config, self
@@ -567,7 +570,7 @@ class DGPOFMState:
         m_centers = config.m_centers
         M_total = (m_centers + 1) * config.i_neighbors
 
-        # 👑 干净的 4D 占位符，没有一点多余的计算
+        # 👑 干净占位符
         dummy_pool_acts = jnp.zeros((N_u, N_e, m_centers + 1, act_dim))
         dummy_pool_probs = jnp.zeros((N_u, N_e, m_centers + 1))
         dummy_pool_noises = jnp.zeros((N_u, N_e, M_total, act_dim))
