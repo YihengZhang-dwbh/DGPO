@@ -21,7 +21,7 @@ class IgmmConfig:
     # 👑 流匹配核心参数 (The Flow)
     # ==========================================
     flow_steps: jdc.Static[int] = 10
-    training_flow_steps: jdc.Static[int] = 2  # 🚀 内层反传的截断积分步数
+    training_flow_steps: jdc.Static[int] = 2
     output_mode: jdc.Static[Literal["u", "u_but_supervise_as_eps"]] = "u_but_supervise_as_eps"
     timestep_embed_dim: jdc.Static[int] = 8
     discretize_t_for_training: jdc.Static[bool] = True
@@ -33,7 +33,8 @@ class IgmmConfig:
     num_epsilon_samples: jdc.Static[int] = 16
     clipping_epsilon: float = 0.2
 
-    min_log_std: float = -5.0
+    # 🛡️ 防爆装甲 1：抬高方差地板，封死 1/sigma^3 的爆炸源
+    min_log_std: float = -3.0  # (sigma ≈ 0.05)
     max_log_std: float = -1.6094  # 限制 sigma < 0.2
 
     action_clip: jdc.Static[Literal["hard", "margin", "tanh", "fold", "scale_clip"]] = "margin"
@@ -77,11 +78,10 @@ class IgmmParams:
 class IgmmActionInfo:
     raw_action: Array = dataclasses.field(default_factory=lambda: jnp.zeros(()))
 
-    # 🚀 目标缓存容器
     eps_batch: Array = dataclasses.field(default_factory=lambda: jnp.zeros(()))
     log_p_old: Array = dataclasses.field(default_factory=lambda: jnp.zeros(()))
     gae_vs: Array = dataclasses.field(default_factory=lambda: jnp.zeros(()))
-    gae_advantages: Array = dataclasses.field(default_factory=lambda: jnp.zeros(()))  # 👑 新增：优势也必须缓存！
+    gae_advantages: Array = dataclasses.field(default_factory=lambda: jnp.zeros(()))
 
 
 @jdc.pytree_dataclass
@@ -121,12 +121,17 @@ class IgmmState:
         critic_net = networks.mlp_init(prng1, (obs_size, 256, 256, 256, 256, 256, 1))
 
         network_params = IgmmParams(actor_net, critic_net)
-        opt = optax.scale_by_adam()
+
+        # 🛡️ 防爆装甲 2：强制全局梯度裁剪 (绝对核心)，将过长梯度强制压缩
+        opt = optax.chain(
+            optax.clip_by_global_norm(1.0),
+            optax.scale_by_adam()
+        )
 
         return IgmmState(
             env=env, config=config, params=network_params,
             obs_stats=math_utils.RunningStats.init((obs_size,)),
-            opt=opt, opt_state=opt.init(network_params),  # type: ignore
+            opt=opt, opt_state=opt.init(network_params),
             prng=prng2, steps=jnp.zeros((), dtype=jnp.int32),
         )
 
@@ -154,7 +159,9 @@ class IgmmState:
         return jnp.concatenate([jnp.cos(scaled_t), jnp.sin(scaled_t)], axis=-1)
 
     def sample_action(self, obs: Array, prng: Array, deterministic: bool) -> tuple[Array, IgmmActionInfo]:
-        obs_norm = (obs - self.obs_stats.mean) / self.obs_stats.std if self.config.normalize_observations else obs
+        # 加个 epsilon 防御除以 0
+        obs_norm = (obs - self.obs_stats.mean) / (
+                    self.obs_stats.std + 1e-8) if self.config.normalize_observations else obs
         (*batch_dims, obs_dim) = obs.shape
         theta_dim = self.env.action_size * 2
 
@@ -199,13 +206,12 @@ class IgmmState:
             with jdc.copy_and_mutate(state) as state:
                 state.obs_stats = state.obs_stats.update(transitions.obs)
 
-        obs_norm = (
-                               transitions.obs - state.obs_stats.mean) / state.obs_stats.std if config.normalize_observations else transitions.obs
+        obs_norm = (transitions.obs - state.obs_stats.mean) / (
+                    state.obs_stats.std + 1e-8) if config.normalize_observations else transitions.obs
         value_pred = networks.value_mlp_fwd(state.params.value, obs_norm)
-        bootstrap_obs_norm = (transitions.next_obs[-1:, :, :] - state.obs_stats.mean) / state.obs_stats.std
+        bootstrap_obs_norm = (transitions.next_obs[-1:, :, :] - state.obs_stats.mean) / (state.obs_stats.std + 1e-8)
         bootstrap_value = networks.value_mlp_fwd(state.params.value, bootstrap_obs_norm)
 
-        # 🚀 在外层 (时间序列完整时) 算好 GAE 优势！
         gae_vs, gae_advantages = jax.lax.stop_gradient(
             rollouts.compute_gae(
                 truncation=transitions.truncation, discount=transitions.discount * config.discounting,
@@ -218,7 +224,9 @@ class IgmmState:
         if config.normalize_advantage:
             gae_advantages = (gae_advantages - gae_advantages.mean()) / (gae_advantages.std() + 1e-8)
 
-        # 提取旧策略概率
+        # ==========================================
+        # 提取旧策略概率 p(a|s; theta_old)
+        # ==========================================
         prng_eps = jax.random.fold_in(state.prng, state.steps)
         M = config.num_epsilon_samples
         theta_dim = state.env.action_size * 2
@@ -246,13 +254,13 @@ class IgmmState:
         log_p_old = -0.5 * jnp.log(2 * jnp.pi) - log_std_old - ((a_b - mu_old) ** 2) / (2 * sigma_old ** 2 + 1e-8)
         log_p_old = jnp.sum(log_p_old, axis=-1)
 
-        # 👑 把所有需要缓存的东西 (包括优势!) 装入 action_info
+        # 将所有的全局优势安全装进动作信息
         new_action_info = jdc.replace(
             transitions.action_info,
             eps_batch=eps_batch,
             log_p_old=log_p_old,
             gae_vs=gae_vs,
-            gae_advantages=gae_advantages  # 必须装进去
+            gae_advantages=gae_advantages
         )
         cached_transitions = jdc.replace(transitions, action_info=new_action_info)
 
@@ -284,15 +292,14 @@ class IgmmState:
         return state, metrics
 
     def _compute_policy_loss(self, transitions: IgmmTransition, prng: Array) -> tuple[Array, dict[str, Array]]:
-        obs_norm = (
-                               transitions.obs - self.obs_stats.mean) / self.obs_stats.std if self.config.normalize_observations else transitions.obs
+        obs_norm = (transitions.obs - self.obs_stats.mean) / (
+                    self.obs_stats.std + 1e-8) if self.config.normalize_observations else transitions.obs
         value_pred = networks.value_mlp_fwd(self.params.value, obs_norm)
 
-        # 👑 直接读取缓存：毫无计算开销！
         eps_batch = transitions.action_info.eps_batch
         log_p_old = transitions.action_info.log_p_old
         gae_vs = transitions.action_info.gae_vs
-        A = transitions.action_info.gae_advantages  # ✅ 完美读取，不会有 NaN！
+        A = transitions.action_info.gae_advantages
 
         # 允许自动微分穿透！
         def forward_ode_step_new(carry, t_tup):
@@ -315,8 +322,9 @@ class IgmmState:
         log_p_pred = -0.5 * jnp.log(2 * jnp.pi) - log_std_pred - ((a_b - mu_pred) ** 2) / (2 * sigma_pred ** 2 + 1e-8)
         log_p_pred = jnp.sum(log_p_pred, axis=-1)
 
-        # 🎯 PPO Clip Loss
-        ratio = jnp.exp(log_p_pred - log_p_old)
+        # 🛡️ 防爆装甲 3：Ratio 截断。限制指数项的绝对大小，彻底杜绝 exp(100) -> inf
+        log_ratio = jnp.clip(log_p_pred - log_p_old, -15.0, 15.0)
+        ratio = jnp.exp(log_ratio)
 
         surr1 = ratio * A[..., None]
         surr2 = jnp.clip(ratio, 1.0 - self.config.clipping_epsilon, 1.0 + self.config.clipping_epsilon) * A[..., None]
