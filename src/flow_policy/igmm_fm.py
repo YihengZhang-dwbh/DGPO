@@ -27,15 +27,17 @@ class IgmmConfig:
     policy_mlp_output_scale: float = 0.25
 
     # ==========================================
-    # 👑 IGMM 独家范式超参 (Infinite GMM & Target Reprojection)
+    # 👑 IGMM 独家范式超参 (Wasserstein Geodesic Reprojection)
     # ==========================================
-    # 每次更新时，用来探路、构建稠密流场的噪声条数 M
+    # 是否使用多噪声构建稠密流场。如果为 False，则回归最严格的 1v1 On-Policy 映射
+    use_dense_flow: jdc.Static[bool] = True
     num_epsilon_samples: jdc.Static[int] = 48
-    # 相当于 PPO 的概率缩放步长 (eta)，决定了优势转化为位移的剧烈程度
+
+    # 相当于 PPO 的概率缩放步长 (eta)
     target_k_scaling: float = 0.1
     clipping_epsilon: float = 0.2
 
-    # 方差边界，防止网络学成完全的确定性或者崩盘
+    # 方差边界，防止数值溢出或完全确定性
     min_log_std: float = -5.0
     max_log_std: float = 2.0
 
@@ -78,9 +80,11 @@ class IgmmParams:
 
 @jdc.pytree_dataclass
 class IgmmActionInfo:
-    # 记录真实环境交互执行的动作
+    # 环境交互数据
     raw_action: Array = dataclasses.field(default_factory=lambda: jnp.zeros(()))
-    # 🚀 用于全局缓存静态目标的容器（形状会在 training_step 里被替换升级）
+    eps_1: Array = dataclasses.field(default_factory=lambda: jnp.zeros(()))
+
+    # 全局目标缓存容器 (用于内层加速)
     eps_batch: Array = dataclasses.field(default_factory=lambda: jnp.zeros(()))
     theta_2: Array = dataclasses.field(default_factory=lambda: jnp.zeros(()))
     gae_vs: Array = dataclasses.field(default_factory=lambda: jnp.zeros(()))
@@ -115,7 +119,6 @@ class IgmmState:
         action_size = env.action_size
         assert isinstance(obs_size, int)
 
-        # 👑 策略网络输出升维：预测 mu 和 log_sigma
         theta_dim = action_size * 2
 
         prng0, prng1, prng2 = jax.random.split(prng, num=3)
@@ -181,10 +184,9 @@ class IgmmState:
 
         prng_sample, prng_action = jax.random.split(prng, 2)
 
-        # 1. 采样单一基准噪声 (Rollout阶段不计算48个，只求当前需要执行的那1个动作)
+        # 环境交互：仅采样唯一的本源噪声 eps_1
         eps_1 = jax.random.normal(prng_sample, (*batch_dims, theta_dim))
 
-        # 2. ODE 求解输出参数
         theta_1, _ = jax.lax.scan(
             euler_step, init=eps_1,
             xs=(self.get_schedule(), jnp.zeros((self.config.flow_steps, 1))),
@@ -194,12 +196,11 @@ class IgmmState:
         log_std_1 = jnp.clip(log_std_1, self.config.min_log_std, self.config.max_log_std)
         sigma_1 = jnp.exp(log_std_1)
 
-        # 3. 基于策略内蕴方差的真实探索
         raw_action = mu_1 if deterministic else mu_1 + sigma_1 * jax.random.normal(prng_action, mu_1.shape)
         action_clipped = self._apply_clip(raw_action)
 
-        # 这里仅返回执行信息，其余维度初始化为占位符
-        return action_clipped, IgmmActionInfo(raw_action=raw_action)
+        # 返回执行的动作，并妥善缓存本源 eps_1
+        return action_clipped, IgmmActionInfo(raw_action=raw_action, eps_1=eps_1)
 
     @jdc.jit
     def training_step(self, transitions: IgmmTransition) -> tuple[IgmmState, dict[str, Array]]:
@@ -217,16 +218,13 @@ class IgmmState:
         bootstrap_value = networks.value_mlp_fwd(state.params.value, bootstrap_obs_norm)
 
         # ==========================================
-        # 🚀 提速核心一：全局仅算 1 次 GAE 优势
+        # 🚀 计算 GAE 优势
         # ==========================================
         gae_vs, gae_advantages = jax.lax.stop_gradient(
             rollouts.compute_gae(
-                truncation=transitions.truncation,
-                discount=transitions.discount * config.discounting,
-                rewards=transitions.reward * config.reward_scaling,
-                values=value_pred,
-                bootstrap_value=bootstrap_value,
-                gae_lambda=config.gae_lambda,
+                truncation=transitions.truncation, discount=transitions.discount * config.discounting,
+                rewards=transitions.reward * config.reward_scaling, values=value_pred,
+                bootstrap_value=bootstrap_value, gae_lambda=config.gae_lambda,
             )
         )
 
@@ -235,16 +233,22 @@ class IgmmState:
             gae_advantages = (gae_advantages - gae_advantages.mean()) / (gae_advantages.std() + 1e-8)
 
         # ==========================================
-        # 🚀 提速核心二：全局仅积分 1 次 48条流形
+        # 👑 模式切换：构建流场的起点
         # ==========================================
-        prng_eps, prng_mask = jax.random.split(jax.random.fold_in(state.prng, state.steps), 2)
-        M = config.num_epsilon_samples  # 就是这里的 48
+        prng_eps = jax.random.fold_in(state.prng, state.steps)
         act_dim = state.env.action_size
         theta_dim = act_dim * 2
 
-        # 🟢 生成 48 个原始噪声：形状为 [T, B, 48, theta_dim]
-        eps_batch = jax.random.normal(prng_eps, (*transitions.reward.shape, M, theta_dim))
+        if config.use_dense_flow:
+            # 模式 B: 撒 M 个全新随机噪声，构建稠密流场
+            M = config.num_epsilon_samples
+            eps_batch = jax.random.normal(prng_eps, (*transitions.reward.shape, M, theta_dim))
+        else:
+            # 模式 A: 纯正 On-Policy，提取创造真实动作的唯一噪声
+            M = 1
+            eps_batch = transitions.action_info.eps_1[..., None, :]
 
+        # 统一进行一次全局静态 ODE 积分，找到靶点起点 theta_1
         def forward_ode_step(carry, t_tup):
             x = carry
             t_curr, t_next = t_tup
@@ -256,56 +260,35 @@ class IgmmState:
             return x + (t_next - t_curr) * v, None
 
         sch = state.get_schedule()
-        # 🟢 ODE求得 48 个当前分布参数 theta_1：形状为 [T, B, 48, theta_dim]
         theta_1, _ = jax.lax.scan(forward_ode_step, eps_batch, (sch.t_current, sch.t_next))
         theta_1 = jax.lax.stop_gradient(theta_1)
 
         mu_1, log_std_1 = jnp.split(theta_1, 2, axis=-1)
-        sigma_1 = jnp.exp(log_std_1)
 
         # ==========================================
-        # 🚀 提速核心三：提前推导出 48 个万剑归宗专属目标 theta_2
+        # 👑 绝对闭式解：最优传输连线投影 (Wasserstein Geodesic)
         # ==========================================
-        eta = config.target_k_scaling
-        clip_eps = config.clipping_epsilon
-
-        ratio_target = 1.0 + eta * gae_advantages[..., None, None]
-        ratio_target_clipped = jnp.where(
-            gae_advantages[..., None, None] > 0,
-            jnp.minimum(ratio_target, 1.0 + clip_eps),
-            jnp.maximum(ratio_target, 1.0 - clip_eps)
-        )
-        ratio_target_clipped = jnp.maximum(ratio_target_clipped, 1e-4)
+        # 1. 计算对数概率增量 Delta L
+        ratio_target = 1.0 + config.target_k_scaling * gae_advantages[..., None, None]
+        ratio_target_clipped = jnp.clip(ratio_target, 1.0 - config.clipping_epsilon, 1.0 + config.clipping_epsilon)
+        ratio_target_clipped = jnp.maximum(ratio_target_clipped, 1e-4)  # 防止 log(0) 爆炸
         delta_L = jnp.log(ratio_target_clipped)
 
-        # 唯一的那个真动作 a_true
+        # 2. 完美的几何消元反解：连线步长 rho_inv = 1 / rho = exp(-Delta L)
+        rho_inv = jnp.exp(-delta_L)
+
+        # 唯一的真动作 a_true 扩展形状以匹配 M 维
         a_b = transitions.action[..., None, :]
-        L_max_mu = -0.5 * jnp.log(2 * jnp.pi) - log_std_1
 
-        # 48个参数分布各自计算跟 a_b 的差值与对数概率
-        L_1 = L_max_mu - ((a_b - mu_1) ** 2) / (2 * sigma_1 ** 2 + 1e-8)
-        L_star = jnp.minimum(L_1 + delta_L, L_max_mu)
+        # 3. 极简闭式推导：参数沿着连线无冲突同步移动
+        log_std_2 = jnp.clip(log_std_1 - delta_L, config.min_log_std, config.max_log_std)
+        mu_2 = mu_1 + (1.0 - rho_inv) * (a_b - mu_1)
 
-        sign_dir = jnp.where(a_b >= mu_1, 1.0, -1.0)
-        # 闭式解求出 48个各自的 mu_2
-        mu_2 = a_b - sign_dir * jnp.sqrt(jnp.maximum(0.0, 2 * sigma_1 ** 2 * (L_max_mu - L_star)))
-
-        grad_y = ((a_b - mu_1) ** 2) / (sigma_1 ** 2 + 1e-8) - 1.0
-        grad_y_clipped = jnp.clip(grad_y, -10.0, 10.0)
-        # 泰勒展开求出 48个各自的 log_std_2
-        log_std_2_raw = log_std_1 + delta_L * grad_y_clipped * 0.5
-        log_std_2 = jnp.clip(log_std_2_raw, config.min_log_std, config.max_log_std)
-
-        # 抛硬币交替优化机制
-        is_mu_turn = jax.random.bernoulli(prng_mask, 0.5, shape=(*transitions.reward.shape, M, 1))
-        mu_target = jnp.where(is_mu_turn, mu_2, mu_1)
-        log_std_target = jnp.where(is_mu_turn, log_std_1, log_std_2)
-
-        # 🟢 最终拼接出 48 个绝对精准的目标 theta_2：形状为 [T, B, 48, theta_dim]
-        theta_2 = jax.lax.stop_gradient(jnp.concatenate([mu_target, log_std_target], axis=-1))
+        # 4. 组装终极目标 theta_2
+        theta_2 = jax.lax.stop_gradient(jnp.concatenate([mu_2, log_std_2], axis=-1))
 
         # ==========================================
-        # 🚀 打包进入 transitions 发往内层
+        # 🚀 目标缓存注入
         # ==========================================
         new_action_info = jdc.replace(
             transitions.action_info, eps_batch=eps_batch, theta_2=theta_2, gae_vs=gae_vs
@@ -322,7 +305,6 @@ class IgmmState:
             return new_state, metrics
 
         state, metrics = jax.lax.scan(step_batch, init=state, length=config.num_updates_per_batch)
-        # 把外层算好的 adv_mean 放回 metrics 以便监控
         metrics["advantages_mean"] = global_adv_mean
         return state, metrics
 
@@ -331,7 +313,6 @@ class IgmmState:
             lambda params: IgmmState._compute_policy_loss(jdc.replace(self, params=params), transitions, prng),
             has_aux=True,
         )(self.params)
-
         param_update, new_opt_state = self.opt.update(grads, self.opt_state)
         param_update = jax.tree.map(lambda x: -self.config.learning_rate * x, param_update)
         with jdc.copy_and_mutate(self) as state:
@@ -342,18 +323,18 @@ class IgmmState:
 
     def _compute_policy_loss(self, transitions: IgmmTransition, prng: Array) -> tuple[Array, dict[str, Array]]:
         # ==========================================
-        # 🚀 极其轻盈的内层回归：只需一步前向预测和 MSE Loss
+        # 🚀 极其轻盈的内层回归
         # ==========================================
         obs_norm = (
                                transitions.obs - self.obs_stats.mean) / self.obs_stats.std if self.config.normalize_observations else transitions.obs
         value_pred = networks.value_mlp_fwd(self.params.value, obs_norm)
 
-        # 从缓存里直接把 48 个起点和 48 个靶子拿出来
+        # 提取目标缓存
         eps_batch = transitions.action_info.eps_batch
         theta_2 = transitions.action_info.theta_2
         gae_vs = transitions.action_info.gae_vs
 
-        M = self.config.num_epsilon_samples
+        M = eps_batch.shape[-2]
         batch_shape = eps_batch.shape[:-2]
 
         if self.config.discretize_t_for_training:
@@ -362,11 +343,11 @@ class IgmmState:
         else:
             t = jax.random.uniform(prng, (*batch_shape, M, 1))
 
-        # 极致简单的流场监督：让起点eps按比例滑向theta_2
+        # 流场监督：起点按比例滑向终点
         x_t = t * eps_batch + (1.0 - t) * theta_2
         obs_b_fit = jnp.broadcast_to(obs_norm[..., None, :], (*x_t.shape[:-1], obs_norm.shape[-1]))
 
-        # 只需单次前向通过网络
+        # 单次前向通过
         vel_pred = networks.flow_mlp_fwd(
             self.params.policy, obs_b_fit, x_t, self.embed_timestep(t)
         ) * self.config.policy_mlp_output_scale
@@ -383,6 +364,5 @@ class IgmmState:
         # Value Loss
         v_error = (gae_vs - value_pred) * (1 - transitions.truncation)
         v_loss = jnp.mean(v_error ** 2) * self.config.value_loss_coeff
-        total_loss = policy_loss + v_loss
 
-        return total_loss, {"policy_loss": policy_loss, "v_loss": v_loss}
+        return policy_loss + v_loss, {"policy_loss": policy_loss, "v_loss": v_loss}
