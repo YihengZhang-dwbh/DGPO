@@ -166,9 +166,23 @@ class IgmmState:
         return jnp.concatenate([jnp.cos(scaled_t), jnp.sin(scaled_t)], axis=-1)
 
     def get_current_std(self) -> Array:
-        """🚀 计算当前全局退火方差"""
+        """🚀 带有总体衰减包络的余弦波动探索 (Cyclical Cosine Annealing)"""
         progress = jnp.clip(self.steps / self.config.total_training_steps, 0.0, 1.0)
-        return self.config.initial_std - progress * (self.config.initial_std - self.config.final_std)
+
+        # 设定整个训练过程波动的周期数 (比如 3 次大波谷大波峰)
+        num_cycles = 3.0
+
+        # 当前处于哪个周期的什么位置 (0.0 到 1.0 之间循环)
+        cycle_progress = (progress * num_cycles) % 1.0
+
+        # 经典的余弦退火波形：在每个周期内从 1.0 平滑降到 0.0
+        cosine_wave = 0.5 * (1.0 + jnp.cos(jnp.pi * cycle_progress))
+
+        # 加一个线性的衰减包络：让每次波峰都比上一次矮，防止大后期还在瞎探索
+        envelope = 1.0 - progress
+
+        # 最终的 sigma：基础下限 + 波动幅度 * 余弦波 * 衰减包络
+        return self.config.final_std + (self.config.initial_std - self.config.final_std) * cosine_wave * envelope
 
     def sample_action(self, obs: Array, prng: Array, deterministic: bool) -> tuple[Array, IgmmActionInfo]:
         obs_norm = (obs - self.obs_stats.mean) / (
