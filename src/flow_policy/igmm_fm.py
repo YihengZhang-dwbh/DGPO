@@ -28,14 +28,14 @@ class IgmmConfig:
     policy_mlp_output_scale: float = 0.25
 
     # ==========================================
-    # 👑 IGMM 端到端 PPO 动力学超参
+    # 👑 全局退火方差调度 (DDPM-Style Annealing)
     # ==========================================
     num_epsilon_samples: jdc.Static[int] = 16
     clipping_epsilon: float = 0.2
 
-    # 🛡️ 防爆装甲 1：抬高方差地板，封死 1/sigma^3 的爆炸源
-    min_log_std: float = -3.0  # (sigma ≈ 0.05)
-    max_log_std: float = -1.6094  # 限制 sigma < 0.2
+    # 🚀 降维打击：网络不再预测方差，使用全局统一的随时间衰减的超参数
+    initial_std: float = 0.5  # 训练初期的超大探索方差
+    final_std: float = 0.05  # 训练末期的精准打击方差
 
     action_clip: jdc.Static[Literal["hard", "margin", "tanh", "fold", "scale_clip"]] = "margin"
     clip_margin: float = 10.0
@@ -66,6 +66,11 @@ class IgmmConfig:
     @property
     def iterations_per_env(self) -> int:
         return (self.num_minibatches * self.batch_size * self.unroll_length) // self.num_envs
+
+    @property
+    def total_training_steps(self) -> int:
+        outer_iters = self.num_timesteps // (self.iterations_per_env * self.num_envs)
+        return outer_iters * self.num_updates_per_batch * self.num_minibatches
 
 
 @jdc.pytree_dataclass
@@ -111,7 +116,9 @@ class IgmmState:
     def init(prng: Array, env: jdc.Static[mjp.MjxEnv], config: IgmmConfig) -> IgmmState:
         obs_size = env.observation_size
         action_size = env.action_size
-        theta_dim = action_size * 2
+
+        # 🚀 降维打击：去掉方差，ODE 状态回归最纯粹的动作维度！
+        theta_dim = action_size
 
         prng0, prng1, prng2 = jax.random.split(prng, num=3)
         actor_net = networks.mlp_init(
@@ -122,7 +129,7 @@ class IgmmState:
 
         network_params = IgmmParams(actor_net, critic_net)
 
-        # 🛡️ 防爆装甲 2：强制全局梯度裁剪 (绝对核心)，将过长梯度强制压缩
+        # 保留全局梯度裁剪作为最后一道防线
         opt = optax.chain(
             optax.clip_by_global_norm(1.0),
             optax.scale_by_adam()
@@ -158,12 +165,16 @@ class IgmmState:
         scaled_t = t * freqs
         return jnp.concatenate([jnp.cos(scaled_t), jnp.sin(scaled_t)], axis=-1)
 
+    def get_current_std(self) -> Array:
+        """🚀 计算当前全局退火方差"""
+        progress = jnp.clip(self.steps / self.config.total_training_steps, 0.0, 1.0)
+        return self.config.initial_std - progress * (self.config.initial_std - self.config.final_std)
+
     def sample_action(self, obs: Array, prng: Array, deterministic: bool) -> tuple[Array, IgmmActionInfo]:
-        # 加个 epsilon 防御除以 0
         obs_norm = (obs - self.obs_stats.mean) / (
                     self.obs_stats.std + 1e-8) if self.config.normalize_observations else obs
         (*batch_dims, obs_dim) = obs.shape
-        theta_dim = self.env.action_size * 2
+        theta_dim = self.env.action_size
 
         def euler_step(carry: Array, inputs: tuple[FlowSchedule, Array]) -> tuple[Array, Array]:
             x_t = carry
@@ -184,16 +195,14 @@ class IgmmState:
         eps_1 = jax.random.normal(prng_sample, (*batch_dims, theta_dim))
 
         sch = self.get_schedule(self.config.flow_steps)
-        theta_1, _ = jax.lax.scan(
+        # 🚀 ODE 直接输出均值 mu，没有任何冗余的切片！
+        mu_1, _ = jax.lax.scan(
             euler_step, init=eps_1,
             xs=(sch, jnp.zeros((self.config.flow_steps, 1))),
         )
 
-        mu_1, log_std_1 = jnp.split(theta_1, 2, axis=-1)
-        log_std_1 = jnp.clip(log_std_1, self.config.min_log_std, self.config.max_log_std)
-        sigma_1 = jnp.exp(log_std_1)
-
-        raw_action = mu_1 if deterministic else mu_1 + sigma_1 * jax.random.normal(prng_action, mu_1.shape)
+        current_std = self.get_current_std()
+        raw_action = mu_1 if deterministic else mu_1 + current_std * jax.random.normal(prng_action, mu_1.shape)
         action_clipped = self._apply_clip(raw_action)
 
         return action_clipped, IgmmActionInfo(raw_action=raw_action)
@@ -225,11 +234,11 @@ class IgmmState:
             gae_advantages = (gae_advantages - gae_advantages.mean()) / (gae_advantages.std() + 1e-8)
 
         # ==========================================
-        # 提取旧策略概率 p(a|s; theta_old)
+        # 提取旧策略概率 p(a|s; mu_old, current_std)
         # ==========================================
         prng_eps = jax.random.fold_in(state.prng, state.steps)
         M = config.num_epsilon_samples
-        theta_dim = state.env.action_size * 2
+        theta_dim = state.env.action_size
 
         eps_batch = jax.random.normal(prng_eps, (*transitions.reward.shape, M, theta_dim))
 
@@ -243,18 +252,17 @@ class IgmmState:
             return x + (t_next - t_curr) * v, None
 
         train_sch = state.get_schedule(config.training_flow_steps)
-        theta_old, _ = jax.lax.scan(forward_ode_step_old, eps_batch, (train_sch.t_current, train_sch.t_next))
-        theta_old = jax.lax.stop_gradient(theta_old)
+        mu_old, _ = jax.lax.scan(forward_ode_step_old, eps_batch, (train_sch.t_current, train_sch.t_next))
+        mu_old = jax.lax.stop_gradient(mu_old)
 
-        mu_old, log_std_old = jnp.split(theta_old, 2, axis=-1)
-        log_std_old = jnp.clip(log_std_old, config.min_log_std, config.max_log_std)
-        sigma_old = jnp.exp(log_std_old)
-
+        current_std = state.get_current_std()
         a_b = transitions.action[..., None, :]
-        log_p_old = -0.5 * jnp.log(2 * jnp.pi) - log_std_old - ((a_b - mu_old) ** 2) / (2 * sigma_old ** 2 + 1e-8)
+
+        # 🚀 极致干净的对数概率
+        log_p_old = -0.5 * jnp.log(2 * jnp.pi) - jnp.log(current_std) - ((a_b - mu_old) ** 2) / (
+                    2 * current_std ** 2 + 1e-8)
         log_p_old = jnp.sum(log_p_old, axis=-1)
 
-        # 将所有的全局优势安全装进动作信息
         new_action_info = jdc.replace(
             transitions.action_info,
             eps_batch=eps_batch,
@@ -301,29 +309,30 @@ class IgmmState:
         gae_vs = transitions.action_info.gae_vs
         A = transitions.action_info.gae_advantages
 
-        # 允许自动微分穿透！
+        current_std = self.get_current_std()
+
         def forward_ode_step_new(carry, t_tup):
             x = carry
             t_curr, t_next = t_tup
             t_embed = self.embed_timestep(jnp.broadcast_to(t_curr, (*x.shape[:-1], 1)))
             obs_b = jnp.broadcast_to(obs_norm[..., None, :], (*x.shape[:-1], obs_norm.shape[-1]))
+            # 前向计算包含梯度
             v = networks.flow_mlp_fwd(self.params.policy, obs_b, x, t_embed) * self.config.policy_mlp_output_scale
             return x + (t_next - t_curr) * v, None
 
         train_sch = self.get_schedule(self.config.training_flow_steps)
-        theta_pred, _ = jax.lax.scan(forward_ode_step_new, eps_batch, (train_sch.t_current, train_sch.t_next))
-
-        mu_pred, log_std_pred = jnp.split(theta_pred, 2, axis=-1)
-        log_std_pred = jnp.clip(log_std_pred, self.config.min_log_std, self.config.max_log_std)
-        sigma_pred = jnp.exp(log_std_pred)
+        # 🚀 预测的纯粹就是 mu_pred，没有任何切片和多余维度
+        mu_pred, _ = jax.lax.scan(forward_ode_step_new, eps_batch, (train_sch.t_current, train_sch.t_next))
 
         a_b = transitions.action[..., None, :]
 
-        log_p_pred = -0.5 * jnp.log(2 * jnp.pi) - log_std_pred - ((a_b - mu_pred) ** 2) / (2 * sigma_pred ** 2 + 1e-8)
+        # 计算新策略下的概率
+        log_p_pred = -0.5 * jnp.log(2 * jnp.pi) - jnp.log(current_std) - ((a_b - mu_pred) ** 2) / (
+                    2 * current_std ** 2 + 1e-8)
         log_p_pred = jnp.sum(log_p_pred, axis=-1)
 
-        # 🛡️ 防爆装甲 3：Ratio 截断。限制指数项的绝对大小，彻底杜绝 exp(100) -> inf
-        log_ratio = jnp.clip(log_p_pred - log_p_old, -15.0, 15.0)
+        # 稳健截断 ratio，因为已经去掉了指数爆炸的根源，这里实际上起双保险作用
+        log_ratio = jnp.clip(log_p_pred - log_p_old, -10.0, 10.0)
         ratio = jnp.exp(log_ratio)
 
         surr1 = ratio * A[..., None]
@@ -334,4 +343,9 @@ class IgmmState:
         v_error = (gae_vs - value_pred) * (1 - transitions.truncation)
         v_loss = jnp.mean(v_error ** 2) * self.config.value_loss_coeff
 
-        return policy_loss + v_loss, {"policy_loss": policy_loss, "v_loss": v_loss, "ratio_mean": jnp.mean(ratio)}
+        return policy_loss + v_loss, {
+            "policy_loss": policy_loss,
+            "v_loss": v_loss,
+            "ratio_mean": jnp.mean(ratio),
+            "current_sigma": current_std
+        }
