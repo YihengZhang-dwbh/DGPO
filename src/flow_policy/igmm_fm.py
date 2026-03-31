@@ -29,7 +29,7 @@ class IgmmConfig:
     # ==========================================
     # 👑 IGMM 独家范式超参 (Infinite GMM & Target Reprojection)
     # ==========================================
-    # 每次更新时，用来探路、构建稠密流场的噪声条数
+    # 每次更新时，用来探路、构建稠密流场的噪声条数 M
     num_epsilon_samples: jdc.Static[int] = 48
     # 相当于 PPO 的概率缩放步长 (eta)，决定了优势转化为位移的剧烈程度
     target_k_scaling: float = 0.1
@@ -40,7 +40,7 @@ class IgmmConfig:
     max_log_std: float = 2.0
 
     action_clip: jdc.Static[Literal["hard", "margin", "tanh", "fold", "scale_clip"]] = "margin"
-    clip_margin: float = 10
+    clip_margin: float = 10.0
 
     # ==========================================
     # 经典的 On-Policy / V-Net 参数
@@ -78,9 +78,12 @@ class IgmmParams:
 
 @jdc.pytree_dataclass
 class IgmmActionInfo:
-    # 一切投影推导都在 loss 函数里基于 a_true On-the-fly 完成，
-    # 不再需要缓存庞大的噪声池，内存开销直降到底。
+    # 记录真实环境交互执行的动作
     raw_action: Array = dataclasses.field(default_factory=lambda: jnp.zeros(()))
+    # 🚀 用于全局缓存静态目标的容器（形状会在 training_step 里被替换升级）
+    eps_batch: Array = dataclasses.field(default_factory=lambda: jnp.zeros(()))
+    theta_2: Array = dataclasses.field(default_factory=lambda: jnp.zeros(()))
+    gae_vs: Array = dataclasses.field(default_factory=lambda: jnp.zeros(()))
 
 
 @jdc.pytree_dataclass
@@ -178,7 +181,7 @@ class IgmmState:
 
         prng_sample, prng_action = jax.random.split(prng, 2)
 
-        # 1. 采样单一基准噪声
+        # 1. 采样单一基准噪声 (Rollout阶段不计算48个，只求当前需要执行的那1个动作)
         eps_1 = jax.random.normal(prng_sample, (*batch_dims, theta_dim))
 
         # 2. ODE 求解输出参数
@@ -195,25 +198,132 @@ class IgmmState:
         raw_action = mu_1 if deterministic else mu_1 + sigma_1 * jax.random.normal(prng_action, mu_1.shape)
         action_clipped = self._apply_clip(raw_action)
 
+        # 这里仅返回执行信息，其余维度初始化为占位符
         return action_clipped, IgmmActionInfo(raw_action=raw_action)
 
     @jdc.jit
     def training_step(self, transitions: IgmmTransition) -> tuple[IgmmState, dict[str, Array]]:
         config, state = self.config, self
+
+        # --- 观测特征归一化 ---
         if config.normalize_observations:
             with jdc.copy_and_mutate(state) as state:
                 state.obs_stats = state.obs_stats.update(transitions.obs)
+
+        obs_norm = (
+                               transitions.obs - state.obs_stats.mean) / state.obs_stats.std if config.normalize_observations else transitions.obs
+        value_pred = networks.value_mlp_fwd(state.params.value, obs_norm)
+        bootstrap_obs_norm = (transitions.next_obs[-1:, :, :] - state.obs_stats.mean) / state.obs_stats.std
+        bootstrap_value = networks.value_mlp_fwd(state.params.value, bootstrap_obs_norm)
+
+        # ==========================================
+        # 🚀 提速核心一：全局仅算 1 次 GAE 优势
+        # ==========================================
+        gae_vs, gae_advantages = jax.lax.stop_gradient(
+            rollouts.compute_gae(
+                truncation=transitions.truncation,
+                discount=transitions.discount * config.discounting,
+                rewards=transitions.reward * config.reward_scaling,
+                values=value_pred,
+                bootstrap_value=bootstrap_value,
+                gae_lambda=config.gae_lambda,
+            )
+        )
+
+        global_adv_mean = jnp.mean(gae_advantages)
+        if config.normalize_advantage:
+            gae_advantages = (gae_advantages - gae_advantages.mean()) / (gae_advantages.std() + 1e-8)
+
+        # ==========================================
+        # 🚀 提速核心二：全局仅积分 1 次 48条流形
+        # ==========================================
+        prng_eps, prng_mask = jax.random.split(jax.random.fold_in(state.prng, state.steps), 2)
+        M = config.num_epsilon_samples  # 就是这里的 48
+        act_dim = state.env.action_size
+        theta_dim = act_dim * 2
+
+        # 🟢 生成 48 个原始噪声：形状为 [T, B, 48, theta_dim]
+        eps_batch = jax.random.normal(prng_eps, (*transitions.reward.shape, M, theta_dim))
+
+        def forward_ode_step(carry, t_tup):
+            x = carry
+            t_curr, t_next = t_tup
+            t_embed = state.embed_timestep(jnp.broadcast_to(t_curr, (*x.shape[:-1], 1)))
+            obs_b = jnp.broadcast_to(obs_norm[..., None, :], (*x.shape[:-1], obs_norm.shape[-1]))
+            # 停止梯度！寻找投影目标时绝不让梯度穿过 ODE
+            v = networks.flow_mlp_fwd(jax.lax.stop_gradient(state.params.policy), obs_b, x,
+                                      t_embed) * config.policy_mlp_output_scale
+            return x + (t_next - t_curr) * v, None
+
+        sch = state.get_schedule()
+        # 🟢 ODE求得 48 个当前分布参数 theta_1：形状为 [T, B, 48, theta_dim]
+        theta_1, _ = jax.lax.scan(forward_ode_step, eps_batch, (sch.t_current, sch.t_next))
+        theta_1 = jax.lax.stop_gradient(theta_1)
+
+        mu_1, log_std_1 = jnp.split(theta_1, 2, axis=-1)
+        sigma_1 = jnp.exp(log_std_1)
+
+        # ==========================================
+        # 🚀 提速核心三：提前推导出 48 个万剑归宗专属目标 theta_2
+        # ==========================================
+        eta = config.target_k_scaling
+        clip_eps = config.clipping_epsilon
+
+        ratio_target = 1.0 + eta * gae_advantages[..., None, None]
+        ratio_target_clipped = jnp.where(
+            gae_advantages[..., None, None] > 0,
+            jnp.minimum(ratio_target, 1.0 + clip_eps),
+            jnp.maximum(ratio_target, 1.0 - clip_eps)
+        )
+        ratio_target_clipped = jnp.maximum(ratio_target_clipped, 1e-4)
+        delta_L = jnp.log(ratio_target_clipped)
+
+        # 唯一的那个真动作 a_true
+        a_b = transitions.action[..., None, :]
+        L_max_mu = -0.5 * jnp.log(2 * jnp.pi) - log_std_1
+
+        # 48个参数分布各自计算跟 a_b 的差值与对数概率
+        L_1 = L_max_mu - ((a_b - mu_1) ** 2) / (2 * sigma_1 ** 2 + 1e-8)
+        L_star = jnp.minimum(L_1 + delta_L, L_max_mu)
+
+        sign_dir = jnp.where(a_b >= mu_1, 1.0, -1.0)
+        # 闭式解求出 48个各自的 mu_2
+        mu_2 = a_b - sign_dir * jnp.sqrt(jnp.maximum(0.0, 2 * sigma_1 ** 2 * (L_max_mu - L_star)))
+
+        grad_y = ((a_b - mu_1) ** 2) / (sigma_1 ** 2 + 1e-8) - 1.0
+        grad_y_clipped = jnp.clip(grad_y, -10.0, 10.0)
+        # 泰勒展开求出 48个各自的 log_std_2
+        log_std_2_raw = log_std_1 + delta_L * grad_y_clipped * 0.5
+        log_std_2 = jnp.clip(log_std_2_raw, config.min_log_std, config.max_log_std)
+
+        # 抛硬币交替优化机制
+        is_mu_turn = jax.random.bernoulli(prng_mask, 0.5, shape=(*transitions.reward.shape, M, 1))
+        mu_target = jnp.where(is_mu_turn, mu_2, mu_1)
+        log_std_target = jnp.where(is_mu_turn, log_std_1, log_std_2)
+
+        # 🟢 最终拼接出 48 个绝对精准的目标 theta_2：形状为 [T, B, 48, theta_dim]
+        theta_2 = jax.lax.stop_gradient(jnp.concatenate([mu_target, log_std_target], axis=-1))
+
+        # ==========================================
+        # 🚀 打包进入 transitions 发往内层
+        # ==========================================
+        new_action_info = jdc.replace(
+            transitions.action_info, eps_batch=eps_batch, theta_2=theta_2, gae_vs=gae_vs
+        )
+        cached_transitions = jdc.replace(transitions, action_info=new_action_info)
 
         def step_batch(carry_state: IgmmState, _):
             step_prng = jax.random.fold_in(carry_state.prng, carry_state.steps)
             new_state, metrics = jax.lax.scan(
                 partial(IgmmState._step_minibatch, prng=jax.random.fold_in(step_prng, 0)),
                 init=carry_state,
-                xs=transitions.prepare_minibatches(step_prng, config.num_minibatches, config.batch_size),
+                xs=cached_transitions.prepare_minibatches(step_prng, config.num_minibatches, config.batch_size),
             )
             return new_state, metrics
 
         state, metrics = jax.lax.scan(step_batch, init=state, length=config.num_updates_per_batch)
+        # 把外层算好的 adv_mean 放回 metrics 以便监控
+        metrics["advantages_mean"] = global_adv_mean
         return state, metrics
 
     def _step_minibatch(self, transitions: IgmmTransition, prng: Array) -> tuple[IgmmState, dict[str, Array]]:
@@ -231,114 +341,32 @@ class IgmmState:
         return state, metrics
 
     def _compute_policy_loss(self, transitions: IgmmTransition, prng: Array) -> tuple[Array, dict[str, Array]]:
-        prng_eps, prng_mask, prng_t = jax.random.split(prng, 3)
-        (timesteps, batch_dim) = transitions.reward.shape
-        act_dim = self.env.action_size
-        theta_dim = act_dim * 2
-        M = self.config.num_epsilon_samples
-
+        # ==========================================
+        # 🚀 极其轻盈的内层回归：只需一步前向预测和 MSE Loss
+        # ==========================================
         obs_norm = (
                                transitions.obs - self.obs_stats.mean) / self.obs_stats.std if self.config.normalize_observations else transitions.obs
         value_pred = networks.value_mlp_fwd(self.params.value, obs_norm)
 
-        bootstrap_obs_norm = (transitions.next_obs[-1:, :, :] - self.obs_stats.mean) / self.obs_stats.std
-        bootstrap_value = networks.value_mlp_fwd(self.params.value, bootstrap_obs_norm)
+        # 从缓存里直接把 48 个起点和 48 个靶子拿出来
+        eps_batch = transitions.action_info.eps_batch
+        theta_2 = transitions.action_info.theta_2
+        gae_vs = transitions.action_info.gae_vs
 
-        gae_vs, gae_advantages = jax.lax.stop_gradient(
-            rollouts.compute_gae(
-                truncation=transitions.truncation,
-                discount=transitions.discount * self.config.discounting,
-                rewards=transitions.reward * self.config.reward_scaling,
-                values=value_pred,
-                bootstrap_value=bootstrap_value,
-                gae_lambda=self.config.gae_lambda,
-            )
-        )
+        M = self.config.num_epsilon_samples
+        batch_shape = eps_batch.shape[:-2]
 
-        metrics = {"advantages_mean": jnp.mean(gae_advantages)}
-        if self.config.normalize_advantage:
-            gae_advantages = (gae_advantages - gae_advantages.mean()) / (gae_advantages.std() + 1e-8)
-
-        # A: (T, B), a_true: (T, B, act_dim)
-        A = gae_advantages
-        a_true = transitions.action
-
-        # ==========================================
-        # 👑 1. 批量映射 (The Flow to The Param Space)
-        # ==========================================
-        eps_batch = jax.random.normal(prng_eps, (timesteps, batch_dim, M, theta_dim))
-
-        def forward_ode_step(carry, t_tup):
-            x = carry
-            t_curr, t_next = t_tup
-            t_embed = self.embed_timestep(jnp.broadcast_to(t_curr, (*x.shape[:-1], 1)))
-            obs_b = jnp.broadcast_to(obs_norm[..., None, :], (*x.shape[:-1], obs_norm.shape[-1]))
-            # 停止梯度，绝不让梯度穿过 ODE
-            v = networks.flow_mlp_fwd(jax.lax.stop_gradient(self.params.policy), obs_b, x,
-                                      t_embed) * self.config.policy_mlp_output_scale
-            return x + (t_next - t_curr) * v, None
-
-        sch = self.get_schedule()
-        theta_1, _ = jax.lax.scan(forward_ode_step, eps_batch, (sch.t_current, sch.t_next))
-        theta_1 = jax.lax.stop_gradient(theta_1)
-
-        mu_1, log_std_1 = jnp.split(theta_1, 2, axis=-1)
-        sigma_1 = jnp.exp(log_std_1)
-
-        # ==========================================
-        # 👑 2. 万剑归宗的目标投影 (Target Reprojection)
-        # ==========================================
-        eta = self.config.target_k_scaling
-        clip_eps = self.config.clipping_epsilon
-
-        ratio_target = 1.0 + eta * A[..., None, None]
-        ratio_target_clipped = jnp.where(
-            A[..., None, None] > 0,
-            jnp.minimum(ratio_target, 1.0 + clip_eps),
-            jnp.maximum(ratio_target, 1.0 - clip_eps)
-        )
-        ratio_target_clipped = jnp.maximum(ratio_target_clipped, 1e-4)
-        delta_L = jnp.log(ratio_target_clipped)
-
-        # 为广播准备形状: (T, B, 1, act_dim)
-        a_b = a_true[..., None, :]
-
-        # --- 路线 A: 移动均值 mu (极限天花板闭式解) ---
-        L_max_mu = -0.5 * jnp.log(2 * jnp.pi) - log_std_1
-        L_1 = L_max_mu - ((a_b - mu_1) ** 2) / (2 * sigma_1 ** 2 + 1e-8)
-        L_star = jnp.minimum(L_1 + delta_L, L_max_mu)
-
-        sign_dir = jnp.where(a_b >= mu_1, 1.0, -1.0)
-        mu_2 = a_b - sign_dir * jnp.sqrt(jnp.maximum(0.0, 2 * sigma_1 ** 2 * (L_max_mu - L_star)))
-
-        # --- 路线 B: 收缩/放大方差 sigma (对数方差一阶安全游走) ---
-        grad_y = ((a_b - mu_1) ** 2) / (sigma_1 ** 2 + 1e-8) - 1.0
-        grad_y_clipped = jnp.clip(grad_y, -10.0, 10.0)
-
-        log_std_2_raw = log_std_1 + delta_L * grad_y_clipped * 0.5
-        log_std_2 = jnp.clip(log_std_2_raw, self.config.min_log_std, self.config.max_log_std)
-
-        # ==========================================
-        # 👑 3. 完美轮换交替法则 (Alternating Optimization)
-        # ==========================================
-        is_mu_turn = jax.random.bernoulli(prng_mask, 0.5, shape=(timesteps, batch_dim, M, 1))
-
-        mu_target = jnp.where(is_mu_turn, mu_2, mu_1)
-        log_std_target = jnp.where(is_mu_turn, log_std_1, log_std_2)
-        theta_2 = jax.lax.stop_gradient(jnp.concatenate([mu_target, log_std_target], axis=-1))
-
-        # ==========================================
-        # 👑 4. 纯净流形回归 (Dense Flow Regression)
-        # ==========================================
         if self.config.discretize_t_for_training:
-            t_idx = jax.random.randint(prng_t, (timesteps, batch_dim, M, 1), 0, self.config.flow_steps)
-            t = sch.t_current[t_idx]
+            t_idx = jax.random.randint(prng, (*batch_shape, M, 1), 0, self.config.flow_steps)
+            t = self.get_schedule().t_current[t_idx]
         else:
-            t = jax.random.uniform(prng_t, (timesteps, batch_dim, M, 1))
+            t = jax.random.uniform(prng, (*batch_shape, M, 1))
 
+        # 极致简单的流场监督：让起点eps按比例滑向theta_2
         x_t = t * eps_batch + (1.0 - t) * theta_2
         obs_b_fit = jnp.broadcast_to(obs_norm[..., None, :], (*x_t.shape[:-1], obs_norm.shape[-1]))
 
+        # 只需单次前向通过网络
         vel_pred = networks.flow_mlp_fwd(
             self.params.policy, obs_b_fit, x_t, self.embed_timestep(t)
         ) * self.config.policy_mlp_output_scale
@@ -352,15 +380,9 @@ class IgmmState:
 
         policy_loss = jnp.mean(flow_loss)
 
-        # --- Value Loss ---
+        # Value Loss
         v_error = (gae_vs - value_pred) * (1 - transitions.truncation)
         v_loss = jnp.mean(v_error ** 2) * self.config.value_loss_coeff
         total_loss = policy_loss + v_loss
 
-        # --- Metrics ---
-        metrics["policy_loss"] = policy_loss
-        metrics["v_loss"] = v_loss
-        metrics["target_reproj_mu_diff"] = jnp.mean(jnp.abs(mu_target - mu_1))
-        metrics["target_reproj_sigma_diff"] = jnp.mean(jnp.abs(jnp.exp(log_std_target) - sigma_1))
-
-        return total_loss, metrics
+        return total_loss, {"policy_loss": policy_loss, "v_loss": v_loss}
