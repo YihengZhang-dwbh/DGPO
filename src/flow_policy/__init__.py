@@ -23,7 +23,7 @@ from . import ppo
 from . import fpo
 from . import dgpo_fm
 from . import dgpo_diffusion
-from . import igmm_flow
+from . import igmm_fm
 
 __all__ = [
     # GoRL core
@@ -40,4 +40,5 @@ __all__ = [
     'fpo',
     'dgpo_fm',
     'dgpo_diffusion',
+    'igmm_fm',
 ]

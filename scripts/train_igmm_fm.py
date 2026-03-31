@@ -13,8 +13,8 @@ from tqdm import tqdm
 
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-# 👑 引入全新的 igmm 模块
-from flow_policy import igmm, rollouts
+# 👑 引入全新的 igmm_fm 模块
+from flow_policy import igmm_fm, rollouts
 
 
 def main(
@@ -26,7 +26,7 @@ def main(
             )
         ),
     ],
-    config: igmm.IgmmConfig,
+    config: igmm_fm.IgmmConfig,
     exp_name: str = "",
     seed: int = 0,
 ) -> None:
@@ -39,7 +39,7 @@ def main(
 
     # Create results directory
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    algo_name = "igmm"
+    algo_name = "igmm_fm"
     results_dir = Path("results") / f"{algo_name}_{env_name}_{exp_name}_{timestamp}"
     results_dir.mkdir(parents=True, exist_ok=True)
 
@@ -67,7 +67,7 @@ def main(
     # Initialize.
     env = registry.load(env_name, config=env_config)
     # 👑 使用 IgmmState 初始化
-    agent_state = igmm.IgmmState.init(prng=jax.random.key(seed), env=env, config=config)
+    agent_state = igmm_fm.IgmmState.init(prng=jax.random.key(seed), env=env, config=config)
     rollout_state = rollouts.BatchedRolloutState.init(
         env,
         prng=jax.random.key(seed),
