@@ -33,9 +33,8 @@ class IgmmConfig:
     num_epsilon_samples: jdc.Static[int] = 16
     clipping_epsilon: float = 0.2
 
-    # 🚀 降维打击：网络不再预测方差，使用全局统一的随时间衰减的超参数
-    initial_std: float = 0.5  # 训练初期的超大探索方差
-    final_std: float = 0.05  # 训练末期的精准打击方差
+    # 🎯 极其稳固的固定探索超参：不再退火，专心移动均值！
+    fixed_std: float = 0.2
 
     action_clip: jdc.Static[Literal["hard", "margin", "tanh", "fold", "scale_clip"]] = "margin"
     clip_margin: float = 10.0
@@ -165,24 +164,9 @@ class IgmmState:
         scaled_t = t * freqs
         return jnp.concatenate([jnp.cos(scaled_t), jnp.sin(scaled_t)], axis=-1)
 
-    def get_current_std(self) -> Array:
-        """🚀 带有总体衰减包络的余弦波动探索 (Cyclical Cosine Annealing)"""
-        progress = jnp.clip(self.steps / self.config.total_training_steps, 0.0, 1.0)
-
-        # 设定整个训练过程波动的周期数 (比如 3 次大波谷大波峰)
-        num_cycles = 3.0
-
-        # 当前处于哪个周期的什么位置 (0.0 到 1.0 之间循环)
-        cycle_progress = (progress * num_cycles) % 1.0
-
-        # 经典的余弦退火波形：在每个周期内从 1.0 平滑降到 0.0
-        cosine_wave = 0.5 * (1.0 + jnp.cos(jnp.pi * cycle_progress))
-
-        # 加一个线性的衰减包络：让每次波峰都比上一次矮，防止大后期还在瞎探索
-        envelope = 1.0 - progress
-
-        # 最终的 sigma：基础下限 + 波动幅度 * 余弦波 * 衰减包络
-        return self.config.final_std + (self.config.initial_std - self.config.final_std) * cosine_wave * envelope
+    def get_current_std(self) -> float:
+        """🎯 回归大道至简：返回固定的探索方差"""
+        return self.config.fixed_std
 
     def sample_action(self, obs: Array, prng: Array, deterministic: bool) -> tuple[Array, IgmmActionInfo]:
         obs_norm = (obs - self.obs_stats.mean) / (
