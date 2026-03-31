@@ -40,7 +40,7 @@ class IgmmConfig:
     max_log_std: float = 2.0
 
     action_clip: jdc.Static[Literal["hard", "margin", "tanh", "fold", "scale_clip"]] = "margin"
-    clip_margin: float = 1.1
+    clip_margin: float = 10
 
     # ==========================================
     # 经典的 On-Policy / V-Net 参数
@@ -53,7 +53,7 @@ class IgmmConfig:
     num_envs: jdc.Static[int] = 2048
     num_evals: jdc.Static[int] = 30
     num_minibatches: jdc.Static[int] = 32
-    num_timesteps: jdc.Static[int] = 60_000_000
+    num_timesteps: jdc.Static[int] = 180_000_000
     num_updates_per_batch: jdc.Static[int] = 16
     reward_scaling: float = 10.0
     unroll_length: jdc.Static[int] = 30
