@@ -182,8 +182,7 @@ class IgmmState:
         )
 
         mu_1, scaled_sigma_1 = jnp.split(theta_1, 2, axis=-1)
-        sigma_1 = jnp.clip(scaled_sigma_1 / self.config.sigma_scale_factor, self.config.min_sigma,
-                           self.config.max_sigma)
+        sigma_1 = jnp.clip(jnp.abs(scaled_sigma_1) / self.config.sigma_scale_factor, self.config.min_sigma, self.config.max_sigma)
 
         raw_action = mu_1 if deterministic else mu_1 + sigma_1 * jax.random.normal(prng_action, mu_1.shape)
         action_clipped = self._apply_clip(raw_action)
@@ -240,7 +239,7 @@ class IgmmState:
         theta_1 = jax.lax.stop_gradient(theta_1)
 
         mu_1, scaled_sigma_1 = jnp.split(theta_1, 2, axis=-1)
-        sigma_1 = jnp.clip(scaled_sigma_1 / config.sigma_scale_factor, config.min_sigma, config.max_sigma)
+        sigma_1 = jnp.clip(jnp.abs(scaled_sigma_1) / config.sigma_scale_factor, config.min_sigma, config.max_sigma)
 
         ratio_target = 1.0 + config.target_k_scaling * gae_advantages[..., None, None]
         ratio_target_clipped = jnp.clip(ratio_target, 1.0 - config.clipping_epsilon, 1.0 + config.clipping_epsilon)
