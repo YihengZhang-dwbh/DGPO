@@ -18,6 +18,7 @@ from . import math_utils, networks, rollouts
 @jdc.pytree_dataclass
 class IgmmConfig:
     flow_steps: jdc.Static[int] = 10
+    training_flow_steps: jdc.Static[int] = 2
     output_mode: jdc.Static[Literal["u", "u_but_supervise_as_eps"]] = "u_but_supervise_as_eps"
     timestep_embed_dim: jdc.Static[int] = 8
     discretize_t_for_training: jdc.Static[bool] = True
@@ -25,7 +26,6 @@ class IgmmConfig:
 
     use_dense_flow: jdc.Static[bool] = True
     num_epsilon_samples: jdc.Static[int] = 16
-    target_k_scaling: float = 0.1
     clipping_epsilon: float = 0.2
 
     sigma_scale_factor: float = 10.0
@@ -72,8 +72,9 @@ class IgmmActionInfo:
     eps_1: Array = dataclasses.field(default_factory=lambda: jnp.zeros(()))
 
     eps_batch: Array = dataclasses.field(default_factory=lambda: jnp.zeros(()))
-    theta_2: Array = dataclasses.field(default_factory=lambda: jnp.zeros(()))
+    log_p_old: Array = dataclasses.field(default_factory=lambda: jnp.zeros(()))
     gae_vs: Array = dataclasses.field(default_factory=lambda: jnp.zeros(()))
+    gae_advantages: Array = dataclasses.field(default_factory=lambda: jnp.zeros(()))
 
 
 @jdc.pytree_dataclass
@@ -141,8 +142,8 @@ class IgmmState:
             return jnp.abs(x - T * jnp.floor((x + 3 * t) / T) + t) - t
         return x
 
-    def get_schedule(self) -> FlowSchedule:
-        full_t_path = jnp.linspace(1.0, 0.0, self.config.flow_steps + 1)
+    def get_schedule(self, num_steps: int) -> FlowSchedule:
+        full_t_path = jnp.linspace(1.0, 0.0, num_steps + 1)
         return FlowSchedule(t_current=full_t_path[:-1], t_next=full_t_path[1:])
 
     def embed_timestep(self, t: Array) -> Array:
@@ -175,14 +176,15 @@ class IgmmState:
         prng_sample, prng_action = jax.random.split(prng, 2)
         eps_1 = jax.random.normal(prng_sample, (*batch_dims, theta_dim))
 
-        sch = self.get_schedule()
+        sch = self.get_schedule(self.config.flow_steps)
         theta_1, _ = jax.lax.scan(
             euler_step, init=eps_1,
             xs=(sch, jnp.zeros((self.config.flow_steps, 1))),
         )
 
         mu_1, scaled_sigma_1 = jnp.split(theta_1, 2, axis=-1)
-        sigma_1 = jnp.clip(jnp.abs(scaled_sigma_1) / self.config.sigma_scale_factor, self.config.min_sigma, self.config.max_sigma)
+        sigma_1 = jnp.clip(jnp.abs(scaled_sigma_1) / self.config.sigma_scale_factor, self.config.min_sigma,
+                           self.config.max_sigma)
 
         raw_action = mu_1 if deterministic else mu_1 + sigma_1 * jax.random.normal(prng_action, mu_1.shape)
         action_clipped = self._apply_clip(raw_action)
@@ -225,7 +227,7 @@ class IgmmState:
             M = 1
             eps_batch = transitions.action_info.eps_1[..., None, :]
 
-        def forward_ode_step(carry, t_tup):
+        def forward_ode_step_old(carry, t_tup):
             x = carry
             t_curr, t_next = t_tup
             t_embed = state.embed_timestep(jnp.broadcast_to(t_curr, (*x.shape[:-1], 1)))
@@ -234,29 +236,21 @@ class IgmmState:
                                       t_embed) * config.policy_mlp_output_scale
             return x + (t_next - t_curr) * v, None
 
-        sch = state.get_schedule()
-        theta_1, _ = jax.lax.scan(forward_ode_step, eps_batch, (sch.t_current, sch.t_next))
-        theta_1 = jax.lax.stop_gradient(theta_1)
+        train_sch = state.get_schedule(config.training_flow_steps)
+        theta_old, _ = jax.lax.scan(forward_ode_step_old, eps_batch, (train_sch.t_current, train_sch.t_next))
+        theta_old = jax.lax.stop_gradient(theta_old)
 
-        mu_1, scaled_sigma_1 = jnp.split(theta_1, 2, axis=-1)
-        sigma_1 = jnp.clip(jnp.abs(scaled_sigma_1) / config.sigma_scale_factor, config.min_sigma, config.max_sigma)
+        mu_old, scaled_sigma_old = jnp.split(theta_old, 2, axis=-1)
+        sigma_old = jnp.clip(jnp.abs(scaled_sigma_old) / config.sigma_scale_factor, config.min_sigma, config.max_sigma)
 
-        ratio_target = 1.0 + config.target_k_scaling * gae_advantages[..., None, None]
-        ratio_target_clipped = jnp.clip(ratio_target, 1.0 - config.clipping_epsilon, 1.0 + config.clipping_epsilon)
-        ratio_target_clipped = jnp.maximum(ratio_target_clipped, 1e-4)
-        delta_L = jnp.log(ratio_target_clipped)
-
-        rho_inv = jnp.exp(-delta_L)
         a_b = transitions.action[..., None, :]
-
-        mu_2 = mu_1 + (1.0 - rho_inv) * (a_b - mu_1)
-        sigma_2 = jnp.clip(sigma_1 * rho_inv, config.min_sigma, config.max_sigma)
-
-        scaled_sigma_2 = sigma_2 * config.sigma_scale_factor
-        theta_2 = jax.lax.stop_gradient(jnp.concatenate([mu_2, scaled_sigma_2], axis=-1))
+        log_p_old = -0.5 * jnp.log(2 * jnp.pi) - jnp.log(sigma_old) - ((a_b - mu_old) ** 2) / (
+                    2 * sigma_old ** 2 + 1e-8)
+        log_p_old = jnp.sum(log_p_old, axis=-1)
 
         new_action_info = jdc.replace(
-            transitions.action_info, eps_batch=eps_batch, theta_2=theta_2, gae_vs=gae_vs
+            transitions.action_info, eps_batch=eps_batch, log_p_old=log_p_old, gae_vs=gae_vs,
+            gae_advantages=gae_advantages
         )
         cached_transitions = jdc.replace(transitions, action_info=new_action_info)
 
@@ -293,35 +287,39 @@ class IgmmState:
         value_pred = networks.value_mlp_fwd(self.params.value, obs_norm)
 
         eps_batch = transitions.action_info.eps_batch
-        theta_2 = transitions.action_info.theta_2
+        log_p_old = transitions.action_info.log_p_old
         gae_vs = transitions.action_info.gae_vs
+        A = transitions.action_info.gae_advantages
 
-        M = eps_batch.shape[-2]
-        batch_shape = eps_batch.shape[:-2]
+        def forward_ode_step_new(carry, t_tup):
+            x = carry
+            t_curr, t_next = t_tup
+            t_embed = self.embed_timestep(jnp.broadcast_to(t_curr, (*x.shape[:-1], 1)))
+            obs_b = jnp.broadcast_to(obs_norm[..., None, :], (*x.shape[:-1], obs_norm.shape[-1]))
+            v = networks.flow_mlp_fwd(self.params.policy, obs_b, x, t_embed) * self.config.policy_mlp_output_scale
+            return x + (t_next - t_curr) * v, None
 
-        if self.config.discretize_t_for_training:
-            t_idx = jax.random.randint(prng, (*batch_shape, M, 1), 0, self.config.flow_steps)
-            t = self.get_schedule().t_current[t_idx]
-        else:
-            t = jax.random.uniform(prng, (*batch_shape, M, 1))
+        train_sch = self.get_schedule(self.config.training_flow_steps)
+        theta_pred, _ = jax.lax.scan(forward_ode_step_new, eps_batch, (train_sch.t_current, train_sch.t_next))
 
-        x_t = t * eps_batch + (1.0 - t) * theta_2
-        obs_b_fit = jnp.broadcast_to(obs_norm[..., None, :], (*x_t.shape[:-1], obs_norm.shape[-1]))
+        mu_pred, scaled_sigma_pred = jnp.split(theta_pred, 2, axis=-1)
+        sigma_pred = jnp.clip(jnp.abs(scaled_sigma_pred) / self.config.sigma_scale_factor, self.config.min_sigma,
+                              self.config.max_sigma)
 
-        vel_pred = networks.flow_mlp_fwd(
-            self.params.policy, obs_b_fit, x_t, self.embed_timestep(t)
-        ) * self.config.policy_mlp_output_scale
+        a_b = transitions.action[..., None, :]
+        log_p_pred = -0.5 * jnp.log(2 * jnp.pi) - jnp.log(sigma_pred) - ((a_b - mu_pred) ** 2) / (
+                    2 * sigma_pred ** 2 + 1e-8)
+        log_p_pred = jnp.sum(log_p_pred, axis=-1)
 
-        if self.config.output_mode == "u":
-            flow_loss = jnp.mean((vel_pred - (eps_batch - theta_2)) ** 2, axis=-1)
-        else:
-            x0_pred = x_t - t * vel_pred
-            x1_pred = x0_pred + vel_pred
-            flow_loss = jnp.mean((eps_batch - x1_pred) ** 2, axis=-1)
+        log_ratio = jnp.clip(log_p_pred - log_p_old, -15.0, 15.0)
+        ratio = jnp.exp(log_ratio)
 
-        policy_loss = jnp.mean(flow_loss)
+        surr1 = ratio * A[..., None]
+        surr2 = jnp.clip(ratio, 1.0 - self.config.clipping_epsilon, 1.0 + self.config.clipping_epsilon) * A[..., None]
+
+        policy_loss = -jnp.mean(jnp.minimum(surr1, surr2))
 
         v_error = (gae_vs - value_pred) * (1 - transitions.truncation)
         v_loss = jnp.mean(v_error ** 2) * self.config.value_loss_coeff
 
-        return policy_loss + v_loss, {"policy_loss": policy_loss, "v_loss": v_loss}
+        return policy_loss + v_loss, {"policy_loss": policy_loss, "v_loss": v_loss, "ratio_mean": jnp.mean(ratio)}
