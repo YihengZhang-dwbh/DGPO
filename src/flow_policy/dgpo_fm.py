@@ -17,33 +17,39 @@ from . import math_utils, networks, rollouts
 
 @jdc.pytree_dataclass
 class DGPOFMConfig:
+    # --- New Q-Guided Generation Control Core ---
     independent_noise_sampling: jdc.Static[bool] = True
     use_global_variance: jdc.Static[bool] = False
-    temp_func_type: jdc.Static[Literal["log", "cbrt", "std", "fixed", "max"]] = "fixed"
+    temp_func_type: jdc.Static[Literal["log", "cbrt", "std", "fixed", "max"]] = "max"
     fast_flow_step: jdc.Static[int] = 5
 
-    # 👑 全新 ANO 架构核心超参
-    m_centers: jdc.Static[int] = 8
-    i_neighbors: jdc.Static[int] = 5
-    perturb_std: float = 0.01
+    # Probability allocation mode: KL closed-form (Softmax) vs Linear mass redistribution
+    prob_allocation_mode: jdc.Static[Literal["kl_softmax", "linear_redistribution"]] = "linear_redistribution"
 
-    # 👑 双模式完美共存
-    prob_allocation_mode: jdc.Static[Literal["kl_softmax", "linear_redistribution"]] = "kl_softmax"
+    # Asymmetric linear redistribution parameters (l: penalty stripping rate, r: reward amplification rate)
     resampling_l: float = 0.3
     resampling_r: float = 0.4
-    resampling_ood_p: float = 0.0
 
+    # Action boundary processing: Fold mapping included
     action_clip: jdc.Static[Literal["hard", "margin", "tanh", "fold", "scale_clip"]] = "margin"
     clip_margin: float = 1.1
     penalty_coef: float = 0
+
+    # Sampling budget allocation mode
+    sampling_mode: jdc.Static[Literal["absolute_budget", "relative_h_pool"]] = "relative_h_pool"
+    h_fakes_in_pool: jdc.Static[int] = 3  # Number of fake actions fixed per outer loop
+
+    # Advantage weighting parameters
+    adv_weight_temp: float = 1.0
+    adv_weight_clip_min: float = 0.1
+    adv_weight_clip_max: float = 10.0
 
     base_tolerance: float = 1.0
     resampling_alpha_k: float = 0.3
     resampling_alpha_min: float = 0.0001
     f_x_forward: jdc.Static[bool] = True
-
-    # 👑 极速内层算力控制
-    num_epsilon_samples: jdc.Static[int] = 8
+    num_generated_actions: jdc.Static[int] = 48  # Global generated actions (K)
+    num_epsilon_samples: jdc.Static[int] = 8  # Inner fitting allocation budget (M)
 
     beta_r: float = 0.9
     beta_v: float = 0.9
@@ -96,9 +102,11 @@ class DGPOFMParams:
 class DGPOFMActionInfo:
     target_qs: Array = dataclasses.field(default_factory=lambda: jnp.zeros(()))
     raw_action: Array = dataclasses.field(default_factory=lambda: jnp.zeros(()))
+
+    # Caches computed outer-loop pools and probabilities to decouple inner loop
     pool_actions: Array = dataclasses.field(default_factory=lambda: jnp.zeros(()))
     pool_probs: Array = dataclasses.field(default_factory=lambda: jnp.zeros(()))
-    pool_noises: Array = dataclasses.field(default_factory=lambda: jnp.zeros(()))
+    pool_advs: Array = dataclasses.field(default_factory=lambda: jnp.zeros(()))
 
 
 @jdc.pytree_dataclass
@@ -164,7 +172,7 @@ class DGPOFMState:
             return jnp.abs(x - T * jnp.floor((x + 3 * t) / T) + t) - t
         return x
 
-    def _compute_fresh_weights(self, value_params, obs_norm, pool_actions_raw) -> tuple[Array, dict[str, Array]]:
+    def _compute_fresh_weights(self, value_params, obs_norm, pool_actions_raw) -> tuple[Array, Array, dict[str, Array]]:
         N, K_plus_1, act_dim = pool_actions_raw.shape
         flat_obs = obs_norm.reshape((N, self.env.observation_size))
         obs_pool_b = jnp.broadcast_to(flat_obs[:, None, :], (N, K_plus_1, flat_obs.shape[-1]))
@@ -184,6 +192,9 @@ class DGPOFMState:
         pool_mean = jnp.mean(q_pool_penalized, axis=-1, keepdims=True)
         adv = q_pool_penalized - pool_mean
 
+        # ==========================================
+        # Mode A: Classic KL closed-form (Softmax)
+        # ==========================================
         if self.config.prob_allocation_mode == "kl_softmax":
             if self.config.temp_func_type == "max":
                 abs_adv = jnp.abs(adv)
@@ -209,12 +220,23 @@ class DGPOFMState:
             logits = (q_pool_penalized - jnp.max(q_pool_penalized, axis=-1, keepdims=True)) / alpha
             pool_probs = jax.nn.softmax(logits, axis=-1)
 
-            metrics = {"q_guided/prob_real_mean": jnp.mean(pool_probs[:, 0])}
-            return jax.lax.stop_gradient(pool_probs), metrics
+            metrics = {
+                "q_guided/q_real_mean": jnp.mean(q_pool[:, 0]),
+                "q_guided/q_real_penalized_mean": jnp.mean(q_pool_penalized[:, 0]),
+                "q_guided/penalty_mean": jnp.mean(penalty),
+                "q_guided/prob_real_mean": jnp.mean(pool_probs[:, 0]),
+                "q_guided/alpha_mean": jnp.mean(alpha),
+                "q_guided/f_x_mean": jnp.mean(f_x),
+            }
+            return jax.lax.stop_gradient(pool_probs), jax.lax.stop_gradient(adv), metrics
 
+        # ==========================================
+        # Mode B: Asymmetric linear probability mass redistribution
+        # ==========================================
         elif self.config.prob_allocation_mode == "linear_redistribution":
             l_val = self.config.resampling_l
             r_val = self.config.resampling_r
+
             p_base = jnp.ones((N, K_plus_1)) / K_plus_1
 
             is_pos = adv > 0.0
@@ -224,20 +246,24 @@ class DGPOFMState:
             sum_A_pos = jnp.sum(adv * is_pos, axis=-1, keepdims=True) + 1e-8
             sum_A_neg = jnp.sum(adv * is_neg, axis=-1, keepdims=True) - 1e-8
 
+            # --- Case 1: (l+r)*p_+ <= l ---
             new_p_c1_pos = p_base * (1 + r_val) + (adv * is_pos / sum_A_pos) * (l_val - (l_val + r_val) * p_pos)
             new_p_c1_neg = p_base * (1 - l_val)
             p_case1 = jnp.where(is_pos, new_p_c1_pos, new_p_c1_neg)
 
+            # --- Case 2: (l+r)*p_+ > l ---
             new_p_c2_pos = p_base * (1 + r_val)
             new_p_c2_neg = p_base * (1 - l_val) - (adv * is_neg / sum_A_neg) * ((l_val + r_val) * p_pos - l_val)
             p_case2 = jnp.where(is_pos, new_p_c2_pos, new_p_c2_neg)
 
+            # --- Case 3: p_+ * (1+r) > 1.0 (Pool depletion, rank allocation) ---
             target_p = p_base * (1 + r_val) * is_pos
             sort_idx = jnp.argsort(-adv, axis=-1)
             sorted_target_p = jnp.take_along_axis(target_p, sort_idx, axis=-1)
 
             cum_p = jnp.cumsum(sorted_target_p, axis=-1)
             full_alloc_mask = cum_p <= 1.0
+
             prev_full_alloc_mask = jnp.concatenate([jnp.ones((N, 1), dtype=bool), full_alloc_mask[:, :-1]], axis=-1)
             boundary_mask = prev_full_alloc_mask & ~full_alloc_mask
             prev_cum_p = jnp.concatenate([jnp.zeros((N, 1)), cum_p[:, :-1]], axis=-1)
@@ -248,17 +274,31 @@ class DGPOFMState:
             undo_sort_idx = jnp.argsort(sort_idx, axis=-1)
             p_case3 = jnp.take_along_axis(sorted_new_p, undo_sort_idx, axis=-1)
 
+            # ==========================================
+            # Routing integration
+            # ==========================================
             cond_case3 = (p_pos * (1 + r_val) > 1.0)
             cond_case1 = ~cond_case3 & ((l_val + r_val) * p_pos <= l_val)
 
             pool_probs = jnp.where(cond_case3, p_case3, jnp.where(cond_case1, p_case1, p_case2))
+
+            # Final clip and normalize for numerical stability
             pool_probs = jnp.clip(pool_probs, 0.0, 1.0)
             pool_probs = pool_probs / jnp.sum(pool_probs, axis=-1, keepdims=True)
 
-            metrics = {"q_guided/prob_real_mean": jnp.mean(pool_probs[:, 0])}
-            return jax.lax.stop_gradient(pool_probs), metrics
+            metrics = {
+                "q_guided/q_real_mean": jnp.mean(q_pool[:, 0]),
+                "q_guided/q_real_penalized_mean": jnp.mean(q_pool_penalized[:, 0]),
+                "q_guided/prob_real_mean": jnp.mean(pool_probs[:, 0]),
+                "q_guided/l_val": l_val,
+                "q_guided/r_val": r_val,
+                "q_guided/case3_ratio": jnp.mean(cond_case3.astype(jnp.float32)),
+                "q_guided/case1_ratio": jnp.mean(cond_case1.astype(jnp.float32)),
+            }
+            return jax.lax.stop_gradient(pool_probs), jax.lax.stop_gradient(adv), metrics
+
         else:
-            raise ValueError(f"Unknown mode: {self.config.prob_allocation_mode}")
+            raise ValueError(f"Unknown prob_allocation_mode: {self.config.prob_allocation_mode}")
 
     def _compute_value_loss(self, value_params, obs_norm, actions, truncation, target_qs):
         concat_inputs = jnp.concatenate([obs_norm, actions], axis=-1)
@@ -306,6 +346,7 @@ class DGPOFMState:
             x_raw = x_raw + noise * self.config.feather_std
 
         x_final = self._apply_clip(x_raw)
+        # pool_actions and pool_probs will be populated in the outer loop
         return x_final, DGPOFMActionInfo(raw_action=x_raw)
 
     def _update_critic_only(self, transitions: DGPOFMTransition, prng: Array) -> tuple[DGPOFMState, dict[str, Array]]:
@@ -336,77 +377,72 @@ class DGPOFMState:
                                 opt_state_value=new_v_opt_state)
         return new_state, extra_v_metrics
 
+    # ==========================================
+    # Outer layer target preparation (OOM safe)
+    # ==========================================
     def _prepare_actor_targets_chunk(self, transitions_chunk: DGPOFMTransition, prng: Array) -> tuple[
         DGPOFMActionInfo, dict[str, Array]]:
         cfg = self.config
-        prng_fake, prng_perturb = jax.random.split(prng, 2)
+        prng_gen, prng_sample = jax.random.split(prng, 2)
 
         obs_dim = self.env.observation_size
         act_dim = self.env.action_size
         t_dim = cfg.timestep_embed_dim
         N = transitions_chunk.obs.shape[0]
-
-        m_centers = cfg.m_centers
-        i_neighbors = cfg.i_neighbors
-        M_total = (m_centers + 1) * i_neighbors
-        perturb_std = cfg.perturb_std
+        K_fakes = cfg.num_generated_actions
 
         obs_flat = ((transitions_chunk.obs - self.obs_stats.mean) / self.obs_stats.std
                     if cfg.normalize_observations else transitions_chunk.obs)
+
         real_action_flat = transitions_chunk.action_info.raw_action.reshape((N, 1, act_dim))
+        obs_b_gen = jnp.broadcast_to(obs_flat[:, None, :], (N, K_fakes, obs_dim))
 
-        fast_flow_steps = cfg.fast_flow_step
-
-        z_fake_centers = jax.random.normal(prng_fake, (N, m_centers, act_dim))
-
-        fast_full_t_inv = jnp.linspace(0.0, 1.0, fast_flow_steps + 1)
-        t_curr_inv, t_next_inv = fast_full_t_inv[:-1], fast_full_t_inv[1:]
-
-        def inverse_gen_step(x, t_tup):
-            t_c, t_n = t_tup
-            t_embed = jnp.broadcast_to(self.embed_timestep(jnp.array([t_c])[..., None])[:, None, :], (N, 1, t_dim))
-            obs_b_real = jnp.broadcast_to(obs_flat[:, None, :], (N, 1, obs_dim))
-            vel = networks.flow_mlp_fwd(jax.lax.stop_gradient(self.params.policy), obs_b_real, x,
-                                        t_embed) * cfg.policy_mlp_output_scale
-            return x + (t_n - t_c) * vel, None
-
-        z_true, _ = jax.lax.scan(inverse_gen_step, real_action_flat, (t_curr_inv, t_next_inv))
-
-        z_centers = jnp.concatenate([z_true, z_fake_centers], axis=1)
-
-        fast_full_t_fwd = jnp.linspace(1.0, 0.0, fast_flow_steps + 1)
-        t_curr_fwd, t_next_fwd = fast_full_t_fwd[:-1], fast_full_t_fwd[1:]
-        obs_b_fake = jnp.broadcast_to(obs_flat[:, None, :], (N, m_centers, obs_dim))
+        fast_flow_steps = self.config.fast_flow_step
+        fast_full_t = jnp.linspace(1.0, 0.0, fast_flow_steps + 1)
+        fast_t_curr, fast_t_next = fast_full_t[:-1], fast_full_t[1:]
 
         def gen_step(x, t_tup):
             t_c, t_n = t_tup
             t_embed = jnp.broadcast_to(self.embed_timestep(jnp.array([t_c])[..., None])[:, None, :],
-                                       (N, m_centers, t_dim))
-            vel = networks.flow_mlp_fwd(jax.lax.stop_gradient(self.params.policy), obs_b_fake, x,
+                                       (N, K_fakes, t_dim))
+            vel = networks.flow_mlp_fwd(jax.lax.stop_gradient(self.params.policy), obs_b_gen, x,
                                         t_embed) * cfg.policy_mlp_output_scale
             return x + (t_n - t_c) * vel, None
 
-        fake_actions, _ = jax.lax.scan(gen_step, z_fake_centers, (t_curr_fwd, t_next_fwd))
-        actions_centers = jnp.concatenate([real_action_flat, fake_actions], axis=1)
+        gen_acts, _ = jax.lax.scan(gen_step, jax.random.normal(prng_gen, (N, K_fakes, act_dim)),
+                                   (fast_t_curr, fast_t_next))
 
-        probs_centers, fresh_metrics = self._compute_fresh_weights(self.params.value, obs_flat, actions_centers)
+        # Full set including generated actions
+        pool_actions_full = jnp.concatenate([real_action_flat, gen_acts], axis=1)
+        probs_full, advs_full, fresh_metrics = self._compute_fresh_weights(self.params.value, obs_flat,
+                                                                           pool_actions_full)
 
-        # 👑 直接在这里把噪声池平铺为 M_total，回归全局维度
-        z_centers_expanded = jnp.expand_dims(z_centers, axis=2)
-        noise_perturbations = jax.random.normal(prng_perturb, (N, m_centers + 1, i_neighbors, act_dim)) * perturb_std
-        mask = (jnp.arange(i_neighbors) > 0).reshape(1, 1, i_neighbors, 1)
-        z_pool_expanded = z_centers_expanded + noise_perturbations * mask
-        z_pool_flat = z_pool_expanded.reshape((N, M_total, act_dim))
+        if cfg.sampling_mode == "relative_h_pool":
+            h = cfg.h_fakes_in_pool
+            fake_indices = jax.random.randint(prng_sample, (N, h), 1, K_fakes + 1)
+            zero_idx = jnp.zeros((N, 1), dtype=jnp.int32)
+            pool_indices = jnp.concatenate([zero_idx, fake_indices], axis=1)
 
-        new_action_info = jdc.replace(
-            transitions_chunk.action_info,
-            pool_actions=actions_centers,
-            pool_probs=probs_centers,
-            pool_noises=z_pool_flat
-        )
+            local_probs_raw = jnp.take_along_axis(probs_full, pool_indices, axis=1)
+            local_probs = local_probs_raw / (jnp.sum(local_probs_raw, axis=-1, keepdims=True) + 1e-8)
 
+            local_advs = jnp.take_along_axis(advs_full, pool_indices, axis=1)
+
+            final_actions = jnp.take_along_axis(pool_actions_full, pool_indices[..., None], axis=1)
+            final_probs = local_probs
+            final_advs = local_advs
+        else:
+            final_actions = pool_actions_full
+            final_probs = probs_full
+            final_advs = advs_full
+
+        new_action_info = jdc.replace(transitions_chunk.action_info, pool_actions=final_actions, pool_probs=final_probs,
+                                      pool_advs=final_advs)
         return new_action_info, fresh_metrics
 
+    # ==========================================
+    # Fast inner loop: Pure flow fitting
+    # ==========================================
     def _update_actor_only(self, transitions: DGPOFMTransition, prng: Array, global_v_loss: Array) -> tuple[
         DGPOFMState, dict[str, Array]]:
         cfg, sch = self.config, self.get_schedule()
@@ -414,6 +450,7 @@ class DGPOFMState:
 
         obs_dim = self.env.observation_size
         act_dim = self.env.action_size
+
         N = transitions.obs.size // obs_dim
         obs_flat = ((transitions.obs - self.obs_stats.mean) / self.obs_stats.std
                     if cfg.normalize_observations else transitions.obs).reshape((N, obs_dim))
@@ -421,47 +458,65 @@ class DGPOFMState:
         mb_mean_reward = jnp.mean(transitions.reward)
         final_v_loss = global_v_loss
 
-        m_centers = cfg.m_centers
-        M_total = (m_centers + 1) * cfg.i_neighbors
-        M = cfg.num_epsilon_samples  # 👑 极速算力：只做 M 次梯度传播
-
         raw_pool_acts = transitions.action_info.pool_actions
         raw_pool_probs = transitions.action_info.pool_probs
-        raw_pool_noises = transitions.action_info.pool_noises
+        raw_pool_advs = transitions.action_info.pool_advs
 
-        pool_actions = raw_pool_acts.reshape((N, m_centers + 1, act_dim))
-        pool_probs = raw_pool_probs.reshape((N, m_centers + 1))
-        # 👑 接收外层展平好的整个 M_total 噪声题库
-        pool_noises_flat = raw_pool_noises.reshape((N, M_total, act_dim))
+        pool_actions = raw_pool_acts.reshape((N, raw_pool_acts.shape[-2], act_dim))
+        pool_probs = raw_pool_probs.reshape((N, raw_pool_probs.shape[-1]))
+        pool_advs = raw_pool_advs.reshape((N, raw_pool_advs.shape[-1]))
 
         def policy_loss_fn(p_params):
-            p_idx_alloc, p_match, p_t, p_trust, p_idx_uniform, p_ood_mask = jax.random.split(prng_pol, 6)
+            M = cfg.num_epsilon_samples
+            K_fakes = cfg.num_generated_actions
+            p_idx_fake, p_idx_alloc, p_eps, p_t, p_trust = jax.random.split(prng_pol, 5)
 
-            local_logits = jnp.where(pool_probs > 0, jnp.log(pool_probs + 1e-12), -1e9)
+            if cfg.sampling_mode == "absolute_budget":
+                BUDGET = (float(M) / 2.0) * float(K_fakes + 1)
+                fake_idx = jax.random.randint(p_idx_fake, (N, 1), 1, K_fakes + 1)
 
-            # 👑 1. 从 m+1 个动作中，基于优势概率抽取 M 个 Target 动作
-            assigned_idx = jax.random.categorical(p_idx_alloc, local_logits[:, None, :], axis=-1, shape=(N, M))
-            a_target = jnp.take_along_axis(pool_actions, assigned_idx[..., None], axis=1)
+                p_real = pool_probs[:, 0]
+                p_fake = jnp.take_along_axis(pool_probs, fake_idx, axis=1).squeeze(1)
 
-            # ==========================================
-            # 👑 2. 核心修复：从 M_total 整个汪洋大海里，完全随机盲抽 M 个噪声！
-            # 彻底实现全局概率抢夺，强迫差区域向好动作靠拢！
-            # ==========================================
-            noise_idx = jax.random.randint(p_match, (N, M), 0, M_total)
-            shuffled_noises = jnp.take_along_axis(pool_noises_flat, noise_idx[..., None], axis=1)
+                n_exp_real = p_real * BUDGET
+                n_exp_fake = p_fake * BUDGET
+                sum_exp = n_exp_real + n_exp_fake
 
-            is_real_slot = (assigned_idx == 0)
+                denom = jnp.maximum(float(M), sum_exp)
+                prob_real = n_exp_real / denom
+                prob_fake = n_exp_fake / denom
+                prob_discard = 1.0 - prob_real - prob_fake
 
-            ood_p = cfg.resampling_ood_p
-            uniform_actions = jax.random.uniform(p_idx_uniform, (N, M, act_dim), minval=-1.0, maxval=1.0)
-            ood_mask = jax.random.uniform(p_ood_mask, (N, M)) < ood_p
+                alloc_probs = jnp.stack([prob_discard, prob_real, prob_fake], axis=-1)
+                logits = jnp.log(alloc_probs[:, None, :] + 1e-8)
 
-            a_target = jnp.where(ood_mask[..., None], uniform_actions, a_target)
-            is_real_slot = is_real_slot & (~ood_mask)
+                assigned_classes = jax.random.categorical(p_idx_alloc, logits, axis=-1, shape=(N, M))
+
+                real_acts = pool_actions[:, 0:1, :]
+                fake_acts = jnp.take_along_axis(pool_actions, fake_idx[..., None], axis=1)
+                a_target = jnp.where((assigned_classes == 1)[..., None], real_acts, fake_acts)
+
+                real_advs = pool_advs[:, 0:1]
+                fake_advs = jnp.take_along_axis(pool_advs, fake_idx, axis=1)
+                a_adv = jnp.where((assigned_classes == 1), real_advs, fake_advs)
+
+                alloc_valid_mask = (assigned_classes > 0).astype(jnp.float32)
+                is_real_slot = (assigned_classes == 1)
+            else:
+                local_logits = jnp.log(pool_probs[:, None, :] + 1e-8)
+
+                assigned_local_idx = jax.random.categorical(p_idx_alloc, local_logits, axis=-1, shape=(N, M))
+
+                a_target = jnp.take_along_axis(pool_actions, assigned_local_idx[..., None], axis=1)
+                a_adv = jnp.take_along_axis(pool_advs, assigned_local_idx, axis=1)
+
+                alloc_valid_mask = jnp.ones((N, M), dtype=jnp.float32)
+                is_real_slot = (assigned_local_idx == 0)
 
             if cfg.action_clip in ["hard", "margin", "fold"]:
                 a_target = self._apply_clip(a_target)
 
+            # --- Z-Score EMA Trust Region ---
             t_outer = (self.steps // (cfg.num_updates_per_batch * cfg.num_minibatches)) + 1.0
             bc_v = 1.0 - jnp.power(cfg.beta_v, t_outer)
             bc_r = 1.0 - jnp.power(cfg.beta_r, t_outer)
@@ -481,13 +536,16 @@ class DGPOFMState:
             combined_trust_prob = jnp.where(is_real_slot, r_trust, v_trust)
             trust_mask = (jax.random.uniform(p_trust, (N, M)) < combined_trust_prob).astype(jnp.float32)
 
-            eps = shuffled_noises
+            final_valid_mask = alloc_valid_mask * trust_mask
+
+            # --- Fast Flow Fitting ---
+            eps = jax.random.normal(p_eps, (N, M, act_dim))
             t = sch.t_current[jax.random.randint(p_t, (N, M, 1), 0, cfg.flow_steps)]
+
             x_t = t * eps + (1.0 - t) * a_target
 
             t_embed = self.embed_timestep(t)
             obs_p = jnp.broadcast_to(obs_flat[:, None, :], (N, M, obs_dim))
-
             vel = networks.flow_mlp_fwd(p_params, obs_p, x_t, t_embed) * cfg.policy_mlp_output_scale
 
             if cfg.output_mode == "u_but_supervise_as_eps":
@@ -495,12 +553,24 @@ class DGPOFMState:
             else:
                 err = jnp.sum((vel - (eps - a_target)) ** 2, axis=-1)
 
-            loss = jnp.mean(err * trust_mask)
+            # Compute advantage exponential weight and clip for stability
+            adv_weight = jnp.clip(
+                jnp.exp(a_adv / cfg.adv_weight_temp),
+                cfg.adv_weight_clip_min,
+                cfg.adv_weight_clip_max
+            )
+
+            # Apply soft weighting to the MSE loss
+            loss = jnp.mean(err * adv_weight * final_valid_mask)
 
             return loss, {
                 "policy_loss": loss,
                 "q_guided/real_trust_prob": r_trust,
                 "q_guided/fake_trust_prob": v_trust,
+                "q_guided/final_effective_ratio": jnp.mean(final_valid_mask),
+                "q_guided/actual_utilized_noises": jnp.mean(jnp.sum(alloc_valid_mask, axis=-1)),
+                "q_guided/reward_z_score": r_z,
+                "q_guided/v_loss_z_score": v_z,
             }
 
         (p_loss, p_metrics), p_grads = jax.value_and_grad(policy_loss_fn, has_aux=True)(self.params.policy)
@@ -523,8 +593,8 @@ class DGPOFMState:
             with jdc.copy_and_mutate(state) as state:
                 state.obs_stats = state.obs_stats.update(transitions.obs)
 
-        obs_norm = ((transitions.obs - state.obs_stats.mean) / state.obs_stats.std
-                    if config.normalize_observations else transitions.obs)
+        obs_norm = (
+                           transitions.obs - state.obs_stats.mean) / state.obs_stats.std if config.normalize_observations else transitions.obs
 
         concat_inputs = jnp.concatenate([obs_norm, transitions.action], axis=-1)
         q_pred, _ = networks.value_mlp_fwd_with_features(state.params.value, concat_inputs)
@@ -546,6 +616,7 @@ class DGPOFMState:
         boot_noise = jax.random.normal(prng_boot, (1, bootstrap_obs.shape[1], state.env.action_size))
         bootstrap_act, _ = jax.lax.scan(boot_step_fn, boot_noise,
                                         (state.get_schedule().t_current, state.get_schedule().t_next))
+
         clipped_boot_act = self._apply_clip(bootstrap_act)
 
         bootstrap_q, _ = networks.value_mlp_fwd_with_features(
@@ -564,23 +635,27 @@ class DGPOFMState:
             )
         )
 
+        # ==========================================
+        # Placeholders for JAX Scan dimension stability
+        # ==========================================
         N_u, N_e = target_qs.shape[0], target_qs.shape[1]
         act_dim = state.env.action_size
 
-        m_centers = config.m_centers
-        M_total = (m_centers + 1) * config.i_neighbors
-
-        # 👑 干净占位符
-        dummy_pool_acts = jnp.zeros((N_u, N_e, m_centers + 1, act_dim))
-        dummy_pool_probs = jnp.zeros((N_u, N_e, m_centers + 1))
-        dummy_pool_noises = jnp.zeros((N_u, N_e, M_total, act_dim))
+        if config.sampling_mode == "relative_h_pool":
+            dummy_pool_acts = jnp.zeros((N_u, N_e, config.h_fakes_in_pool + 1, act_dim))
+            dummy_pool_probs = jnp.zeros((N_u, N_e, config.h_fakes_in_pool + 1))
+            dummy_pool_advs = jnp.zeros((N_u, N_e, config.h_fakes_in_pool + 1))
+        else:
+            dummy_pool_acts = jnp.zeros((N_u, N_e, config.num_generated_actions + 1, act_dim))
+            dummy_pool_probs = jnp.zeros((N_u, N_e, config.num_generated_actions + 1))
+            dummy_pool_advs = jnp.zeros((N_u, N_e, config.num_generated_actions + 1))
 
         new_action_info = jdc.replace(
             transitions.action_info,
             target_qs=target_qs,
             pool_actions=dummy_pool_acts,
             pool_probs=dummy_pool_probs,
-            pool_noises=dummy_pool_noises
+            pool_advs=dummy_pool_advs
         )
         new_transitions = jdc.replace(transitions, action_info=new_action_info)
 
@@ -608,6 +683,9 @@ class DGPOFMState:
                 current_global_v_loss)
         )
 
+        # ==========================================
+        # Outer loop safe chunked processing
+        # ==========================================
         N_total = new_transitions.obs.shape[0] * new_transitions.obs.shape[1]
         flat_transitions = jax.tree_util.tree_map(lambda x: x.reshape((N_total, *x.shape[2:])), new_transitions)
         chunk_size = N_total // config.num_minibatches
@@ -625,6 +703,7 @@ class DGPOFMState:
         _, (prepped_action_info_chunked, prep_metrics_chunked) = jax.lax.scan(scan_prep_fn, None,
                                                                               (chunked_transitions, prngs))
 
+        # Re-shape using truth mold
         prepped_action_info = jax.tree_util.tree_map(
             lambda orig_target, chunked_data: chunked_data.reshape(orig_target.shape),
             new_action_info,
