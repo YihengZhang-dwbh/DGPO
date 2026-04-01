@@ -18,7 +18,6 @@ from . import math_utils, networks, rollouts
 @jdc.pytree_dataclass
 class IgmmConfig:
     flow_steps: jdc.Static[int] = 10
-    training_flow_steps: jdc.Static[int] = 2
     output_mode: jdc.Static[Literal["u", "u_but_supervise_as_eps"]] = "u_but_supervise_as_eps"
     timestep_embed_dim: jdc.Static[int] = 8
     discretize_t_for_training: jdc.Static[bool] = True
@@ -26,6 +25,8 @@ class IgmmConfig:
 
     use_dense_flow: jdc.Static[bool] = True
     num_epsilon_samples: jdc.Static[int] = 16
+
+    target_k_scaling: float = 0.1
     clipping_epsilon: float = 0.2
 
     sigma_scale_factor: float = 10.0
@@ -72,9 +73,8 @@ class IgmmActionInfo:
     eps_1: Array = dataclasses.field(default_factory=lambda: jnp.zeros(()))
 
     eps_batch: Array = dataclasses.field(default_factory=lambda: jnp.zeros(()))
-    log_p_old: Array = dataclasses.field(default_factory=lambda: jnp.zeros(()))
+    theta_2: Array = dataclasses.field(default_factory=lambda: jnp.zeros(()))
     gae_vs: Array = dataclasses.field(default_factory=lambda: jnp.zeros(()))
-    gae_advantages: Array = dataclasses.field(default_factory=lambda: jnp.zeros(()))
 
 
 @jdc.pytree_dataclass
@@ -116,6 +116,7 @@ class IgmmState:
         critic_net = networks.mlp_init(prng1, (obs_size, 256, 256, 256, 256, 256, 1))
 
         network_params = IgmmParams(actor_net, critic_net)
+
         opt = optax.chain(
             optax.clip_by_global_norm(1.0),
             optax.scale_by_adam()
@@ -183,6 +184,8 @@ class IgmmState:
         )
 
         mu_1, scaled_sigma_1 = jnp.split(theta_1, 2, axis=-1)
+
+        # Absolute topological protection applied directly to generation
         sigma_1 = jnp.clip(jnp.abs(scaled_sigma_1) / self.config.sigma_scale_factor, self.config.min_sigma,
                            self.config.max_sigma)
 
@@ -236,21 +239,48 @@ class IgmmState:
                                       t_embed) * config.policy_mlp_output_scale
             return x + (t_next - t_curr) * v, None
 
-        train_sch = state.get_schedule(config.training_flow_steps)
-        theta_old, _ = jax.lax.scan(forward_ode_step_old, eps_batch, (train_sch.t_current, train_sch.t_next))
-        theta_old = jax.lax.stop_gradient(theta_old)
+        # 1. Establish the causal anchor: old network output theta_1
+        sch = state.get_schedule(config.flow_steps)
+        theta_1, _ = jax.lax.scan(forward_ode_step_old, eps_batch, (sch.t_current, sch.t_next))
+        theta_1 = jax.lax.stop_gradient(theta_1)
 
-        mu_old, scaled_sigma_old = jnp.split(theta_old, 2, axis=-1)
-        sigma_old = jnp.clip(jnp.abs(scaled_sigma_old) / config.sigma_scale_factor, config.min_sigma, config.max_sigma)
+        mu_1, scaled_sigma_1 = jnp.split(theta_1, 2, axis=-1)
+        sigma_1 = jnp.clip(jnp.abs(scaled_sigma_1) / config.sigma_scale_factor, config.min_sigma, config.max_sigma)
 
         a_b = transitions.action[..., None, :]
-        log_p_old = -0.5 * jnp.log(2 * jnp.pi) - jnp.log(sigma_old) - ((a_b - mu_old) ** 2) / (
-                    2 * sigma_old ** 2 + 1e-8)
+
+        # 2. Compute L_old from the causal anchor
+        log_p_old = -0.5 * jnp.log(2 * jnp.pi) - jnp.log(sigma_1) - ((a_b - mu_1) ** 2) / (2 * sigma_1 ** 2 + 1e-8)
         log_p_old = jnp.sum(log_p_old, axis=-1)
 
+        # 3. Compute L_target based on PPO bounds
+        ratio_target = 1.0 + config.target_k_scaling * gae_advantages[..., None]
+        ratio_target_clipped = jnp.clip(ratio_target, 1.0 - config.clipping_epsilon, 1.0 + config.clipping_epsilon)
+        delta_L = jnp.log(jnp.maximum(ratio_target_clipped, 1e-4))
+        L_target = log_p_old + delta_L
+
+        # 4. Compute L_eps from the source truth anchor (eps to a,0)
+        eps_mu, eps_scaled_sigma = jnp.split(eps_batch, 2, axis=-1)
+        sigma_eps = jnp.clip(jnp.abs(eps_scaled_sigma) / config.sigma_scale_factor, config.min_sigma, config.max_sigma)
+
+        L_eps = -0.5 * jnp.log(2 * jnp.pi) - jnp.log(sigma_eps) - ((a_b - eps_mu) ** 2) / (2 * sigma_eps ** 2 + 1e-8)
+        L_eps = jnp.sum(L_eps, axis=-1)
+
+        # 5. Determine the geometric progress scalar (1-s) for the target line
+        action_dim = state.env.action_size
+        C_scalar = (L_eps - L_target) / action_dim
+
+        rho_inv = jnp.exp(C_scalar)[..., None]
+        rho_inv = jnp.clip(rho_inv, 1e-4, 1e4)
+
+        # 6. Map closed-form solution coordinates onto theta_2 target
+        mu_2 = a_b - rho_inv * (a_b - eps_mu)
+        scaled_sigma_2 = rho_inv * eps_scaled_sigma
+
+        theta_2 = jax.lax.stop_gradient(jnp.concatenate([mu_2, scaled_sigma_2], axis=-1))
+
         new_action_info = jdc.replace(
-            transitions.action_info, eps_batch=eps_batch, log_p_old=log_p_old, gae_vs=gae_vs,
-            gae_advantages=gae_advantages
+            transitions.action_info, eps_batch=eps_batch, theta_2=theta_2, gae_vs=gae_vs
         )
         cached_transitions = jdc.replace(transitions, action_info=new_action_info)
 
@@ -287,39 +317,36 @@ class IgmmState:
         value_pred = networks.value_mlp_fwd(self.params.value, obs_norm)
 
         eps_batch = transitions.action_info.eps_batch
-        log_p_old = transitions.action_info.log_p_old
+        theta_2 = transitions.action_info.theta_2
         gae_vs = transitions.action_info.gae_vs
-        A = transitions.action_info.gae_advantages
 
-        def forward_ode_step_new(carry, t_tup):
-            x = carry
-            t_curr, t_next = t_tup
-            t_embed = self.embed_timestep(jnp.broadcast_to(t_curr, (*x.shape[:-1], 1)))
-            obs_b = jnp.broadcast_to(obs_norm[..., None, :], (*x.shape[:-1], obs_norm.shape[-1]))
-            v = networks.flow_mlp_fwd(self.params.policy, obs_b, x, t_embed) * self.config.policy_mlp_output_scale
-            return x + (t_next - t_curr) * v, None
+        M = eps_batch.shape[-2]
+        batch_shape = eps_batch.shape[:-2]
 
-        train_sch = self.get_schedule(self.config.training_flow_steps)
-        theta_pred, _ = jax.lax.scan(forward_ode_step_new, eps_batch, (train_sch.t_current, train_sch.t_next))
+        if self.config.discretize_t_for_training:
+            t_idx = jax.random.randint(prng, (*batch_shape, M, 1), 0, self.config.flow_steps)
+            t = self.get_schedule(self.config.flow_steps).t_current[t_idx]
+        else:
+            t = jax.random.uniform(prng, (*batch_shape, M, 1))
 
-        mu_pred, scaled_sigma_pred = jnp.split(theta_pred, 2, axis=-1)
-        sigma_pred = jnp.clip(jnp.abs(scaled_sigma_pred) / self.config.sigma_scale_factor, self.config.min_sigma,
-                              self.config.max_sigma)
+        # Simulation-Free geometric matching against closed-form target
+        x_t = t * eps_batch + (1.0 - t) * theta_2
+        obs_b_fit = jnp.broadcast_to(obs_norm[..., None, :], (*x_t.shape[:-1], obs_norm.shape[-1]))
 
-        a_b = transitions.action[..., None, :]
-        log_p_pred = -0.5 * jnp.log(2 * jnp.pi) - jnp.log(sigma_pred) - ((a_b - mu_pred) ** 2) / (
-                    2 * sigma_pred ** 2 + 1e-8)
-        log_p_pred = jnp.sum(log_p_pred, axis=-1)
+        vel_pred = networks.flow_mlp_fwd(
+            self.params.policy, obs_b_fit, x_t, self.embed_timestep(t)
+        ) * self.config.policy_mlp_output_scale
 
-        log_ratio = jnp.clip(log_p_pred - log_p_old, -15.0, 15.0)
-        ratio = jnp.exp(log_ratio)
+        if self.config.output_mode == "u":
+            flow_loss = jnp.mean((vel_pred - (eps_batch - theta_2)) ** 2, axis=-1)
+        else:
+            x0_pred = x_t - t * vel_pred
+            x1_pred = x0_pred + vel_pred
+            flow_loss = jnp.mean((eps_batch - x1_pred) ** 2, axis=-1)
 
-        surr1 = ratio * A[..., None]
-        surr2 = jnp.clip(ratio, 1.0 - self.config.clipping_epsilon, 1.0 + self.config.clipping_epsilon) * A[..., None]
-
-        policy_loss = -jnp.mean(jnp.minimum(surr1, surr2))
+        policy_loss = jnp.mean(flow_loss)
 
         v_error = (gae_vs - value_pred) * (1 - transitions.truncation)
         v_loss = jnp.mean(v_error ** 2) * self.config.value_loss_coeff
 
-        return policy_loss + v_loss, {"policy_loss": policy_loss, "v_loss": v_loss, "ratio_mean": jnp.mean(ratio)}
+        return policy_loss + v_loss, {"policy_loss": policy_loss, "v_loss": v_loss}
