@@ -25,11 +25,11 @@ class DGPOFMConfig:
     timestep_embed_dim: jdc.Static[int] = 8
     policy_mlp_output_scale: float = 0.25
 
-    # Number of noise paths (eps) to fit per REAL action
+    # Number of noise samples (eps) to fit per real action
     num_epsilon_samples: jdc.Static[int] = 8
 
     # ==========================================
-    # 2. Dynamic Lipschitz Repulsive Flow & Routing
+    # 2. Dynamic Lipschitz Repulsion & Routing
     # ==========================================
     # 👑 Three choices for the Z partition constant
     z_estimation_mode: jdc.Static[Literal["local_max", "global_ema", "fixed"]] = "local_max"
@@ -42,13 +42,7 @@ class DGPOFMConfig:
     max_repel_radius: float = 2.0
 
     # ==========================================
-    # 3. Action Boundary Safety
-    # ==========================================
-    action_clip: jdc.Static[Literal["hard", "margin", "tanh", "fold", "scale_clip"]] = "margin"
-    clip_margin: float = 1.1
-
-    # ==========================================
-    # 4. RL Infrastructure & EMA Trust Region
+    # 4. RL Infrastructure
     # ==========================================
     batch_size: jdc.Static[int] = 1024
     num_minibatches: jdc.Static[int] = 32
@@ -70,11 +64,6 @@ class DGPOFMConfig:
     normalize_advantage: jdc.Static[bool] = True
     sde_sigma: float = 0.0
     feather_std: float = 0.0
-
-    beta_r: float = 0.9
-    beta_v: float = 0.9
-    tolerance_r: float = -10
-    tolerance_v: float = 10
 
     episode_length: int = 1000
     num_timesteps: jdc.Static[int] = 180000000
@@ -122,12 +111,7 @@ class DGPOFMState:
     prng: Array
     steps: Array
 
-    ema_reward: jnp.ndarray = dataclasses.field(default_factory=lambda: jnp.zeros(()))
-    ema_reward_sq: jnp.ndarray = dataclasses.field(default_factory=lambda: jnp.zeros(()))
-    ema_v_loss: jnp.ndarray = dataclasses.field(default_factory=lambda: jnp.zeros(()))
-    ema_v_loss_sq: jnp.ndarray = dataclasses.field(default_factory=lambda: jnp.zeros(()))
-
-    # Track global maximum advantage for Rejection Sampling Z-estimation
+    # Track global maximum advantage for Rejection Sampling Z-estimation ONLY
     ema_max_adv: jnp.ndarray = dataclasses.field(default_factory=lambda: jnp.zeros(()))
 
     @staticmethod
@@ -157,19 +141,6 @@ class DGPOFMState:
             prng=prng2, steps=jnp.zeros((), dtype=jnp.int32),
         )
 
-    def _apply_clip(self, x: Array) -> Array:
-        cfg = self.config
-        if cfg.action_clip == "hard":
-            return jnp.clip(x, -1.0, 1.0)
-        elif cfg.action_clip == "margin":
-            return jnp.clip(x, -cfg.clip_margin, cfg.clip_margin)
-        elif cfg.action_clip == "tanh":
-            return cfg.clip_margin * jnp.tanh(x / cfg.clip_margin)
-        elif cfg.action_clip == "fold":
-            T = 4.0 * cfg.clip_margin
-            t = cfg.clip_margin
-            return jnp.abs(x - T * jnp.floor((x + 3 * t) / T) + t) - t
-        return x
 
     def _compute_value_loss(self, value_params, obs_norm, truncation, target_vs):
         # Pure V-Network forward
@@ -216,7 +187,8 @@ class DGPOFMState:
             noise = jax.random.normal(prng_feather, x_raw.shape)
             x_raw = x_raw + noise * self.config.feather_std
 
-        x_final = self._apply_clip(x_raw)
+        # 换成最纯粹的 JAX 原生操作：
+        x_final = x_raw
         return x_final, DGPOFMActionInfo()
 
     def _update_critic_only(self, transitions: DGPOFMTransition, prng: Array) -> tuple[DGPOFMState, dict[str, Array]]:
@@ -245,8 +217,8 @@ class DGPOFMState:
                                 opt_state_value=new_v_opt_state)
         return new_state, extra_v_metrics
 
-    def _update_actor_only(self, transitions: DGPOFMTransition, prng: Array, global_v_loss: Array,
-                           global_max_adv: Array) -> tuple[DGPOFMState, dict[str, Array]]:
+    def _update_actor_only(self, transitions: DGPOFMTransition, prng: Array, global_max_adv: Array) -> tuple[
+        DGPOFMState, dict[str, Array]]:
         cfg, sch = self.config, self.get_schedule()
         prng_pol, next_prng = jax.random.split(prng, 2)
 
@@ -256,60 +228,28 @@ class DGPOFMState:
         obs_flat = ((transitions.obs - self.obs_stats.mean) / self.obs_stats.std
                     if cfg.normalize_observations else transitions.obs).reshape((N, obs_dim))
 
-        mb_mean_reward = jnp.mean(transitions.reward)
-        final_v_loss = global_v_loss
-
         # 👑 Pure Real Actions and Real GAE Advantages
         a_real_flat = transitions.action.reshape((N, act_dim))
         adv_flat = transitions.action_info.advantages.reshape((N, 1))
 
         def policy_loss_fn(p_params):
             M = cfg.num_epsilon_samples
-            p_eps, p_t, p_trust, p_route = jax.random.split(prng_pol, 4)
+            p_eps, p_t, p_route = jax.random.split(prng_pol, 3)
 
             a_target = jnp.broadcast_to(a_real_flat[:, None, :], (N, M, act_dim))
-            a_adv = jnp.broadcast_to(adv_flat, (N, M))  # <--- 修复完毕，完美二维广播
+            # GAE already reshaped to (N, 1), simple broadcast to (N, M)
+            a_adv = jnp.broadcast_to(adv_flat, (N, M))
 
-            if cfg.action_clip in ["hard", "margin", "fold"]:
-                a_target = self._apply_clip(a_target)
-
-            # --- Z-Score EMA Trust Region ---
-            t_outer = (self.steps // (cfg.num_updates_per_batch * cfg.num_minibatches)) + 1.0
-            bc_v = 1.0 - jnp.power(cfg.beta_v, t_outer)
-            bc_r = 1.0 - jnp.power(cfg.beta_r, t_outer)
-
-            hat_r, hat_r_sq = self.ema_reward / bc_r, self.ema_reward_sq / bc_r
-            hat_v, hat_v_sq = self.ema_v_loss / bc_v, self.ema_v_loss_sq / bc_v
-
-            r_std = jnp.sqrt(jnp.maximum(hat_r_sq - jnp.square(hat_r), 0.0)) + 1e-5
-            v_std = jnp.sqrt(jnp.maximum(hat_v_sq - jnp.square(hat_v), 0.0)) + 1e-5
-
-            r_z = (mb_mean_reward - hat_r) / r_std
-            v_z = (final_v_loss - hat_v) / v_std
-
-            r_trust = jnp.clip(jnp.exp(-jnp.maximum(-r_z + cfg.tolerance_r, 0.0) / 0.5), 0.01, 1.0)
-            v_trust = jnp.clip(jnp.exp(-jnp.maximum(v_z - cfg.tolerance_v, 0.0) / 0.5), 0.01, 1.0)
-
-            # Only real actions now, so we always use r_trust as combined trust proxy
-            trust_mask = (jax.random.uniform(p_trust, (N, M)) < r_trust).astype(jnp.float32)
 
             # --- 👑 Rejection Sampling Z-Estimation & Routing ---
             if cfg.z_estimation_mode == "local_max":
-                # 把原来的：
-                # Z_adv = jnp.max(a_adv)
-
-                # 换成极其抗破坏的 95% 分位数锚点：
-                Z_adv = jnp.percentile(a_adv, 95.0)
+                Z_adv = jnp.max(a_adv)
             elif cfg.z_estimation_mode == "global_ema":
                 Z_adv = global_max_adv
             elif cfg.z_estimation_mode == "fixed":
                 Z_adv = cfg.z_fixed_max_adv
             else:
-                # 把原来的：
-                # Z_adv = jnp.max(a_adv)
-                
-                # 换成极其抗破坏的 95% 分位数锚点：
-                Z_adv = jnp.percentile(a_adv, 95.0)
+                Z_adv = jnp.max(a_adv)
 
             # Compute Target Probability (p*) guaranteed to be un-biased and bounded
             p_star = jnp.exp((a_adv - Z_adv) / cfg.z_temperature)
@@ -342,12 +282,12 @@ class DGPOFMState:
             loss_repel = jnp.maximum(0.0, R_safe - dist) ** 2
 
             err_combined = is_attract * loss_attract + is_repel * loss_repel
-            loss = jnp.mean(err_combined * trust_mask)
+
+            # Final Expected Loss
+            loss = jnp.mean(err_combined)
 
             return loss, {
                 "policy_loss": loss,
-                "q_guided/real_trust_prob": r_trust,
-                "q_guided/fake_trust_prob": v_trust,
                 "q_guided/attract_ratio": jnp.mean(is_attract),
                 "q_guided/mean_R_safe": jnp.mean(R_safe),
                 "q_guided/Z_adv_anchor": Z_adv,
@@ -377,7 +317,7 @@ class DGPOFMState:
         obs_norm = (
                                transitions.obs - state.obs_stats.mean) / state.obs_stats.std if config.normalize_observations else transitions.obs
 
-        # 👑 Pure V-Network Forward (No actions required!)
+        # Pure V-Network Forward (No actions required!)
         v_pred, _ = networks.value_mlp_fwd_with_features(state.params.value, obs_norm)
         v_pred = jax.lax.stop_gradient(v_pred)
 
@@ -385,7 +325,7 @@ class DGPOFMState:
         if config.normalize_observations:
             bootstrap_obs = (bootstrap_obs - state.obs_stats.mean) / state.obs_stats.std
 
-        # 👑 Massive Compute Saver: No ODE required to bootstrap V!
+        # Fast V-Network Bootstrap
         bootstrap_v, _ = networks.value_mlp_fwd_with_features(state.params.value, bootstrap_obs)
 
         target_vs, advs = jax.lax.stop_gradient(
@@ -399,10 +339,10 @@ class DGPOFMState:
             )
         )
 
-        # Normalize advantages properly across the global batch
         if config.normalize_advantage:
             advs = (advs - jnp.mean(advs)) / (jnp.std(advs) + 1e-8)
 
+        # 👑 Pipeline re-connected: advantages passed through Transitions
         new_action_info = jdc.replace(
             transitions.action_info,
             target_vs=target_vs,
@@ -429,18 +369,11 @@ class DGPOFMState:
             return jax.lax.scan(minibatch_scan_fn, init=carry_state, xs=minibatches)
 
         state_after_v, all_v_metrics = jax.lax.scan(critic_epoch_step, init=state, length=config.num_updates_per_batch)
-        current_global_v_loss = jnp.mean(all_v_metrics["v_loss/total"])
 
-        batch_reward = jnp.mean(transitions.reward)
+        # Sync the new global max advantage
         new_state = jdc.replace(
             state_after_v,
-            ema_max_adv=new_ema_max_adv,  # 👑 Record global Z anchor
-            ema_reward=config.beta_r * state_after_v.ema_reward + (1.0 - config.beta_r) * batch_reward,
-            ema_reward_sq=config.beta_r * state_after_v.ema_reward_sq + (1.0 - config.beta_r) * jnp.square(
-                batch_reward),
-            ema_v_loss=config.beta_v * state_after_v.ema_v_loss + (1.0 - config.beta_v) * current_global_v_loss,
-            ema_v_loss_sq=config.beta_v * state_after_v.ema_v_loss_sq + (1.0 - config.beta_v) * jnp.square(
-                current_global_v_loss)
+            ema_max_adv=new_ema_max_adv
         )
 
         def actor_epoch_step(carry_state, _):
@@ -449,8 +382,7 @@ class DGPOFMState:
             )
 
             def minibatch_scan_fn(ms, mb):
-                return ms._update_actor_only(mb, jax.random.fold_in(ms.prng, ms.steps + 2), current_global_v_loss,
-                                             new_state.ema_max_adv)
+                return ms._update_actor_only(mb, jax.random.fold_in(ms.prng, ms.steps + 2), new_state.ema_max_adv)
 
             return jax.lax.scan(minibatch_scan_fn, init=carry_state, xs=minibatches)
 
