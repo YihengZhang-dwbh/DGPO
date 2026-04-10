@@ -268,7 +268,7 @@ class DGPOFMState:
             p_eps, p_t, p_trust, p_route = jax.random.split(prng_pol, 4)
 
             a_target = jnp.broadcast_to(a_real_flat[:, None, :], (N, M, act_dim))
-            a_adv = jnp.broadcast_to(adv_flat[:, None], (N, M))
+            a_adv = jnp.broadcast_to(adv_flat, (N, M))  # <--- 修复完毕，完美二维广播
 
             if cfg.action_clip in ["hard", "margin", "fold"]:
                 a_target = self._apply_clip(a_target)
