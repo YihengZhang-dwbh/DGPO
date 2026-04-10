@@ -19,8 +19,8 @@ from . import math_utils, networks, rollouts
 class DGPOFMConfig:
     independent_noise_sampling: jdc.Static[bool] = True
     use_global_variance: jdc.Static[bool] = False
-    temp_func_type: jdc.Static[Literal["log", "cbrt", "std", "fixed", "max"]] = "fixed"
-    fast_flow_step: jdc.Static[int] = 5
+    temp_func_type: jdc.Static[Literal["log", "cbrt", "std", "fixed", "max"]] = "max"
+    fast_flow_step: jdc.Static[int] = 10
 
     prob_allocation_mode: jdc.Static[Literal["kl_softmax", "linear_redistribution"]] = "kl_softmax"
 
@@ -31,7 +31,7 @@ class DGPOFMConfig:
     clip_margin: float = 1.1
     penalty_coef: float = 0
 
-    sampling_mode: jdc.Static[Literal["absolute_budget", "relative_h_pool"]] = "relative_h_pool"
+    sampling_mode: jdc.Static[Literal["absolute_budget", "relative_h_pool"]] = "absolute_budget"
     h_fakes_in_pool: jdc.Static[int] = 3
 
     # Contrastive Flow / Repulsive Hinge Loss Parameter
@@ -41,7 +41,7 @@ class DGPOFMConfig:
     resampling_alpha_k: float = 0.3
     resampling_alpha_min: float = 0.0001
     f_x_forward: jdc.Static[bool] = True
-    num_generated_actions: jdc.Static[int] = 48
+    num_generated_actions: jdc.Static[int] = 4
     num_epsilon_samples: jdc.Static[int] = 8
 
     beta_r: float = 0.9
