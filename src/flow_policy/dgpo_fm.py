@@ -295,13 +295,21 @@ class DGPOFMState:
 
             # --- 👑 Rejection Sampling Z-Estimation & Routing ---
             if cfg.z_estimation_mode == "local_max":
-                Z_adv = jnp.max(a_adv)
+                # 把原来的：
+                # Z_adv = jnp.max(a_adv)
+
+                # 换成极其抗破坏的 95% 分位数锚点：
+                Z_adv = jnp.percentile(a_adv, 95.0)
             elif cfg.z_estimation_mode == "global_ema":
                 Z_adv = global_max_adv
             elif cfg.z_estimation_mode == "fixed":
                 Z_adv = cfg.z_fixed_max_adv
             else:
-                Z_adv = jnp.max(a_adv)
+                # 把原来的：
+                # Z_adv = jnp.max(a_adv)
+                
+                # 换成极其抗破坏的 95% 分位数锚点：
+                Z_adv = jnp.percentile(a_adv, 95.0)
 
             # Compute Target Probability (p*) guaranteed to be un-biased and bounded
             p_star = jnp.exp((a_adv - Z_adv) / cfg.z_temperature)
