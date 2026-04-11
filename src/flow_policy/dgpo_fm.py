@@ -602,16 +602,16 @@ class DGPOFMState:
             else:
                 # Compute DGPOFM ratio. We clip before exponentiation to prevent
                 # outliers from blowing up the loss; this is optional.
-                # rho_s = jnp.exp(
-                #     jnp.clip(
-                #         transitions.action_info.initial_cfm_loss - cfm_loss, -3.0, 3.0
-                #     )
-                # )
                 rho_s = jnp.exp(
                     jnp.clip(
-                        - cfm_loss, -3.0, 3.0
+                        transitions.action_info.initial_cfm_loss - cfm_loss, -3.0, 3.0
                     )
                 )
+                # rho_s = jnp.exp(
+                #     jnp.clip(
+                #         - cfm_loss, -3.0, 3.0
+                #     )
+                # )
                 #
                 # rho_s = jnp.exp(
                 #         (transitions.action_info.initial_cfm_loss < 3.0) *(- cfm_loss)
