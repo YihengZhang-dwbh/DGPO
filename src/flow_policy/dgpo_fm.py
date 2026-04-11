@@ -364,7 +364,7 @@ class DGPOFMState:
             x0 = x0 + perturb
 
         # Create action info based on loss mode
-        if self.config.loss_mode == "DGPOFM":
+        if self.config.loss_mode == "dgpo":
             # Sample eps and t for DGPOFM loss.
             sample_shape = (*batch_dims, self.config.n_samples_per_action)
             prng_eps, prng_t = jax.random.split(prng_loss)
