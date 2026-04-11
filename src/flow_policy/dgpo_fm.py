@@ -621,7 +621,7 @@ class DGPOFMState:
                     batch_dim,
                     self.config.n_samples_per_action,
                 )
-                rho_s = rho_s * gae_advantages[..., None] * (1-(gae_advantages[..., None]<0)*(cfm_loss>0.5))
+                rho_s = rho_s * gae_advantages[..., None] * (1-(gae_advantages[..., None]<0)*(cfm_loss>1))
         else:  # denoising_mdp
             # Compute policy ratio for denoising MDP
             assert isinstance(transitions.action_info, DenoisingMdpActionInfo)
