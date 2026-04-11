@@ -16,7 +16,7 @@ from . import math_utils, networks, rollouts
 
 
 @jdc.pytree_dataclass
-class DGPOConfig:
+class DGPOFMConfig:
     # Flow parameters.
     flow_steps: jdc.Static[int] = 10
     output_mode: jdc.Static[Literal["u", "u_but_supervise_as_eps"]] = (
@@ -71,13 +71,13 @@ class DGPOConfig:
 
 
 @jdc.pytree_dataclass
-class DGPOParams:
+class DGPOFMParams:
     policy: MlpWeights
     value: MlpWeights
 
 
 @jdc.pytree_dataclass
-class DGPOActionInfo:
+class DGPOFMActionInfo:
     loss_eps: Array  # (*, sample_dim, action_dim)
     loss_t: Array  # (*, sample_dim, 1)
     initial_cfm_loss: Array  # (*,)
@@ -97,16 +97,16 @@ class FlowSchedule:
     t_next: Array  # (*, flow_steps) - timesteps at the end of each step
 
 
-DGPOTransition = rollouts.TransitionStruct[DGPOActionInfo | DenoisingMdpActionInfo]
+DGPOFMTransition = rollouts.TransitionStruct[DGPOFMActionInfo | DenoisingMdpActionInfo]
 
 
 @jdc.pytree_dataclass
-class DGPOState:
+class DGPOFMState:
     """PPO agent state."""
 
     env: jdc.Static[mjp.MjxEnv]
-    config: DGPOConfig
-    params: DGPOParams
+    config: DGPOFMConfig
+    params: DGPOFMParams
     obs_stats: math_utils.RunningStats
 
     opt: jdc.Static[optax.GradientTransformation]
@@ -117,7 +117,7 @@ class DGPOState:
 
     @staticmethod
     @jdc.jit
-    def init(prng: Array, env: jdc.Static[mjp.MjxEnv], config: DGPOConfig) -> DGPOState:
+    def init(prng: Array, env: jdc.Static[mjp.MjxEnv], config: DGPOFMConfig) -> DGPOFMState:
         obs_size = env.observation_size
         action_size = env.action_size
         assert isinstance(obs_size, int)
@@ -137,11 +137,11 @@ class DGPOState:
         )
         critic_net = networks.mlp_init(prng1, (obs_size, 256, 256, 256, 256, 256, 1))
 
-        network_params = DGPOParams(actor_net, critic_net)
+        network_params = DGPOFMParams(actor_net, critic_net)
 
         # We'll manage learning rate ourselves!
         opt = optax.scale_by_adam()
-        return DGPOState(
+        return DGPOFMState(
             env=env,
             config=config,
             params=network_params,
@@ -299,7 +299,7 @@ class DGPOState:
 
     def sample_action(
         self, obs: Array, prng: Array, deterministic: bool
-    ) -> tuple[Array, DGPOActionInfo | DenoisingMdpActionInfo]:
+    ) -> tuple[Array, DGPOFMActionInfo | DenoisingMdpActionInfo]:
         """Sample an action from the policy given an observation."""
         if self.config.normalize_observations:
             obs_norm = (obs - self.obs_stats.mean) / self.obs_stats.std
@@ -364,8 +364,8 @@ class DGPOState:
             x0 = x0 + perturb
 
         # Create action info based on loss mode
-        if self.config.loss_mode == "DGPO":
-            # Sample eps and t for DGPO loss.
+        if self.config.loss_mode == "DGPOFM":
+            # Sample eps and t for DGPOFM loss.
             sample_shape = (*batch_dims, self.config.n_samples_per_action)
             prng_eps, prng_t = jax.random.split(prng_loss)
             eps = jax.random.normal(prng_eps, (*sample_shape, self.env.action_size))
@@ -382,7 +382,7 @@ class DGPOState:
                 t = jax.random.uniform(prng_t, (*sample_shape, 1))
             initial_cfm_loss = self._compute_cfm_loss(obs_norm, x0, eps=eps, t=t)
 
-            return x0, DGPOActionInfo(
+            return x0, DGPOFMActionInfo(
                 loss_eps=eps,
                 loss_t=t,
                 initial_cfm_loss=initial_cfm_loss,
@@ -428,8 +428,8 @@ class DGPOState:
 
     @jdc.jit
     def training_step(
-        self, transitions: DGPOTransition
-    ) -> tuple[DGPOState, dict[str, Array]]:
+        self, transitions: DGPOFMTransition
+    ) -> tuple[DGPOFMState, dict[str, Array]]:
         # We're use a (T, B) shape convention, corresponding to a "scan of the
         # vmap" and not a "vmap of the scan".
         config = self.config
@@ -442,11 +442,11 @@ class DGPOState:
                 state.obs_stats = state.obs_stats.update(transitions.obs)
         del self
 
-        def step_batch(state: DGPOState, _):
+        def step_batch(state: DGPOFMState, _):
             step_prng = jax.random.fold_in(state.prng, state.steps)
             state, metrics = jax.lax.scan(
                 partial(
-                    DGPOState._step_minibatch, prng=jax.random.fold_in(step_prng, 0)
+                    DGPOFMState._step_minibatch, prng=jax.random.fold_in(step_prng, 0)
                 ),
                 init=state,
                 xs=transitions.prepare_minibatches(
@@ -465,8 +465,8 @@ class DGPOState:
         return state, metrics
 
     def _step_minibatch(
-        self, transitions: DGPOTransition, prng: Array
-    ) -> tuple[DGPOState, dict[str, Array]]:
+        self, transitions: DGPOFMTransition, prng: Array
+    ) -> tuple[DGPOFMState, dict[str, Array]]:
         """One training step over a minibatch of transitions."""
 
         assert transitions.reward.shape == (
@@ -474,14 +474,14 @@ class DGPOState:
             self.config.batch_size,
         )
         (loss, metrics), grads = jax.value_and_grad(
-            lambda params: DGPOState._compute_dgpo_loss(
+            lambda params: DGPOFMState._compute_dgpo_loss(
                 jdc.replace(self, params=params),
                 transitions,
                 prng,
             ),
             has_aux=True,
         )(self.params)
-        assert isinstance(grads, DGPOParams)
+        assert isinstance(grads, DGPOFMParams)
         assert isinstance(loss, Array)
         assert isinstance(metrics, dict)
 
@@ -496,7 +496,7 @@ class DGPOState:
         return state, metrics
 
     def _compute_dgpo_loss(
-        self, transitions: DGPOTransition, prng: Array
+        self, transitions: DGPOFMTransition, prng: Array
     ) -> tuple[Array, dict[str, Array]]:
         del prng  # Unused for now.
 
@@ -551,8 +551,8 @@ class DGPOState:
 
         # Compute policy ratio based on loss mode
         if self.config.loss_mode == "dgpo":
-            # Original DGPO loss computation
-            assert isinstance(transitions.action_info, DGPOActionInfo)
+            # Original DGPOFM loss computation
+            assert isinstance(transitions.action_info, DGPOFMActionInfo)
 
             # Check action info shapes
             assert transitions.action_info.loss_eps.shape == (
@@ -600,7 +600,7 @@ class DGPOState:
                     1,
                 )
             else:
-                # Compute DGPO ratio. We clip before exponentiation to prevent
+                # Compute DGPOFM ratio. We clip before exponentiation to prevent
                 # outliers from blowing up the loss; this is optional.
                 # rho_s = jnp.exp(
                 #     jnp.clip(
